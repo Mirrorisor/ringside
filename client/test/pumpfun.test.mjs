@@ -238,7 +238,7 @@ test("quoteSell on the curve matches the curve math", async () => {
   assert.equal(q.venue, "curve");
   assert.equal(q.solOut, sol);
   assert.equal(q.minSolOut, (sol * 9_800n) / 10_000n);
-  assert.equal(q.feeLamports, ceilDiv(sol * 100n, 10_000n));
+  assert.equal(q.feeLamports, ceilDiv(q.minSolOut * 100n, 10_000n));
 });
 
 test("buildBuy on the curve: ATA, buy with exact bounds, then our fee last", async () => {
@@ -270,7 +270,7 @@ test("buildBuy uses the mint's token program (Token-2022 coins)", async () => {
   assert.ok(buy.accounts.some((a) => a.address === spl.TOKEN_2022_PROGRAM_ID.toBase58()));
 });
 
-test("buildSell on the curve: sell with min out, then our fee on the quoted SOL", async () => {
+test("buildSell on the curve: sell with min out, then our fee on the minimum SOL out", async () => {
   const { mint, rpc } = await curveWorld();
   const user = rnd().toBase58();
   const tokensIn = 3_000_000_000_000n;
@@ -282,7 +282,7 @@ test("buildSell on the curve: sell with min out, then our fee on the quoted SOL"
   assert.equal(u64(d.data.amount), tokensIn);
   assert.equal(u64(d.data.minSolOutput), quote.minSolOut);
   assert.equal(quote.minSolOut, (expectedCurveSellSol(tokensIn) * 9_950n) / 10_000n);
-  assertFeeTransfer(fee, user, feeLamports(quote.solOut, 50));
+  assertFeeTransfer(fee, user, feeLamports(quote.minSolOut, 50));
 });
 
 test("feeBps 0 appends no transfer", async () => {
@@ -365,7 +365,7 @@ test("graduated: buildSell uses PumpSwap, unwraps, then our fee", async () => {
   // The WSOL account is closed (SOL unwrapped) before our transfer.
   const closeAt = instructions.findIndex((i) => i.programAddress === spl.TOKEN_PROGRAM_ID.toBase58() && Buffer.from(i.data)[0] === 9);
   assert.ok(closeAt >= 0 && closeAt < instructions.length - 1);
-  assertFeeTransfer(instructions.at(-1), user, feeLamports(quote.solOut, 50));
+  assertFeeTransfer(instructions.at(-1), user, feeLamports(quote.minSolOut, 50));
 });
 
 test("graduated to a non-WSOL pool is refused", async () => {

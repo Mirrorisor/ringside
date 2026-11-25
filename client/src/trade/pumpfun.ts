@@ -104,7 +104,7 @@ export interface SellQuote {
   /** The least the program may return: `solOut` less slippage. */
   minSolOut: bigint;
   slippageBps: number;
-  /** Our fee, on `solOut`. */
+  /** Our fee, on `minSolOut`: never on SOL the seller might not get. */
   feeLamports: bigint;
 }
 
@@ -339,7 +339,7 @@ function quoteSellFrom(market: Market, cfg: PumpTradeConfig, p: SellParams): Sel
   }
   if (solOut <= 0n) throw new PumpTradeError("too_small", "That amount returns no SOL.");
   const minSolOut = withSlippageDown(solOut, slippageBps);
-  return { venue: market.venue, mint: p.mint, tokensIn: p.tokensIn, solOut, minSolOut, slippageBps, feeLamports: feeLamports(solOut, cfg.feeBps ?? DEFAULT_FEE_BPS) };
+  return { venue: market.venue, mint: p.mint, tokensIn: p.tokensIn, solOut, minSolOut, slippageBps, feeLamports: feeLamports(minSolOut, cfg.feeBps ?? DEFAULT_FEE_BPS) };
 }
 
 /** Quote a buy of `solIn` lamports, on the curve or (graduated) on PumpSwap. */
