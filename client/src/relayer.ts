@@ -33,18 +33,15 @@ import {
   assertIsFullySignedTransaction,
   createKeyPairSignerFromBytes,
   createSolanaRpc,
-  decompileTransactionMessage,
   getBase58Encoder,
   getBase64EncodedWireTransaction,
-  getCompiledTransactionMessageDecoder,
   getSignatureFromTransaction,
-  getTransactionDecoder,
-  getTransactionSize,
   partiallySignTransaction,
   type Address,
   type KeyPairSigner,
   type Transaction,
 } from "@solana/kit";
+import { bigintJson, decodeWire, quoteAndSimulate, refuse, rpcRetry, type Accepted, type Ix, type Refusal, type SimulationRpc } from "./txpolicy.js";
 import { createHash } from "node:crypto";
 
 export const PROGRAMS = {
@@ -80,74 +77,24 @@ export const DEFAULT_LIMITS: RelayerLimits = {
 };
 
 /** The RPC methods the relayer uses, so tests can pass a fake. */
-export interface RelayerRpc {
-  getBalance(a: Address, c?: { commitment: "confirmed" }): { send(): Promise<{ value: bigint }> };
-  getFeeForMessage(m: never, c?: { commitment: "confirmed" }): { send(): Promise<{ value: bigint | null }> };
-  simulateTransaction(
-    tx: never,
-    c: { encoding: "base64"; sigVerify: true; accounts: { addresses: Address[]; encoding: "base64" }; commitment: "confirmed" },
-  ): { send(): Promise<{ value: { err: unknown; accounts: ({ lamports: bigint } | null)[] | null; logs: string[] | null } }> };
-  sendTransaction(tx: never, c: { encoding: "base64"; preflightCommitment: "confirmed" }): { send(): Promise<string> };
-}
+export type RelayerRpc = SimulationRpc;
+export type { Accepted, Refusal };
 
-export type Refusal = { ok: false; status: number; code: string; message: string };
-export type Accepted = { ok: true; signature: string; spentLamports: bigint };
-
-const refuse = (status: number, code: string, message: string): Refusal => ({ ok: false, status, code, message });
-
-/** Retries an RPC call the provider rate-limits (HTTP 429), backing off up to ~30 s. */
-async function rpcRetry<T>(call: () => Promise<T>): Promise<T> {
-  for (let i = 0; ; i++) {
-    try {
-      return await call();
-    } catch (e) {
-      if (!/429|Too Many Requests/i.test(String((e as Error)?.message ?? e)) || i >= 4) throw e;
-      await new Promise((r) => setTimeout(r, 1_000 * 2 ** i));
-    }
-  }
-}
-
-type Decoded = {
-  ok: true;
-  tx: Transaction;
-  feePayer: Address;
-  instructions: { programAddress: Address; accounts: { address: Address; role: AccountRole }[]; data: Uint8Array }[];
-  signers: Address[];
-};
+type Decoded = { ok: true; tx: Transaction; feePayer: Address; instructions: Ix[]; signers: Address[] };
 
 /** Decode and run the static checks. Exported for tests. */
 export function inspect(wireBase64: string, relayer: Address): Decoded | Refusal {
-  let tx: Transaction;
-  let message: ReturnType<typeof decompileTransactionMessage>;
-  try {
-    tx = getTransactionDecoder().decode(Buffer.from(wireBase64, "base64"));
-    const compiled = getCompiledTransactionMessageDecoder().decode(tx.messageBytes);
-    if (compiled.version === 0 && (compiled.addressTableLookups?.length ?? 0) > 0) {
-      return refuse(400, "lookup_tables", "Address lookup tables are not accepted.");
-    }
-    message = decompileTransactionMessage(compiled as never);
-  } catch (e) {
-    return refuse(400, "malformed", `Could not decode the transaction: ${(e as Error).message}`);
-  }
-  if (getTransactionSize(tx) > 4096) return refuse(400, "too_large", "Transaction is over 4,096 bytes.");
-  if (message.feePayer.address !== relayer) return refuse(400, "fee_payer", "The relayer must be the fee payer.");
-
-  type AnyIx = { programAddress: Address; accounts?: readonly { address: Address; role: AccountRole }[]; data?: Uint8Array | ArrayLike<number> };
-  const instructions = (message.instructions as readonly AnyIx[]).map((ix) => ({
-    programAddress: ix.programAddress,
-    accounts: (ix.accounts ?? []) as { address: Address; role: AccountRole }[],
-    data: new Uint8Array(ix.data ?? []),
-  }));
-  if (instructions.length === 0) return refuse(400, "empty", "No instructions.");
-
+  const d = decodeWire(wireBase64, relayer);
+  if (!d.ok) return d;
+  const { tx, feePayer, instructions } = d;
   for (const [i, ix] of instructions.entries()) {
     const relayerAt = ix.accounts.flatMap((a, j) => (a.address === relayer ? [j] : []));
     const verdict = checkInstruction(ix, relayerAt);
-    if (verdict) return refuse(403, verdict.code, `Instruction ${i}: ${verdict.message}`);
+    if (verdict) return refuse(403, verdict.code, `Instruction ${i}: ${verdict.message}`, { instruction: i });
   }
-  const signers = Object.keys(tx.signatures).filter((a) => a !== relayer) as Address[];
+  const signers = d.signerSlots.filter((a) => a !== relayer);
   if (signers.length === 0) return refuse(400, "no_signer", "A trading account must sign too.");
-  return { ok: true, tx, feePayer: message.feePayer.address, instructions, signers };
+  return { ok: true, tx, feePayer, instructions, signers };
 }
 
 function checkInstruction(
@@ -296,28 +243,9 @@ export class Relayer {
     }
     const wire = getBase64EncodedWireTransaction(signed);
 
-    const fee = (await rpcRetry(() => this.rpc.getFeeForMessage(Buffer.from(signed.messageBytes).toString("base64") as never, { commitment: "confirmed" }).send())).value;
-    if (fee === null) return refuse(400, "stale_blockhash", "Blockhash expired. Rebuild and resend.");
-    if (fee > L.maxFeeLamports) return refuse(403, "fee_too_high", `Network fee ${fee} is over the ${L.maxFeeLamports} lamport cap.`);
-
-    const before = (await rpcRetry(() => this.rpc.getBalance(this.signer.address, { commitment: "confirmed" }).send())).value;
-    const sim = (
-      await rpcRetry(() =>
-        this.rpc
-          .simulateTransaction(wire as never, {
-            encoding: "base64",
-            sigVerify: true,
-            accounts: { addresses: [this.signer.address], encoding: "base64" },
-            commitment: "confirmed",
-          })
-          .send(),
-      )
-    ).value;
-    if (sim.err) return refuse(400, "simulation_failed", `Simulation failed: ${JSON.stringify(sim.err, (_, v) => (typeof v === "bigint" ? v.toString() : v))}`);
-    const after = sim.accounts?.[0]?.lamports;
-    if (after === undefined) return refuse(502, "simulation_incomplete", "Simulation did not return the relayer balance.");
-    // Count the fee even if the simulator didn't deduct it.
-    const spent = before - after + (before - after >= fee ? 0n : fee);
+    const q = await quoteAndSimulate(this.rpc, this.signer.address, signed.messageBytes, wire, L.maxFeeLamports);
+    if (!q.ok) return q;
+    const { spent } = q;
     if (spent > L.maxSpendLamports) return refuse(403, "spend_too_high", `Would cost the relayer ${spent} lamports (cap ${L.maxSpendLamports}).`);
 
     const signature = await rpcRetry(() => this.rpc.sendTransaction(wire as never, { encoding: "base64", preflightCommitment: "confirmed" }).send());
@@ -340,7 +268,7 @@ export function createRelayerServer(relayer: Relayer, opts: { allowOrigin?: stri
       "access-control-allow-headers": "content-type",
       "cache-control": "no-store",
     });
-    res.end(JSON.stringify(body, (_, v) => (typeof v === "bigint" ? v.toString() : v)));
+    res.end(JSON.stringify(body, bigintJson));
   };
   const ipOf = (req: IncomingMessage) =>
     (opts.trustProxy ? String(req.headers["x-forwarded-for"] ?? "").split(",")[0].trim() : "") || req.socket.remoteAddress || "unknown";
