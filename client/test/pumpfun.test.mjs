@@ -373,3 +373,17 @@ test("graduated to a non-WSOL pool is refused", async () => {
   await addPool(accounts, mint, { quoteMint: rnd() });
   await assert.rejects(quoteBuy(cfg(rpc), { mint: mint.toBase58(), solIn: 1_000_000n }), (e) => e.code === "unsupported_quote");
 });
+
+test("slippage above the cap is refused, so a sell fee can't round to zero", async () => {
+  const { mint, rpc } = await curveWorld();
+  await assert.rejects(
+    quoteSell(cfg(rpc), { mint: mint.toBase58(), tokensIn: 10_000_000_000_000n, slippageBps: 10_000 }),
+    (e) => e.code === "bad_slippage",
+  );
+  await assert.rejects(
+    quoteBuy(cfg(rpc), { mint: mint.toBase58(), solIn: 1_000_000_000n, slippageBps: 3001 }),
+    (e) => e.code === "bad_slippage",
+  );
+  const q = await quoteSell(cfg(rpc), { mint: mint.toBase58(), tokensIn: 10_000_000_000_000n, slippageBps: 3000 });
+  assert.ok(q.feeLamports > 0n);
+});

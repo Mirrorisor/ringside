@@ -115,6 +115,7 @@ export interface BuiltTrade<Q> {
 }
 
 export type PumpTradeErrorCode =
+  | "bad_slippage" // slippage outside 0..MAX_SLIPPAGE_BPS
   | "not_found" // no mint, curve or pool
   | "awaiting_migration" // curve complete, pool not created yet
   | "unsupported_quote" // curve or pool not quoted in SOL
@@ -151,6 +152,15 @@ export function feeLamports(solAmount: bigint, bps: number | bigint = DEFAULT_FE
 }
 
 /** `amount` plus `bps` of it, rounded down. */
+/** Highest slippage we build for. Also keeps the sell fee (on minSolOut) from rounding to zero. */
+export const MAX_SLIPPAGE_BPS = 3000;
+
+function checkSlippage(bps: number): number {
+  if (!Number.isInteger(bps) || bps < 0 || bps > MAX_SLIPPAGE_BPS)
+    throw new PumpTradeError("bad_slippage", `Slippage must be a whole number of bps from 0 to ${MAX_SLIPPAGE_BPS}.`);
+  return bps;
+}
+
 export function withSlippageUp(amount: bigint, bps: number | bigint): bigint {
   return amount + (amount * checkBps(bps, "slippageBps")) / BPS;
 }
@@ -280,7 +290,7 @@ export interface SellParams {
 
 function quoteBuyFrom(market: Market, cfg: PumpTradeConfig, p: BuyParams): BuyQuote {
   if (typeof p.solIn !== "bigint" || p.solIn <= 0n) throw new PumpTradeError("bad_amount", "solIn must be a positive bigint.");
-  const slippageBps = p.slippageBps ?? DEFAULT_SLIPPAGE_BPS;
+  const slippageBps = checkSlippage(p.slippageBps ?? DEFAULT_SLIPPAGE_BPS);
   let tokensOut: bigint;
   if (market.venue === "curve") {
     const { global, feeConfig, bondingCurve } = market;
@@ -309,7 +319,7 @@ function quoteBuyFrom(market: Market, cfg: PumpTradeConfig, p: BuyParams): BuyQu
 
 function quoteSellFrom(market: Market, cfg: PumpTradeConfig, p: SellParams): SellQuote {
   if (typeof p.tokensIn !== "bigint" || p.tokensIn <= 0n) throw new PumpTradeError("bad_amount", "tokensIn must be a positive bigint.");
-  const slippageBps = p.slippageBps ?? DEFAULT_SLIPPAGE_BPS;
+  const slippageBps = checkSlippage(p.slippageBps ?? DEFAULT_SLIPPAGE_BPS);
   let solOut: bigint;
   if (market.venue === "curve") {
     const { global, feeConfig, bondingCurve } = market;
