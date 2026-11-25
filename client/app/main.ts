@@ -243,12 +243,21 @@ function markQ(m: any, c: any, slot: bigint): { mark: bigint; anchor: bigint; cl
   const mark = clampBand(twap, anchor);
   return { mark, anchor, clamped: mark !== twap };
 }
+/** Mirrors tier_params and GROSS_CAP_MULT in programs/ringside_perps. */
+const TIER = [
+  { lev: 2, fee: 0.003 },
+  { lev: 5, fee: 0.0015 },
+  { lev: 10, fee: 0.0008 },
+];
+const GROSS_CAP_MULT = 2;
+const tierOf = () => TIER[Math.min(st.market?.tier ?? 0, 2)];
 function caps() {
   const v = st.vault, c = st.curve;
   if (!v || !c) return null;
   const reserve = graduated() ? st.pool!.sol : big(c.virtualSol);
   const cap = Number((reserve * big(v.solUsdE6)) / 1_000_000_000n * BigInt(v.tier0CapBps) / 10000n) / USDC;
-  return { cap, account: cap * 0.2, skew: (cap * v.skewCapBps) / 10000 };
+  // Each side may reach GROSS_CAP_MULT x cap; the vault's net exposure stays within the skew limit.
+  return { cap, side: cap * GROSS_CAP_MULT, account: cap * 0.2, skew: (cap * v.skewCapBps) / 10000 };
 }
 
 // ---------------------------------------------------------------------------
@@ -382,8 +391,8 @@ function render() {
     const k = caps();
     if (k) {
       const oiL = Number(m.oiLong) / USDC, oiS = Number(m.oiShort) / USDC;
-      $("oiL").textContent = `${usd(oiL)} / ${usd(k.cap)}`;
-      $("oiS").textContent = `${usd(oiS)} / ${usd(k.cap)}`;
+      $("oiL").textContent = `${usd(oiL)} / ${usd(k.side)}`;
+      $("oiS").textContent = `${usd(oiS)} / ${usd(k.side)}`;
       $("skew").textContent = `${usd(oiL - oiS)} / ±${usd(k.skew)}`;
     }
   }
@@ -429,8 +438,16 @@ function backupTradingKey() {
 
 function renderTicket(mk: ReturnType<typeof markQ> | null) {
   const col = parseFloat(($("col") as HTMLInputElement).value) || 0;
-  const lev = parseFloat(($("lev") as HTMLInputElement).value);
-  const size = col * lev, fee = size * 0.003;
+  const t = tierOf(), levInput = $("lev") as HTMLInputElement;
+  const levMax = String(t.lev * 0.99);
+  if (levInput.max !== levMax) {
+    levInput.max = levMax;
+    if (parseFloat(levInput.value) > t.lev * 0.99) levInput.value = levMax;
+  }
+  $("levMax").textContent = `Tier ${st.market?.tier ?? 0} max ${t.lev}x`;
+  $("pFeeL").textContent = `Open fee (${(t.fee * 100).toFixed(2)}%)`;
+  const lev = parseFloat(levInput.value);
+  const size = col * lev, fee = size * t.fee;
   $("levV").textContent = `${lev.toFixed(2)}x`;
   $("pSize").textContent = usd(size);
   $("pFee").textContent = usd(fee);
@@ -448,14 +465,14 @@ function renderTicket(mk: ReturnType<typeof markQ> | null) {
     const oiL = Number(m.oiLong) / USDC, oiS = Number(m.oiShort) / USDC;
     const sideOi = st.side === 0 ? oiL : oiS, netAfter = oiL - oiS + (st.side === 0 ? size : -size);
     const existing = st.positions[st.side] ? Number(st.positions[st.side].sizeUsd) / USDC : 0;
-    $("pCap").textContent = `${usd(k.account - existing)} / ${usd(k.cap - sideOi)}`;
+    $("pCap").textContent = `${usd(k.account - existing)} / ${usd(k.side - sideOi)}`;
     const age = Date.now() / 1000 - Number(st.vault.solUsdTs);
     if (st.orders[st.side]) why = "An order on this side is waiting for the keeper.";
     else if (col <= 0) why = "Enter collateral.";
     else if (col > st.traderUsdc) why = "Not enough USDC in the trading account. Use Get test funds.";
-    else if ((col - fee) * 2 < size) why = "Above 2x after the fee. Lower leverage a little.";
+    else if ((col - fee) * t.lev < size) why = `Above ${t.lev}x after the fee. Lower leverage a little.`;
     else if (existing + size > k.account) why = "Above your per-account cap for this market.";
-    else if (sideOi + size > k.cap) why = "This side of the market is full.";
+    else if (sideOi + size > k.side) why = "This side of the market is full.";
     else if (Math.abs(netAfter) > k.skew) why = "Vault net exposure limit. Try the other side or a smaller size.";
     else if (mk.clamped) why = "Mark is at the band edge; new positions wait for it to catch up.";
     else if (c.complete && m.tier === 0) why = "Sold out: perps reopen once the market moves to the Raydium price.";
