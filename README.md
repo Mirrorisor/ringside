@@ -4,6 +4,16 @@ A Solana token launchpad that gives every token a perpetual futures market from 
 
 **Status: running end to end on devnet, not audited.** Don't deploy to mainnet with real funds until the launch checklist in the spec (Roadmap → Mainnet launch checklist) is complete.
 
+## Security
+
+This code is public and **unaudited**. Treat it as a reference for review, not something to deploy.
+
+- **Report vulnerabilities privately.** Use GitHub's private vulnerability reporting on this repo (Security → Report a vulnerability). Please don't open public issues for security bugs. A paid bounty will run on Immunefi before mainnet deposits open.
+- **Scope that matters most:** the graduation CPI into Raydium (lamport accounting, SBF stack frames), mark pricing (curve price, pool TWAP, the price band), Pyth parsing, LP share pricing and the withdrawal delay, per-market loss budgets and ADL, and the admin handover.
+- **Mainnet keys:** upgrade authority, admin and treasury go to a Squads multisig; the manual SOL price authority goes to a key nobody holds. `init-mainnet.ts` refuses a single-key upgrade authority.
+- **Privacy:** Helius Rings' first mainnet ring hides amounts, not who sent to whom. Don't rely on Ringside's private funding to unlink wallets until that's verified on chain.
+- **No licence.** All rights reserved; you may read the code, not reuse it.
+
 ## What works on devnet today
 
 | Flow | Verified |
@@ -64,7 +74,7 @@ The `devnet` feature gives curves 0.5 virtual SOL (so a curve sells out for ~1.5
 - **Quanto contracts.** PnL = notional × (mark / entry − 1). The mark is the token's SOL price; PnL is paid in USDC. No external oracle is needed for a token that exists nowhere else.
 - **Mark = 5-minute TWAP, clamped to ±15% per window** — the curve's TWAP before graduation, Raydium's observation TWAP after. Graduation restarts the band at the curve's final price, which the pool opens at exactly.
 - **Worst-of fills.** Opening pays the worse of mark and spot; closing gets the worse too. Liquidation uses the mark alone.
-- **OI cap = 1.5% of the SOL behind the price** (virtual curve SOL, or pool SOL after graduation), the vault's net exposure capped at 25% of that. Set from the real-data replay: at 2% a patient attacker pumping a quiet curve roughly breaks even.
+- **OI cap = 1.5% of the SOL behind the price** (virtual curve SOL, or pool SOL after graduation), the vault's net exposure capped at 25% of that. Set from the real-data replay: at 2% a patient attacker pumping a quiet curve roughly breaks even. Each side may hold up to **2x the cap** (`GROSS_CAP_MULT`), because the vault only carries the imbalance: in the replay (`sim/gross_check.py`, `sim/results-gross.json`) that doubled fees with unchanged tail losses, while 3x worsened the worst case under heavy one-sided demand.
 - **Risk budget per market** (0.25% of LP value at Tier 0, 1% at Tier 1). Past it the market goes reduce-only and keepers ADL profitable positions.
 - **SOL/USD only sizes caps.** It comes from Pyth: fully verified, under 60 s old, confidence within 2%.
 - **Graduation is permissionless.** Anyone can call `migrate` and `graduate_market`; every Raydium account is checked against addresses derived from the token.

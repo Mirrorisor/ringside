@@ -104,7 +104,8 @@ def path_stats(m):
     )
 
 
-def replay(m, cap_bps, rng, demand_share=0.2, long_bias=0.4, hold_min=15.0):
+def replay(m, cap_bps, rng, demand_share=0.2, long_bias=0.4, hold_min=15.0, gross_mult=1.0):
+    """gross_mult: each side may reach gross_mult x cap; the net (long - short) stays within SKEW_CAP x cap."""
     t = TIERS[m["tier"]]
     p, vol = m["close"], m["vol"]
     res = reserve_sol(m)
@@ -189,7 +190,7 @@ def replay(m, cap_bps, rng, demand_share=0.2, long_bias=0.4, hold_min=15.0):
             orders += 1
             side = 1 if rng.random() < 1 / (1 + math.exp(-(long_bias + 6 * mom))) else -1
             size = min(demand, cap * ACCOUNT_SHARE * rng.uniform(0.1, 1.0))
-            room = cap - (oi_l if side > 0 else oi_s)
+            room = gross_mult * cap - (oi_l if side > 0 else oi_s)
             net_after = oi_l - oi_s + side * size
             if abs(net_after) > SKEW_CAP * cap:
                 size = max(0.0, SKEW_CAP * cap - side * (oi_l - oi_s))
@@ -214,6 +215,7 @@ def replay(m, cap_bps, rng, demand_share=0.2, long_bias=0.4, hold_min=15.0):
 def study(markets, tier, grid, seeds=4, **kw):
     rows = []
     for bps in grid:
+        kw_ = kw
         v, w, f, b = [], [], [], []
         for mi, m in enumerate(markets):
             for s in range(seeds):

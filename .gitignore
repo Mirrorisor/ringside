@@ -21,3 +21,7 @@ devnet-deployment.json
 
 # Raw third-party market data (GeckoTerminal); fetch it with the collector script
 sim/data/launch-data.json
+
+# Python
+__pycache__/
+*.pyc

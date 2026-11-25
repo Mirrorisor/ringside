@@ -1,0 +1,146 @@
+{
+ "tier0/base/gross1x": {
+  "fees_mean_usd": 489.75,
+  "vault_pnl_mean_usd": 2156.69,
+  "vault_pnl_p1_usd": -8.2,
+  "worst_drawdown_usd": -3331.24,
+  "drawdown_p1_share_of_budget": 0.321,
+  "budget_breach_rate": 0.0046,
+  "share_of_markets_vault_lost": 0.144
+ },
+ "tier0/base/gross2x": {
+  "fees_mean_usd": 985.35,
+  "vault_pnl_mean_usd": 4236.0,
+  "vault_pnl_p1_usd": -8.2,
+  "worst_drawdown_usd": -2744.77,
+  "drawdown_p1_share_of_budget": 0.251,
+  "budget_breach_rate": 0.0046,
+  "share_of_markets_vault_lost": 0.144
+ },
+ "tier0/base/gross3x": {
+  "fees_mean_usd": 1450.87,
+  "vault_pnl_mean_usd": 6038.17,
+  "vault_pnl_p1_usd": -8.2,
+  "worst_drawdown_usd": -3779.63,
+  "drawdown_p1_share_of_budget": 0.251,
+  "budget_breach_rate": 0.0046,
+  "share_of_markets_vault_lost": 0.144
+ },
+ "tier0/base/gross4x": {
+  "fees_mean_usd": 1752.94,
+  "vault_pnl_mean_usd": 7052.97,
+  "vault_pnl_p1_usd": -8.2,
+  "worst_drawdown_usd": -3779.63,
+  "drawdown_p1_share_of_budget": 0.251,
+  "budget_breach_rate": 0.0046,
+  "share_of_markets_vault_lost": 0.144
+ },
+ "tier0/heavy_demand/gross1x": {
+  "fees_mean_usd": 579.86,
+  "vault_pnl_mean_usd": 2696.3,
+  "vault_pnl_p1_usd": -6.06,
+  "worst_drawdown_usd": -1093.07,
+  "drawdown_p1_share_of_budget": 0.368,
+  "budget_breach_rate": 0.0,
+  "share_of_markets_vault_lost": 0.12
+ },
+ "tier0/heavy_demand/gross2x": {
+  "fees_mean_usd": 1043.27,
+  "vault_pnl_mean_usd": 4515.11,
+  "vault_pnl_p1_usd": -6.06,
+  "worst_drawdown_usd": -1093.07,
+  "drawdown_p1_share_of_budget": 0.33,
+  "budget_breach_rate": 0.0,
+  "share_of_markets_vault_lost": 0.12
+ },
+ "tier0/heavy_demand/gross3x": {
+  "fees_mean_usd": 1377.18,
+  "vault_pnl_mean_usd": 5698.68,
+  "vault_pnl_p1_usd": -7.5,
+  "worst_drawdown_usd": -7018.22,
+  "drawdown_p1_share_of_budget": 0.367,
+  "budget_breach_rate": 0.0046,
+  "share_of_markets_vault_lost": 0.125
+ },
+ "tier0/heavy_demand/gross4x": {
+  "fees_mean_usd": 1712.31,
+  "vault_pnl_mean_usd": 6734.36,
+  "vault_pnl_p1_usd": -7.5,
+  "worst_drawdown_usd": -7018.22,
+  "drawdown_p1_share_of_budget": 0.367,
+  "budget_breach_rate": 0.0046,
+  "share_of_markets_vault_lost": 0.125
+ },
+ "tier1/base/gross1x": {
+  "fees_mean_usd": 3.6,
+  "vault_pnl_mean_usd": 48.11,
+  "vault_pnl_p1_usd": -50.26,
+  "worst_drawdown_usd": -166.96,
+  "drawdown_p1_share_of_budget": 0.008,
+  "budget_breach_rate": 0.0,
+  "share_of_markets_vault_lost": 0.074
+ },
+ "tier1/base/gross2x": {
+  "fees_mean_usd": 4.74,
+  "vault_pnl_mean_usd": 63.98,
+  "vault_pnl_p1_usd": -50.26,
+  "worst_drawdown_usd": -166.96,
+  "drawdown_p1_share_of_budget": 0.008,
+  "budget_breach_rate": 0.0,
+  "share_of_markets_vault_lost": 0.074
+ },
+ "tier1/base/gross3x": {
+  "fees_mean_usd": 5.6,
+  "vault_pnl_mean_usd": 74.19,
+  "vault_pnl_p1_usd": -50.26,
+  "worst_drawdown_usd": -166.96,
+  "drawdown_p1_share_of_budget": 0.008,
+  "budget_breach_rate": 0.0,
+  "share_of_markets_vault_lost": 0.074
+ },
+ "tier1/base/gross4x": {
+  "fees_mean_usd": 6.1,
+  "vault_pnl_mean_usd": 76.57,
+  "vault_pnl_p1_usd": -50.26,
+  "worst_drawdown_usd": -166.96,
+  "drawdown_p1_share_of_budget": 0.008,
+  "budget_breach_rate": 0.0,
+  "share_of_markets_vault_lost": 0.074
+ },
+ "tier1/heavy_demand/gross1x": {
+  "fees_mean_usd": 10.22,
+  "vault_pnl_mean_usd": 110.81,
+  "vault_pnl_p1_usd": -148.29,
+  "worst_drawdown_usd": -572.14,
+  "drawdown_p1_share_of_budget": 0.019,
+  "budget_breach_rate": 0.0,
+  "share_of_markets_vault_lost": 0.086
+ },
+ "tier1/heavy_demand/gross2x": {
+  "fees_mean_usd": 13.55,
+  "vault_pnl_mean_usd": 153.32,
+  "vault_pnl_p1_usd": -148.29,
+  "worst_drawdown_usd": -572.14,
+  "drawdown_p1_share_of_budget": 0.017,
+  "budget_breach_rate": 0.0,
+  "share_of_markets_vault_lost": 0.086
+ },
+ "tier1/heavy_demand/gross3x": {
+  "fees_mean_usd": 17.79,
+  "vault_pnl_mean_usd": 212.68,
+  "vault_pnl_p1_usd": -148.29,
+  "worst_drawdown_usd": -572.14,
+  "drawdown_p1_share_of_budget": 0.017,
+  "budget_breach_rate": 0.0,
+  "share_of_markets_vault_lost": 0.086
+ },
+ "tier1/heavy_demand/gross4x": {
+  "fees_mean_usd": 20.85,
+  "vault_pnl_mean_usd": 229.47,
+  "vault_pnl_p1_usd": -148.29,
+  "worst_drawdown_usd": -572.14,
+  "drawdown_p1_share_of_budget": 0.017,
+  "budget_breach_rate": 0.0,
+  "share_of_markets_vault_lost": 0.086
+ }
+}

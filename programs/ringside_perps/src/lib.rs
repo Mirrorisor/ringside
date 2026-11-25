@@ -34,6 +34,12 @@ pub const SOL_PRICE_MAX_AGE: i64 = 120;
 pub const DEFAULT_TIER0_CAP_BPS: u16 = 100;
 /// The vault's net exposure (long OI - short OI) is held to 25% of the cap.
 pub const DEFAULT_SKEW_CAP_BPS: u16 = 2_500;
+/// Each side's open interest may reach this multiple of the market cap. The
+/// vault only carries the long-short imbalance, which the skew cap still limits
+/// to 25% of the cap, so balanced markets can trade twice as much at the same
+/// vault risk. Replay on real launches (sim/gross_check.py): 2x doubles fees with
+/// unchanged tail losses; 3x worsened the worst case under heavy one-sided demand.
+pub const GROSS_CAP_MULT: u64 = 2;
 /// Upper bound for `set_risk_params`. Devnet curves are 60x smaller (0.5
 /// virtual SOL), so the devnet build allows a proportionally larger share.
 #[cfg(not(feature = "devnet"))]
@@ -405,7 +411,7 @@ pub mod ringside_perps {
 
             let cap = oi_cap(market, vault, view.sol_reserve, clock.unix_timestamp)?;
             let side_oi = if is_long { market.oi_long } else { market.oi_short };
-            require!(side_oi + order.size_usd <= cap, PerpsError::OiCap);
+            require!(side_oi + order.size_usd <= cap.saturating_mul(GROSS_CAP_MULT), PerpsError::OiCap);
             require!((new_size as u128) * BPS <= (cap as u128) * MAX_ACCOUNT_SHARE_BPS, PerpsError::AccountCap);
             let delta = if is_long { order.size_usd as i128 } else { -(order.size_usd as i128) };
             let net_after = market.oi_long as i128 - market.oi_short as i128 + delta;
