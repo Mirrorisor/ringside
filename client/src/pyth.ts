@@ -29,6 +29,12 @@ export const SPONSORED_SOL_USD = new PublicKey("7UVimffxr9ow1uXYxsr4LHAcV58mLzhm
 /** Must stay under the program's 60 s limit, with room for the transaction to land. */
 const FRESH_ENOUGH_S = 30;
 
+/**
+ * Compute units for refresh_sol_price. Required: with tightComputeBudget the
+ * Pyth SDK sets the limit to the sum of declared units, so an undeclared
+ * instruction gets a budget of 0 ("consumed 0 of 0 compute units").
+ */
+const REFRESH_CU = 40_000;
 const refreshDisc = createHash("sha256").update("global:refresh_sol_price").digest().subarray(0, 8);
 const setPriceDisc = createHash("sha256").update("global:set_sol_price").digest().subarray(0, 8);
 
@@ -88,12 +94,12 @@ export class PythPoster {
     const builder = this.receiver.newTransactionBuilder({ closeUpdateAccounts: true });
     let source: "sponsored" | "posted";
     if (age <= FRESH_ENOUGH_S) {
-      await builder.addPriceConsumerInstructions(async () => [{ instruction: this.refreshIx(SPONSORED_SOL_USD), signers: [] }]);
+      await builder.addPriceConsumerInstructions(async () => [{ instruction: this.refreshIx(SPONSORED_SOL_USD), signers: [], computeUnits: REFRESH_CU }]);
       source = "sponsored";
     } else {
       const update = await this.hermes.getLatestPriceUpdates([SOL_USD_FEED_ID], { encoding: "base64" });
       await builder.addPostPriceUpdates(update.binary.data);
-      await builder.addPriceConsumerInstructions(async (get: (id: string) => PublicKey) => [{ instruction: this.refreshIx(get(SOL_USD_FEED_ID)), signers: [] }]);
+      await builder.addPriceConsumerInstructions(async (get: (id: string) => PublicKey) => [{ instruction: this.refreshIx(get(SOL_USD_FEED_ID)), signers: [], computeUnits: REFRESH_CU }]);
       source = "posted";
     }
     const txs = await builder.buildVersionedTransactions({ computeUnitPriceMicroLamports: 10_000, tightComputeBudget: true });
