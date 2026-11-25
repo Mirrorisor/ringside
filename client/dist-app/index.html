@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ringside · devnet</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@600;800&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{color-scheme:light dark;
+--bg:light-dark(#f4f5f1,#0f1d1a);--panel:light-dark(#ffffff,#162824);--ink:light-dark(#10201d,#e9efe9);
+--soft:light-dark(#5d6b66,#9fb0aa);--line:light-dark(#dfe4df,#26403a);--rope:#d8382f;--ring:light-dark(#2f55e8,#7f9bff);
+--long:light-dark(#17875c,#3fcf94);--short:light-dark(#c8402f,#ff7b69);--tint:light-dark(#eef1ec,#1c322d)}
+*{box-sizing:border-box;min-width:0}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 Inter,system-ui,sans-serif;font-variant-numeric:tabular-nums}
+h1,h2,h3{font-family:Archivo,Inter,sans-serif;margin:0;line-height:1.1}
+h1{font-size:22px;font-weight:800}h2{font-size:clamp(22px,3vw,30px);font-weight:800}h3{font-size:17px;font-weight:600}
+button,input{font:inherit;color:inherit}
+button{min-height:42px;border-radius:10px;border:1px solid var(--line);background:var(--panel);padding:0 14px;cursor:pointer;font-weight:600}
+button:focus-visible,input:focus-visible{outline:3px solid var(--ring);outline-offset:2px}
+button.primary{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+button.long{background:var(--long);color:#fff;border-color:var(--long)}button.short{background:var(--short);color:#fff;border-color:var(--short)}
+button:disabled{opacity:.45;cursor:not-allowed}
+input{width:100%;min-height:42px;font-size:16px;border:1px solid var(--line);border-radius:10px;background:var(--bg);padding:0 12px}
+input.num{text-align:right}
+label{display:block;font-size:13px;color:var(--soft);margin:10px 0 4px}
+.top{display:flex;flex-wrap:wrap;gap:10px 18px;align-items:center;padding:12px max(3vw,16px);border-bottom:1px solid var(--line);background:var(--panel)}
+.pill{display:inline-flex;gap:6px;align-items:center;border:1px solid var(--line);border-radius:999px;padding:6px 12px;font-size:13px;white-space:nowrap}
+.pill.shield{border-color:var(--ring);color:var(--ring)}
+.wallet{margin-inline-start:auto;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+main{max-width:1300px;margin:0 auto;padding:18px max(3vw,16px) 48px;display:grid;grid-template-columns:280px minmax(0,1fr) 330px;gap:16px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:16px}
+.muted{color:var(--soft);font-size:13px}
+.list{display:grid;gap:8px;max-height:70vh;overflow:auto}
+.mk{display:flex;justify-content:space-between;gap:8px;align-items:center;padding:10px;border:1px solid var(--line);border-radius:12px;cursor:pointer;background:var(--panel);text-align:left;width:100%;min-height:auto}
+.mk[aria-current=true]{border-color:var(--ink)}
+.bar{height:8px;border-radius:99px;background:var(--tint);overflow:hidden}.bar i{display:block;height:100%;background:var(--ink)}
+.head{display:flex;flex-wrap:wrap;gap:6px 22px;align-items:baseline;margin-bottom:8px}
+.stat{display:flex;flex-direction:column}.stat b{font-size:16px;white-space:nowrap}
+.fig{position:relative;height:300px}.fig svg{position:absolute;inset:0;width:100%;height:100%}
+.seg{display:grid;grid-template-columns:1fr 1fr;gap:6px;background:var(--tint);padding:4px;border-radius:12px}
+.seg button{border:0;background:transparent;min-height:36px}.seg button[aria-pressed=true]{background:var(--panel);box-shadow:0 1px 3px #0002}
+.rows{display:grid;gap:5px;margin-top:12px;font-size:13px}.rows div{display:flex;justify-content:space-between;gap:12px}.rows span:last-child{font-weight:600;white-space:nowrap}
+table{width:100%;border-collapse:collapse;font-size:14px}th{font-weight:500;color:var(--soft);text-align:left;font-size:13px}
+th,td{padding:8px 6px;border-bottom:1px solid var(--line)}.n{text-align:right;white-space:nowrap}
+.up{color:var(--long)}.down{color:var(--short)}
+.log{font-size:12px;color:var(--soft);display:grid;gap:4px;max-height:180px;overflow:auto}
+.log a{color:var(--ring)}
+.note{font-size:12px;color:var(--soft);margin-top:10px}
+.stack{display:grid;gap:16px;align-content:start}
+@media(max-width:1100px){main{grid-template-columns:minmax(0,1fr)}}
+</style>
+  <script type="module" crossorigin src="/assets/index-CdTf_lIS.js"></script>
+</head>
+<body>
+<header class="top">
+  <h1>Ringside <span class="muted" style="font-family:Inter;font-weight:500">devnet</span></h1>
+  <div class="wallet">
+    <span class="pill" title="Browser devnet wallet: launches tokens and buys on the curve">Wallet <b id="wAddr">…</b> · <b id="wSol">…</b></span>
+    <span class="pill shield" title="Private trading account: trades perps through the relayer and never holds SOL">Trading acct <b id="tAddr">…</b> · <b id="tUsdc">…</b> · <b id="tSol">…</b></span>
+    <button id="backup" title="Download the trading account's key; it holds your margin and lives only in this browser">Back up trading key</button>
+    <button id="connect" title="Phantom, Backpack, Solflare or any Wallet Standard wallet">Connect wallet</button>
+    <button id="faucet">Get test funds</button>
+  </div>
+</header>
+<main>
+  <div class="stack">
+    <div class="card">
+      <h3>Launch a token</h3>
+      <form id="launch">
+        <label for="lName">Name</label><input id="lName" maxlength="32" required>
+        <label for="lSym">Ticker</label><input id="lSym" maxlength="10" required>
+        <label for="lDesc">Description (optional)</label><textarea id="lDesc" maxlength="500" rows="2"></textarea>
+        <label for="lImg">Image (PNG, JPEG, GIF or WebP, up to 1 MB)</label><input id="lImg" type="file" accept="image/png,image/jpeg,image/gif,image/webp">
+        <label for="lDev">Dev buy (SOL, locked 7 days)</label><input id="lDev" class="num" inputmode="decimal" value="0.05">
+        <button class="primary" style="width:100%;margin-top:12px">Launch with perps</button>
+      </form>
+    </div>
+    <div class="card">
+      <h3>Markets</h3>
+      <div class="list" id="markets" style="margin-top:10px"><span class="muted">Loading from devnet…</span></div>
+    </div>
+  </div>
+
+  <div class="stack">
+    <div class="card">
+      <div class="head">
+        <img id="tImg" alt="" hidden style="width:56px;height:56px;border-radius:12px;object-fit:cover;margin-right:12px;vertical-align:middle"><div><h2 id="tName">Pick a market</h2><span class="muted" id="tSub"></span></div>
+        <div class="stat"><span class="muted">Mark (TWAP, banded)</span><b id="sMark">–</b></div>
+        <div class="stat"><span class="muted">Curve spot</span><b id="sSpot">–</b></div>
+        <div class="stat"><span class="muted">Market cap</span><b id="sCap">–</b></div>
+      </div>
+      <div class="fig" id="chart"></div>
+      <p class="muted" style="margin:6px 0 0">Grey = curve spot · dark = mark · red = ±15% band. Plotted from when you opened this page.</p>
+      <div style="margin-top:12px"><div class="rows" style="margin:0 0 6px"><div><span>Bonding curve → graduation</span><span id="sProg">–</span></div></div><div class="bar"><i id="sProgBar" style="width:0"></i></div></div>
+    </div>
+    <div class="card">
+      <h3>Your positions <span class="muted">(trading account)</span></h3>
+      <table style="margin-top:8px"><thead><tr><th>Side</th><th class="n">Size</th><th class="n">Collateral</th><th class="n">Entry</th><th class="n">PnL (est.)</th><th></th></tr></thead><tbody id="pos"></tbody></table>
+      <p class="muted" id="posEmpty">No open positions in this market.</p>
+    </div>
+    <div class="card"><h3>Activity</h3><div class="log" id="log" style="margin-top:8px"></div></div>
+  </div>
+
+  <div class="stack">
+    <div class="card">
+      <div class="seg" role="group" aria-label="Order type"><button id="mPerp" aria-pressed="true">Perp</button><button id="mSpot" aria-pressed="false">Spot</button></div>
+      <div id="perpBox">
+        <div class="seg" style="margin-top:10px" role="group" aria-label="Side"><button id="sLong" aria-pressed="true">Long</button><button id="sShort" aria-pressed="false">Short</button></div>
+        <label for="col">Collateral (USDC)</label><input id="col" class="num" inputmode="decimal" value="2.6">
+        <label for="lev">Leverage <b id="levV"></b> · Tier 0 max 2x</label><input type="range" id="lev" min="1" max="1.98" step="0.01" value="1.9" style="padding:0">
+        <div class="rows">
+          <div><span>Size</span><span id="pSize">–</span></div>
+          <div><span>Open fee (0.30%)</span><span id="pFee">–</span></div>
+          <div><span>Fill price (worse of mark/spot)</span><span id="pPx">–</span></div>
+          <div><span>Your cap / side room</span><span id="pCap">–</span></div>
+        </div>
+        <button class="long" id="open" style="width:100%;margin-top:12px">Open long</button>
+        <p class="muted" id="pWhy" style="min-height:20px;margin:6px 0 0"></p>
+        <p class="note">Sent through the relayer, which pays the fees and rent. A keeper fills it at least 2 slots later.</p>
+      </div>
+      <div id="spotBox" hidden>
+        <label for="solIn">Buy with (SOL)</label><input id="solIn" class="num" inputmode="decimal" value="0.05">
+        <div class="rows"><div><span>You get (est.)</span><span id="sOut">–</span></div><div><span>You hold</span><span id="sHeld">–</span></div></div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px"><button class="long" id="buy">Buy</button><button class="short" id="sell">Sell all</button></div>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Market limits</h3>
+      <div class="rows">
+        <div><span>Long OI / cap</span><span id="oiL">–</span></div>
+        <div><span>Short OI / cap</span><span id="oiS">–</span></div>
+        <div><span>Net exposure / limit</span><span id="skew">–</span></div>
+        <div><span>Vault (LP USDC)</span><span id="vTvl">–</span></div>
+        <div><span>SOL price (Pyth)</span><span id="solPx">–</span></div>
+      </div>
+    </div>
+  </div>
+</main>
+</body>
+</html>

@@ -1,0 +1,23 @@
+[package]
+name = "ringside_perps"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.84"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "ringside_perps"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+devnet = ["ringside_launch/devnet"]
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+
+[dependencies]
+anchor-lang = { version = "=0.31.1", features = ["init-if-needed"] }
+anchor-spl = "=0.31.1"
+ringside_launch = { path = "../ringside_launch", features = ["cpi"] }

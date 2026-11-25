@@ -1,0 +1,18 @@
+[toolchain]
+anchor_version = "0.31.1"
+
+[features]
+resolution = true
+skip-lint = false
+
+[programs.localnet]
+ringside_launch = "AfZWCTaDQEC9CVTwXkH7pFtDXs4RtLWCK5godexWQDVH"
+ringside_perps = "DsZ69w3q25nRmAzJCRBMLbwZWN6NyVbYipTWsCAUsg1F"
+
+[programs.devnet]
+ringside_launch = "AfZWCTaDQEC9CVTwXkH7pFtDXs4RtLWCK5godexWQDVH"
+ringside_perps = "DsZ69w3q25nRmAzJCRBMLbwZWN6NyVbYipTWsCAUsg1F"
+
+[provider]
+cluster = "devnet"
+wallet = "~/.config/solana/id.json"

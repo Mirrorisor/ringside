@@ -1,0 +1,23 @@
+# Build output
+target/
+tests-graduation/target/
+client/node_modules/
+client/dist/
+
+# Secrets and keys: never commit
+.env
+.env.*
+*.key
+*keypair*.json
+id.json
+helius-key.txt
+pyth-key.txt
+test-trading-accounts/
+
+# Local runtime data
+*.log
+client/metadata-store/
+devnet-deployment.json
+
+# Raw third-party market data (GeckoTerminal); fetch it with the collector script
+sim/data/launch-data.json

@@ -1,0 +1,22 @@
+[package]
+name = "ringside_tests"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.84"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+ringside_launch = { path = "../programs/ringside_launch", features = ["no-entrypoint"] }
+ringside_perps = { path = "../programs/ringside_perps", features = ["no-entrypoint"] }
+anchor-lang = "0.31.1"
+anchor-spl = "0.31.1"
+solana-program-test = "2.3"
+solana-sdk = "2.3"
+spl-token = { version = "7", features = ["no-entrypoint"] }
+spl-associated-token-account = { version = "6", features = ["no-entrypoint"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[workspace]

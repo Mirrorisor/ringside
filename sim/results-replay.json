@@ -1,0 +1,308 @@
+{
+ "source": "GeckoTerminal public API",
+ "fetched_at": "2026-11-25T06:50:06.020Z",
+ "curve_prices_on_curve_share": 0.926,
+ "paths": {
+  "active_curve": {
+   "markets": 54,
+   "median_minutes": 665,
+   "vol_1m_median": 0.0652,
+   "vol_1m_p90": 0.1933,
+   "worst_1m_p10": -1.042,
+   "worst_5m_p10": -1.351,
+   "best_5m_p90": 1.483,
+   "rug_share": 0.648
+  },
+  "active_graduated": {
+   "markets": 60,
+   "median_minutes": 586,
+   "vol_1m_median": 0.1308,
+   "vol_1m_p90": 0.3541,
+   "worst_1m_p10": -4.746,
+   "worst_5m_p10": -4.953,
+   "best_5m_p90": 1.772,
+   "rug_share": 0.617
+  },
+  "fresh_graduated": {
+   "markets": 1,
+   "median_minutes": 33,
+   "vol_1m_median": 0.066,
+   "vol_1m_p90": 0.066,
+   "worst_1m_p10": -0.262,
+   "worst_5m_p10": -0.152,
+   "best_5m_p90": 0.348,
+   "rug_share": 0.0
+  }
+ },
+ "tier0": {
+  "base": [
+   {
+    "cap_bps": 50,
+    "vault_pnl_mean_usd": 823.26,
+    "vault_pnl_p5_usd": 0.0,
+    "vault_pnl_p1_usd": -0.7,
+    "worst_drawdown_usd": -1789.67,
+    "drawdown_p1_share_of_budget": 0.14,
+    "budget_breach_rate": 0.0,
+    "fees_mean_usd": 197.48,
+    "share_of_markets_vault_lost": 0.023
+   },
+   {
+    "cap_bps": 100,
+    "vault_pnl_mean_usd": 1679.49,
+    "vault_pnl_p5_usd": -1.15,
+    "vault_pnl_p1_usd": -4.16,
+    "worst_drawdown_usd": -728.72,
+    "drawdown_p1_share_of_budget": 0.217,
+    "budget_breach_rate": 0.0,
+    "fees_mean_usd": 392.81,
+    "share_of_markets_vault_lost": 0.102
+   },
+   {
+    "cap_bps": 200,
+    "vault_pnl_mean_usd": 3339.13,
+    "vault_pnl_p5_usd": -3.03,
+    "vault_pnl_p1_usd": -7.13,
+    "worst_drawdown_usd": -1457.43,
+    "drawdown_p1_share_of_budget": 0.334,
+    "budget_breach_rate": 0.0,
+    "fees_mean_usd": 764.75,
+    "share_of_markets_vault_lost": 0.144
+   },
+   {
+    "cap_bps": 400,
+    "vault_pnl_mean_usd": 4941.58,
+    "vault_pnl_p5_usd": -9.69,
+    "vault_pnl_p1_usd": -3482.04,
+    "worst_drawdown_usd": -7097.98,
+    "drawdown_p1_share_of_budget": 1.393,
+    "budget_breach_rate": 0.0185,
+    "fees_mean_usd": 981.83,
+    "share_of_markets_vault_lost": 0.194
+   }
+  ],
+  "heavy_demand": [
+   {
+    "cap_bps": 100,
+    "vault_pnl_mean_usd": 1622.38,
+    "vault_pnl_p5_usd": -2.51,
+    "vault_pnl_p1_usd": -6.46,
+    "worst_drawdown_usd": -3955.37,
+    "drawdown_p1_share_of_budget": 0.246,
+    "budget_breach_rate": 0.0046,
+    "fees_mean_usd": 324.47,
+    "share_of_markets_vault_lost": 0.125
+   },
+   {
+    "cap_bps": 200,
+    "vault_pnl_mean_usd": 3045.7,
+    "vault_pnl_p5_usd": -5.57,
+    "vault_pnl_p1_usd": -21.38,
+    "worst_drawdown_usd": -2642.81,
+    "drawdown_p1_share_of_budget": 0.491,
+    "budget_breach_rate": 0.0046,
+    "fees_mean_usd": 637.95,
+    "share_of_markets_vault_lost": 0.116
+   }
+  ]
+ },
+ "tier1": {
+  "base": [
+   {
+    "cap_bps": 100,
+    "vault_pnl_mean_usd": 39.09,
+    "vault_pnl_p5_usd": -1.42,
+    "vault_pnl_p1_usd": -49.32,
+    "worst_drawdown_usd": -178.18,
+    "drawdown_p1_share_of_budget": 0.007,
+    "budget_breach_rate": 0.0,
+    "fees_mean_usd": 3.26,
+    "share_of_markets_vault_lost": 0.066
+   },
+   {
+    "cap_bps": 300,
+    "vault_pnl_mean_usd": 57.96,
+    "vault_pnl_p5_usd": -11.06,
+    "vault_pnl_p1_usd": -104.12,
+    "worst_drawdown_usd": -127.86,
+    "drawdown_p1_share_of_budget": 0.011,
+    "budget_breach_rate": 0.0,
+    "fees_mean_usd": 4.19,
+    "share_of_markets_vault_lost": 0.078
+   },
+   {
+    "cap_bps": 600,
+    "vault_pnl_mean_usd": 48.6,
+    "vault_pnl_p5_usd": -6.13,
+    "vault_pnl_p1_usd": -102.35,
+    "worst_drawdown_usd": -187.93,
+    "drawdown_p1_share_of_budget": 0.012,
+    "budget_breach_rate": 0.0,
+    "fees_mean_usd": 3.61,
+    "share_of_markets_vault_lost": 0.066
+   },
+   {
+    "cap_bps": 1000,
+    "vault_pnl_mean_usd": 42.61,
+    "vault_pnl_p5_usd": -15.29,
+    "vault_pnl_p1_usd": -127.63,
+    "worst_drawdown_usd": -321.74,
+    "drawdown_p1_share_of_budget": 0.014,
+    "budget_breach_rate": 0.0,
+    "fees_mean_usd": 3.2,
+    "share_of_markets_vault_lost": 0.098
+   }
+  ],
+  "heavy_demand": [
+   {
+    "cap_bps": 300,
+    "vault_pnl_mean_usd": 168.95,
+    "vault_pnl_p5_usd": -11.33,
+    "vault_pnl_p1_usd": -140.81,
+    "worst_drawdown_usd": -542.19,
+    "drawdown_p1_share_of_budget": 0.018,
+    "budget_breach_rate": 0.0,
+    "fees_mean_usd": 14.57,
+    "share_of_markets_vault_lost": 0.094
+   },
+   {
+    "cap_bps": 600,
+    "vault_pnl_mean_usd": 188.21,
+    "vault_pnl_p5_usd": -26.06,
+    "vault_pnl_p1_usd": -147.61,
+    "worst_drawdown_usd": -482.36,
+    "drawdown_p1_share_of_budget": 0.021,
+    "budget_breach_rate": 0.0,
+    "fees_mean_usd": 15.49,
+    "share_of_markets_vault_lost": 0.09
+   }
+  ]
+ },
+ "tier1_live_pools": {
+  "min_liquidity_usd": 5000,
+  "markets": 24,
+  "base": [
+   {
+    "cap_bps": 100,
+    "vault_pnl_mean_usd": 84.59,
+    "vault_pnl_p5_usd": -17.85,
+    "vault_pnl_p1_usd": -48.36,
+    "worst_drawdown_usd": -73.31,
+    "drawdown_p1_share_of_budget": 0.006,
+    "budget_breach_rate": 0.0,
+    "fees_mean_usd": 7.26,
+    "share_of_markets_vault_lost": 0.115
+   },
+   {
+    "cap_bps": 300,
+    "vault_pnl_mean_usd": 83.86,
+    "vault_pnl_p5_usd": -71.65,
+    "vault_pnl_p1_usd": -169.49,
+    "worst_drawdown_usd": -190.95,
+    "drawdown_p1_share_of_budget": 0.017,
+    "budget_breach_rate": 0.0,
+    "fees_mean_usd": 8.52,
+    "share_of_markets_vault_lost": 0.135
+   },
+   {
+    "cap_bps": 600,
+    "vault_pnl_mean_usd": 82.04,
+    "vault_pnl_p5_usd": -66.87,
+    "vault_pnl_p1_usd": -269.62,
+    "worst_drawdown_usd": -326.45,
+    "drawdown_p1_share_of_budget": 0.027,
+    "budget_breach_rate": 0.0,
+    "fees_mean_usd": 8.81,
+    "share_of_markets_vault_lost": 0.156
+   },
+   {
+    "cap_bps": 1000,
+    "vault_pnl_mean_usd": 46.0,
+    "vault_pnl_p5_usd": -90.03,
+    "vault_pnl_p1_usd": -270.9,
+    "worst_drawdown_usd": -351.53,
+    "drawdown_p1_share_of_budget": 0.027,
+    "budget_breach_rate": 0.0,
+    "fees_mean_usd": 6.64,
+    "share_of_markets_vault_lost": 0.208
+   }
+  ],
+  "heavy_demand": [
+   {
+    "cap_bps": 300,
+    "vault_pnl_mean_usd": 300.76,
+    "vault_pnl_p5_usd": -87.78,
+    "vault_pnl_p1_usd": -199.72,
+    "worst_drawdown_usd": -241.27,
+    "drawdown_p1_share_of_budget": 0.023,
+    "budget_breach_rate": 0.0,
+    "fees_mean_usd": 30.16,
+    "share_of_markets_vault_lost": 0.094
+   },
+   {
+    "cap_bps": 600,
+    "vault_pnl_mean_usd": 318.13,
+    "vault_pnl_p5_usd": -151.22,
+    "vault_pnl_p1_usd": -344.32,
+    "worst_drawdown_usd": -465.95,
+    "drawdown_p1_share_of_budget": 0.046,
+    "budget_breach_rate": 0.0,
+    "fees_mean_usd": 30.82,
+    "share_of_markets_vault_lost": 0.104
+   },
+   {
+    "cap_bps": 1000,
+    "vault_pnl_mean_usd": 282.09,
+    "vault_pnl_p5_usd": -270.43,
+    "vault_pnl_p1_usd": -542.94,
+    "worst_drawdown_usd": -755.88,
+    "drawdown_p1_share_of_budget": 0.062,
+    "budget_breach_rate": 0.0,
+    "fees_mean_usd": 29.5,
+    "share_of_markets_vault_lost": 0.177
+   }
+  ]
+ },
+ "cap_150bps": {
+  "tier0": [
+   {
+    "cap_bps": 150,
+    "vault_pnl_mean_usd": 2156.69,
+    "vault_pnl_p5_usd": -2.47,
+    "vault_pnl_p1_usd": -8.2,
+    "worst_drawdown_usd": -3331.24,
+    "drawdown_p1_share_of_budget": 0.321,
+    "budget_breach_rate": 0.0046,
+    "fees_mean_usd": 489.75,
+    "share_of_markets_vault_lost": 0.144
+   }
+  ],
+  "tier0_heavy": [
+   {
+    "cap_bps": 150,
+    "vault_pnl_mean_usd": 2696.3,
+    "vault_pnl_p5_usd": -3.2,
+    "vault_pnl_p1_usd": -6.06,
+    "worst_drawdown_usd": -1093.07,
+    "drawdown_p1_share_of_budget": 0.368,
+    "budget_breach_rate": 0.0,
+    "fees_mean_usd": 579.86,
+    "share_of_markets_vault_lost": 0.12
+   }
+  ],
+  "tier1_live": [
+   {
+    "cap_bps": 150,
+    "vault_pnl_mean_usd": 89.99,
+    "vault_pnl_p5_usd": -40.59,
+    "vault_pnl_p1_usd": -87.09,
+    "worst_drawdown_usd": -116.43,
+    "drawdown_p1_share_of_budget": 0.01,
+    "budget_breach_rate": 0.0,
+    "fees_mean_usd": 7.76,
+    "share_of_markets_vault_lost": 0.104
+   }
+  ]
+ },
+ "manipulation_check": "Curve pump attack with worst-of execution: EV per attempt at 1x/1.5x/2x cap, late-stage quiet curve: -2.62 / -2.97 / -0.61 USD (2x is near break-even, p_profit 0.51). Chosen cap: 150 bps."
+}
