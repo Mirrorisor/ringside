@@ -1,0 +1,23 @@
+[
+  {
+    "description": "22S3bVxfkoJB5L5EhFo1Hp3T9EtX1qLG4dP9UDcRQN6B transferred 0.5 SOL to 99cnRnduE5KdqhuJmYN5YH3WcnSiPQ152bF3hbxSfvKU.",
+    "type": "TRANSFER",
+    "source": "SYSTEM_PROGRAM",
+    "fee": 5000,
+    "feePayer": "22S3bVxfkoJB5L5EhFo1Hp3T9EtX1qLG4dP9UDcRQN6B",
+    "signature": "3MFkpWPZJ1c8FGVoBG85K6LMLsaQKHi5Mz2wep7yS9WKTLSkin3zeuCJwqsEzphGdy1cKfBf39PCP6ZwPC2bdfmZ",
+    "slot": 299999990,
+    "timestamp": 1763989996,
+    "nativeTransfers": [
+      { "fromUserAccount": "22S3bVxfkoJB5L5EhFo1Hp3T9EtX1qLG4dP9UDcRQN6B", "toUserAccount": "99cnRnduE5KdqhuJmYN5YH3WcnSiPQ152bF3hbxSfvKU", "amount": 500000000 }
+    ],
+    "tokenTransfers": [],
+    "accountData": [
+      { "account": "22S3bVxfkoJB5L5EhFo1Hp3T9EtX1qLG4dP9UDcRQN6B", "nativeBalanceChange": -500005000, "tokenBalanceChanges": [] },
+      { "account": "99cnRnduE5KdqhuJmYN5YH3WcnSiPQ152bF3hbxSfvKU", "nativeBalanceChange": 500000000, "tokenBalanceChanges": [] }
+    ],
+    "transactionError": null,
+    "instructions": [],
+    "events": {}
+  }
+]

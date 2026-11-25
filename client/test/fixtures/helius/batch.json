@@ -1,0 +1,77 @@
+[
+  {
+    "description": "s7KMacZHd83q5bUtXhVkPPwRsxut1ipy93wfxmWpnn8 swapped 50 USDC for 20000 AbYGhAcF86iLQpQQynmZPZAyMejskVFowy2P2LBktuaH",
+    "type": "SWAP",
+    "source": "RAYDIUM",
+    "fee": 5000,
+    "feePayer": "s7KMacZHd83q5bUtXhVkPPwRsxut1ipy93wfxmWpnn8",
+    "signature": "5f2SHwf17KDQ1HnsEDKSf56EURywmMcCYTB22cUHgxmrcguEe3iRJ5u4srkLbQnNz15J1j8tjRY5GVPy9FZHMj5y",
+    "slot": 300000001,
+    "timestamp": 1763990001,
+    "nativeTransfers": [],
+    "tokenTransfers": [],
+    "accountData": [],
+    "transactionError": null,
+    "instructions": [],
+    "events": {
+      "swap": {
+        "nativeInput": null,
+        "nativeOutput": null,
+        "tokenInputs": [
+          { "userAccount": "s7KMacZHd83q5bUtXhVkPPwRsxut1ipy93wfxmWpnn8", "tokenAccount": "6fD1gQhJXSmhFniSDmtrxK3Mrfqtyg1ox7tESzyvcq1r", "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "rawTokenAmount": { "tokenAmount": "50000000", "decimals": 6 } }
+        ],
+        "tokenOutputs": [
+          { "userAccount": "s7KMacZHd83q5bUtXhVkPPwRsxut1ipy93wfxmWpnn8", "tokenAccount": "3nWfQx1mbN6V8hX2Qk3rWw7eYp1Xb8yAz9T4cJvU5sLd", "mint": "AbYGhAcF86iLQpQQynmZPZAyMejskVFowy2P2LBktuaH", "rawTokenAmount": { "tokenAmount": "20000000000", "decimals": 6 } }
+        ],
+        "tokenFees": [],
+        "nativeFees": [],
+        "innerSwaps": []
+      }
+    }
+  },
+  {
+    "description": "",
+    "type": "SWAP",
+    "source": "JUPITER",
+    "fee": 5000,
+    "feePayer": "s7KMacZHd83q5bUtXhVkPPwRsxut1ipy93wfxmWpnn8",
+    "signature": "oxHDjX9ZKdNb2eekNxFNUaWrKHZnEpceFDRWGMYDm7Jh1YTxbUrDMXD3KsRkWUJmGj7qnrbqxFre7dhprU5nDRY",
+    "slot": 300000002,
+    "timestamp": 1763990002,
+    "nativeTransfers": [],
+    "tokenTransfers": [],
+    "accountData": [],
+    "transactionError": { "InstructionError": [2, { "Custom": 6001 }] },
+    "instructions": [],
+    "events": {}
+  },
+  {
+    "description": "",
+    "type": "SWAP",
+    "source": "PUMP_FUN",
+    "fee": 5000,
+    "feePayer": "8y5FVi7aTTSjwvLQkXFyRojbDrL8w9svysX8mZcEgmyK",
+    "signature": "4cFhJ1WXzVTcrRZ5t3hHnYxyakQgS8VbZ9cS2PUy2QfY7XqRT5a8xy9pZHUm1KkAGuGQ6WTnG7cS5JdBmcJbwMHe",
+    "slot": 300000001,
+    "timestamp": 1763990001,
+    "nativeTransfers": [
+      { "fromUserAccount": "8y5FVi7aTTSjwvLQkXFyRojbDrL8w9svysX8mZcEgmyK", "toUserAccount": "A66M6RCs76ViLDeCsdxqH95USH3x66ofT3YNLqHx7dkN", "amount": 200000000 },
+      { "fromUserAccount": "8y5FVi7aTTSjwvLQkXFyRojbDrL8w9svysX8mZcEgmyK", "toUserAccount": "9f2cite7PgVFQBGPGPGfMxaTebQvesxCuxkKaq3GUAEZ", "amount": 2039280 }
+    ],
+    "tokenTransfers": [
+      {
+        "fromTokenAccount": "6jj9HN2KCJ14QDBC5wfHUasoStm3jS9UCzRyiUrDmLnS",
+        "toTokenAccount": "9f2cite7PgVFQBGPGPGfMxaTebQvesxCuxkKaq3GUAEZ",
+        "fromUserAccount": "A66M6RCs76ViLDeCsdxqH95USH3x66ofT3YNLqHx7dkN",
+        "toUserAccount": "8y5FVi7aTTSjwvLQkXFyRojbDrL8w9svysX8mZcEgmyK",
+        "tokenAmount": 100000,
+        "mint": "AbYGhAcF86iLQpQQynmZPZAyMejskVFowy2P2LBktuaH",
+        "tokenStandard": "Fungible"
+      }
+    ],
+    "accountData": [],
+    "transactionError": null,
+    "instructions": [],
+    "events": {}
+  }
+]

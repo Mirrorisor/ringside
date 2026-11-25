@@ -1,0 +1,55 @@
+[
+  {
+    "description": "99cnRnduE5KdqhuJmYN5YH3WcnSiPQ152bF3hbxSfvKU swapped 1.5 SOL for 1000000 AbYGhAcF86iLQpQQynmZPZAyMejskVFowy2P2LBktuaH",
+    "type": "SWAP",
+    "source": "JUPITER",
+    "fee": 5000,
+    "feePayer": "99cnRnduE5KdqhuJmYN5YH3WcnSiPQ152bF3hbxSfvKU",
+    "signature": "5x9AVKHTZSDZ1oApPM3MqV3HkjpUu3diS7ePGVHCa3nKXgafKEmK85gFE7eXDP8HMFp8ZaDGKZUFeuG5QMuRc5M9",
+    "slot": 300000000,
+    "timestamp": 1763990001,
+    "nativeTransfers": [
+      { "fromUserAccount": "99cnRnduE5KdqhuJmYN5YH3WcnSiPQ152bF3hbxSfvKU", "toUserAccount": "A66M6RCs76ViLDeCsdxqH95USH3x66ofT3YNLqHx7dkN", "amount": 1500000000 }
+    ],
+    "tokenTransfers": [
+      {
+        "fromTokenAccount": "6jj9HN2KCJ14QDBC5wfHUasoStm3jS9UCzRyiUrDmLnS",
+        "toTokenAccount": "9f2cite7PgVFQBGPGPGfMxaTebQvesxCuxkKaq3GUAES",
+        "fromUserAccount": "A66M6RCs76ViLDeCsdxqH95USH3x66ofT3YNLqHx7dkN",
+        "toUserAccount": "99cnRnduE5KdqhuJmYN5YH3WcnSiPQ152bF3hbxSfvKU",
+        "tokenAmount": 1000000,
+        "mint": "AbYGhAcF86iLQpQQynmZPZAyMejskVFowy2P2LBktuaH",
+        "tokenStandard": "Fungible"
+      }
+    ],
+    "accountData": [],
+    "transactionError": null,
+    "instructions": [],
+    "events": {
+      "swap": {
+        "nativeInput": { "account": "99cnRnduE5KdqhuJmYN5YH3WcnSiPQ152bF3hbxSfvKU", "amount": "1500000000" },
+        "nativeOutput": null,
+        "tokenInputs": [],
+        "tokenOutputs": [
+          {
+            "userAccount": "99cnRnduE5KdqhuJmYN5YH3WcnSiPQ152bF3hbxSfvKU",
+            "tokenAccount": "9f2cite7PgVFQBGPGPGfMxaTebQvesxCuxkKaq3GUAES",
+            "mint": "AbYGhAcF86iLQpQQynmZPZAyMejskVFowy2P2LBktuaH",
+            "rawTokenAmount": { "tokenAmount": "1000000000000", "decimals": 6 }
+          }
+        ],
+        "tokenFees": [],
+        "nativeFees": [],
+        "innerSwaps": [
+          {
+            "tokenInputs": [],
+            "tokenOutputs": [],
+            "tokenFees": [],
+            "nativeFees": [],
+            "programInfo": { "source": "RAYDIUM", "account": "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8", "programName": "RAYDIUM_LIQUIDITY_POOL_V4", "instructionName": "swapBaseIn" }
+          }
+        ]
+      }
+    }
+  }
+]

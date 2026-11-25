@@ -1,0 +1,31 @@
+[
+  {
+    "description": "",
+    "type": "SWAP",
+    "source": "PUMP_FUN",
+    "fee": 5000,
+    "feePayer": "99cnRnduE5KdqhuJmYN5YH3WcnSiPQ152bF3hbxSfvKU",
+    "signature": "332JBLcuz7Xk1bPEMQkHKMvTaiCv9UqvNFYHdRKo5btHs5PdsEvyiMXkzVTyUokA2t7hiL9qUYAbXs7nMtusDa6i",
+    "slot": 300000100,
+    "timestamp": 1763990041,
+    "nativeTransfers": [
+      { "fromUserAccount": "A66M6RCs76ViLDeCsdxqH95USH3x66ofT3YNLqHx7dkN", "toUserAccount": "99cnRnduE5KdqhuJmYN5YH3WcnSiPQ152bF3hbxSfvKU", "amount": 900000000 },
+      { "fromUserAccount": "99cnRnduE5KdqhuJmYN5YH3WcnSiPQ152bF3hbxSfvKU", "toUserAccount": "4kDNxcX8XWf7a1fkNCVuMc2JMnTaK9qzkjmPfV7WAWWm", "amount": 9000000 }
+    ],
+    "tokenTransfers": [
+      {
+        "fromTokenAccount": "9f2cite7PgVFQBGPGPGfMxaTebQvesxCuxkKaq3GUAES",
+        "toTokenAccount": "6jj9HN2KCJ14QDBC5wfHUasoStm3jS9UCzRyiUrDmLnS",
+        "fromUserAccount": "99cnRnduE5KdqhuJmYN5YH3WcnSiPQ152bF3hbxSfvKU",
+        "toUserAccount": "A66M6RCs76ViLDeCsdxqH95USH3x66ofT3YNLqHx7dkN",
+        "tokenAmount": 400000,
+        "mint": "AbYGhAcF86iLQpQQynmZPZAyMejskVFowy2P2LBktuaH",
+        "tokenStandard": "Fungible"
+      }
+    ],
+    "accountData": [],
+    "transactionError": null,
+    "instructions": [],
+    "events": {}
+  }
+]
