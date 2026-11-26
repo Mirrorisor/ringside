@@ -676,12 +676,14 @@ async function main() {
   // Authentication: required, unless anonymous mode is switched on for devnet.
   let authenticate: Authenticator | undefined;
   const anon = truthy(env.SPONSOR_ALLOW_ANON);
-  if (env.SPONSOR_SESSION_SECRET) {
-    if (Buffer.byteLength(env.SPONSOR_SESSION_SECRET, "utf8") < 32) {
-      console.error("SPONSOR_SESSION_SECRET must be at least 32 bytes.");
+  // SESSION_SECRET is shared with the social backend and copy engine; SPONSOR_SESSION_SECRET overrides it.
+  const sessionSecret = env.SPONSOR_SESSION_SECRET || env.SESSION_SECRET;
+  if (sessionSecret) {
+    if (Buffer.byteLength(sessionSecret, "utf8") < 32) {
+      console.error("The session secret (SESSION_SECRET or SPONSOR_SESSION_SECRET) must be at least 32 bytes.");
       process.exit(1);
     }
-    authenticate = hmacSessionAuth(env.SPONSOR_SESSION_SECRET);
+    authenticate = hmacSessionAuth(sessionSecret);
   } else if (anon) {
     if (/mainnet/i.test(RPC_URL)) {
       console.error("SPONSOR_ALLOW_ANON=1 is refused on mainnet. Set SPONSOR_SESSION_SECRET.");
