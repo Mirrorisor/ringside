@@ -582,11 +582,11 @@ test("buildSwap: query, response mapping and an unsigned v0 transaction with our
   assert.equal(c.f.calls.length, 1);
   assert.equal(c.f.calls[0].key, "GET /swap/v2/build");
   assert.equal(c.f.calls[0].headers["x-api-key"], KEY);
-  assert.deepEqual(c.q.last, { inputMint: SOL, outputMint: USDC, amount: "1000000000", taker: c.taker, slippageBps: "100", payer: c.sponsor, platformFeeBps: "50", feeAccount: c.feeUsdc, transactionVersion: "0" });
+  assert.deepEqual(c.q.last, { inputMint: SOL, outputMint: USDC, amount: "1000000000", taker: c.taker, slippageBps: "100", payer: c.sponsor, platformFeeBps: "50", feeAccount: c.feeSol, transactionVersion: "0" });
   assert.equal(out.outAmount, "150000000");
   assert.equal(out.otherAmountThreshold, "149250000");
   assert.equal(out.slippageBps, 100);
-  assert.deepEqual(out.platformFee, { feeBps: 50, feeAccount: c.feeUsdc, feeMint: USDC });
+  assert.deepEqual(out.platformFee, { feeBps: 50, feeAccount: c.feeSol, feeMint: SOL });
   assert.equal(out.feeLamports, 5_000_000); // wSOL side 1 SOL x 50 bps
   assert.equal(out.lastValidBlockHeight, 777n);
   const ins = inspectTransaction(out.transaction);
@@ -651,8 +651,8 @@ test("buildSwap: refuses a response that routes the fee anywhere but our configu
   // fee slot holds the attacker's account instead of ours
   let { p } = await run((_q, a) => a.attacker);
   await assert.rejects(p, { code: "fee_account_mismatch" });
-  // fee slot holds our wSOL account while we asked for the USDC one
-  ({ p } = await run((_q, a) => a.feeSol));
+  // fee slot holds our USDC account while we asked for the wSOL one
+  ({ p } = await run((_q, a) => a.feeUsdc));
   await assert.rejects(p, { code: "fee_account_mismatch" });
   // fee requested but the response drops the fee (slot empty)
   ({ p } = await run(() => null));
@@ -699,4 +699,33 @@ test("parseFeeAccounts reads JSON or mint:account lists and validates addresses"
   assert.deepEqual(parseFeeAccounts(JSON.stringify({ [SOL]: A })), { [SOL]: A });
   assert.deepEqual(parseFeeAccounts(`${SOL}:${A}, ${USDC}:${A}`), { [SOL]: A, [USDC]: A });
   for (const bad of ["{nope", "[]", `${SOL}`, `${SOL}:x`, `${SOL}:${A}:extra`]) assert.throws(() => parseFeeAccounts(bad), (e) => e instanceof JupiterError && ["fee_accounts", "bad_address"].includes(e.code));
+});
+
+test("routeV2 from live /build responses: fee slot read from the data, our account accepted, others refused", async () => {
+  const { readFileSync } = await import("node:fs");
+  const live = JSON.parse(readFileSync(new URL("./fixtures/jupiter/build-live.json", import.meta.url), "utf8")).cases;
+  const ix = (c) => [{ program: c.swapInstruction.programId, accounts: c.swapInstruction.accounts.map((a) => a.pubkey), data: Buffer.from(c.swapInstruction.data, "base64") }];
+  const FEE_USDC = "8iHT9Q9BH3vvhrJHE8pK7tpWueueJokBEw8Kb6F2rZNK", FEE_WSOL = "BhPk4nEvu26LFouQpr9Q391JJrxxxJWhrBkZy9xxhr7Q";
+  checkPlatformFee(ix(live.sol_to_usdc_fee_usdc), { expected: FEE_USDC });
+  checkPlatformFee(ix(live.sol_to_usdc_fee_wsol), { expected: FEE_WSOL });
+  checkPlatformFee(ix(live.usdc_to_sol_fee_wsol), { expected: FEE_WSOL });
+  checkPlatformFee(ix(live.sol_to_usdc_no_fee), { expected: null });
+  checkPlatformFee(ix(live.sol_to_usdc_fee_wsol), { ours: [FEE_USDC, FEE_WSOL] });
+  // Someone else's fee account, or a fee where none was asked for, or none where one was.
+  assert.throws(() => checkPlatformFee(ix(live.sol_to_usdc_fee_usdc), { expected: FEE_WSOL }), { code: "fee_account_mismatch" });
+  assert.throws(() => checkPlatformFee(ix(live.sol_to_usdc_fee_usdc), { expected: null }), { code: "fee_account_mismatch" });
+  assert.throws(() => checkPlatformFee(ix(live.sol_to_usdc_no_fee), { expected: FEE_USDC }), { code: "fee_account_mismatch" });
+  assert.throws(() => checkPlatformFee(ix(live.sol_to_usdc_fee_usdc), { ours: [FEE_WSOL] }), { code: "fee_account_mismatch" });
+  // A tampered response that keeps the fee bps but swaps the account at slot 10.
+  const t = structuredClone(live.sol_to_usdc_fee_usdc);
+  t.swapInstruction.accounts[10].pubkey = "9iFER3bpjf1PTTCQCfTRu17EJgvsxo9pVyA9QWwEuX4x";
+  assert.throws(() => checkPlatformFee(ix(t), { expected: FEE_USDC }), { code: "fee_account_mismatch" });
+  // Net of fee: the fee quote returns less than the no-fee quote.
+  assert.ok(BigInt(live.sol_to_usdc_fee_wsol.outAmount) < BigInt(live.sol_to_usdc_no_fee.outAmount));
+});
+
+test("fee account choice prefers wrapped SOL when either side is SOL", () => {
+  const j = new Jupiter({ feeAccounts: { So11111111111111111111111111111111111111112: "BhPk4nEvu26LFouQpr9Q391JJrxxxJWhrBkZy9xxhr7Q", EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v: "8iHT9Q9BH3vvhrJHE8pK7tpWueueJokBEw8Kb6F2rZNK" } });
+  assert.equal(j.pickFeeAccount("So11111111111111111111111111111111111111112", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").feeAccount, "BhPk4nEvu26LFouQpr9Q391JJrxxxJWhrBkZy9xxhr7Q");
+  assert.equal(j.pickFeeAccount("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "So11111111111111111111111111111111111111112").feeAccount, "BhPk4nEvu26LFouQpr9Q391JJrxxxJWhrBkZy9xxhr7Q");
 });

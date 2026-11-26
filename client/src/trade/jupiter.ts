@@ -45,12 +45,10 @@
  * (never the response's `addressesByLookupTableAddress`, which the API could
  * lie about), check it, and refuse anything that routes the fee anywhere but
  * our configured account (`checkPlatformFee`).
- * ASSUMPTION: the docs do not say which mint a /build platform fee is taken in
- * for ExactIn. The docs for the older Metis API say input or output for
- * ExactIn and that the feeAccount mint must be one of the pair, so we choose
- * the mint by the account we pass (output mint preferred, then input).
- * ASSUMPTION: outAmount / otherAmountThreshold are quote values as the API
- * returns them; we do not adjust them for the fee.
+ * Verified live (26 Nov 2026, jupiter-live-report): for ExactIn the fee is
+ * taken in whichever pair mint our fee account holds, input or output, so we
+ * prefer wrapped SOL (fees pile up in SOL), then the output, then the input.
+ * outAmount / otherAmountThreshold are already net of the platform fee.
  *
  * ---------------------------------------------------------------------------
  * Referral fees (/order only, no longer used for copy trading): setup notes
@@ -586,7 +584,13 @@ export async function checkAndSign(
  * programDestination, destination, sourceMint, destinationMint,
  * platformFeeAccount, ...). An absent optional account is the program id.
  */
-const FEE_SLOT: { disc: string; slot: number }[] = [
+const FEE_SLOT: { disc: string; slot: number; feeBpsAt?: number }[] = [
+  // routeV2, the instruction /swap/v2/build returns today. Verified live (26 Nov 2026):
+  // accounts userTransferAuthority, userSource, userDestination, sourceMint,
+  // destinationMint, sourceTokenProgram, destinationTokenProgram,
+  // destinationTokenAccount (optional), eventAuthority, program, then the
+  // platform fee account at 10 only when platform_fee_bps (u16 LE at data[26..28]) > 0.
+  { disc: "bb64facc31c4af14", slot: 10, feeBpsAt: 26 },
   { disc: "e517cb977ae3ad2a", slot: 6 }, // route
   { disc: "d033ef977b2bed5c", slot: 6 }, // exactOutRoute
   { disc: "c1209b3341d69c81", slot: 9 }, // sharedAccountsRoute
@@ -608,7 +612,10 @@ export function checkPlatformFee(ixs: CheckIx[], o: { expected?: Address | null;
   for (const { ix, i } of swaps) {
     const rule = FEE_SLOT.find((r) => r.disc === hex(ix.data.subarray(0, 8)));
     if (!rule) refuse("fee_account_unverified", i, "unknown Jupiter swap instruction layout: cannot verify where the platform fee goes.");
-    const got = ix.accounts[rule!.slot];
+    const feeBps = rule!.feeBpsAt === undefined ? null : ix.data.length >= rule!.feeBpsAt + 2 ? ix.data[rule!.feeBpsAt] | (ix.data[rule!.feeBpsAt + 1] << 8) : -1;
+    if (feeBps === -1) refuse("fee_account_unverified", i, "Jupiter swap instruction too short to read its fee.");
+    // routeV2 has no placeholder: with no fee, slot 10 is a route account, not a fee account.
+    const got = feeBps === 0 ? TX_PROGRAMS.jupiterSwap : ix.accounts[rule!.slot];
     const none = got === TX_PROGRAMS.jupiterSwap;
     if (o.expected !== undefined) {
       if (o.expected === null ? !none : got !== o.expected) refuse("fee_account_mismatch", i, `platform fee goes to ${none ? "nobody" : (got ?? "a lookup-table account")}, not ${o.expected ?? "nobody"}.`);
@@ -886,10 +893,11 @@ export class Jupiter {
     return signedTransaction;
   }
 
-  /** The fee account and mint for a pair: output mint first, then input. Null when we hold none for either. */
+  /** The fee account and mint for a pair: wrapped SOL first, then the output mint, then the input. Null when we hold none. */
   pickFeeAccount(inputMint: string, outputMint: string, feeAccounts?: Record<string, string>): { feeAccount: Address; feeMint: Address } | null {
     const map = feeAccounts ?? this.opts.feeAccounts ?? parseFeeAccounts(process.env.JUPITER_FEE_ACCOUNTS);
-    for (const mint of [outputMint, inputMint]) {
+    const order = [inputMint, outputMint].includes(WSOL_MINT) ? [WSOL_MINT, outputMint, inputMint] : [outputMint, inputMint];
+    for (const mint of order) {
       const a = map[mint];
       if (a) return { feeAccount: addr(a, `feeAccounts[${mint}]`), feeMint: addr(mint, "feeMint") };
     }
