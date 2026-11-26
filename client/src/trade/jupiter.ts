@@ -625,6 +625,23 @@ export function checkPlatformFee(ixs: CheckIx[], o: { expected?: Address | null;
   }
 }
 
+/**
+ * The platform fee, in bps, that the decoded swap instruction(s) actually carry (routeV2 `platform_fee_bps`, u16 LE at
+ * data[26..28]). Null when no swap instruction in the transaction has a layout that carries it (older route layouts).
+ * Reported fees must come from here, not from what we asked the API for.
+ */
+export function decodedPlatformFeeBps(ixs: CheckIx[]): number | null {
+  let out: number | null = null;
+  for (const ix of ixs) {
+    if (ix.program !== TX_PROGRAMS.jupiterSwap) continue;
+    const rule = FEE_SLOT.find((r) => r.disc === hex(ix.data.subarray(0, 8)));
+    if (!rule || rule.feeBpsAt === undefined || ix.data.length < rule.feeBpsAt + 2) continue;
+    const b = ix.data[rule.feeBpsAt] | (ix.data[rule.feeBpsAt + 1] << 8);
+    out = Math.max(out ?? 0, b);
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // Swap V2 types
 // ---------------------------------------------------------------------------
@@ -978,14 +995,19 @@ export class Jupiter {
     const transaction = getBase64EncodedWireTransaction(compileTransaction(msg));
 
     await checkTransaction(transaction, { user: taker, feePayers: [payer], policy: this.opts.txPolicy, lookups });
-    checkPlatformFee(instructionsOf(transaction, lookups).ixs, { expected: fee ? fee.feeAccount : null });
+    const decodedIxs = instructionsOf(transaction, lookups).ixs;
+    checkPlatformFee(decodedIxs, { expected: fee ? fee.feeAccount : null });
+    // The fee we report is the one in the instruction we will have signed, never the one we asked for.
+    const decodedBps = decodedPlatformFeeBps(decodedIxs);
+    if (decodedBps !== null && decodedBps > (fee ? bps : 0)) throw new JupiterError(0, "bad_response", `Build carries a ${decodedBps} bps platform fee, more than the ${fee ? bps : 0} bps requested.`);
+    const feeBps = fee ? (decodedBps ?? bps) : 0;
 
     const solSide = inputMint === WSOL_MINT ? BigInt(amount) : outputMint === WSOL_MINT ? BigInt(r.outAmount) : 0n;
     return {
       transaction, inputMint, outputMint, inAmount: r.inAmount, outAmount: r.outAmount, otherAmountThreshold: r.otherAmountThreshold,
       slippageBps: r.slippageBps, priceImpactPct: r.priceImpactPct,
-      platformFee: fee ? { feeBps: bps, feeAccount: fee.feeAccount, feeMint: fee.feeMint } : null,
-      feeLamports: fee ? Number((solSide * BigInt(bps)) / 10_000n) : 0,
+      platformFee: fee ? { feeBps, feeAccount: fee.feeAccount, feeMint: fee.feeMint } : null,
+      feeLamports: fee ? Number((solSide * BigInt(feeBps)) / 10_000n) : 0,
       lastValidBlockHeight: life.lastValidBlockHeight, taker, payer,
     };
   }

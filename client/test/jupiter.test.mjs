@@ -533,7 +533,7 @@ test("baseUrl is pinned to api.jup.ag unless opted out, and must be https", asyn
 // ---------------------------------------------------------------------------
 // /swap/v2/build with a platform fee
 // ---------------------------------------------------------------------------
-import { parseFeeAccounts, checkPlatformFee, instructionsOf } from "../dist/trade/jupiter.js";
+import { parseFeeAccounts, checkPlatformFee, instructionsOf, decodedPlatformFeeBps } from "../dist/trade/jupiter.js";
 
 const DISC = { route: [229, 23, 203, 151, 122, 227, 173, 42], shared: [193, 32, 155, 51, 65, 214, 156, 129], ledger: [150, 86, 71, 116, 167, 93, 14, 104] };
 const FEE_SLOT = { route: 6, shared: 9, ledger: 6 };
@@ -728,4 +728,16 @@ test("fee account choice prefers wrapped SOL when either side is SOL", () => {
   const j = new Jupiter({ feeAccounts: { So11111111111111111111111111111111111111112: "BhPk4nEvu26LFouQpr9Q391JJrxxxJWhrBkZy9xxhr7Q", EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v: "8iHT9Q9BH3vvhrJHE8pK7tpWueueJokBEw8Kb6F2rZNK" } });
   assert.equal(j.pickFeeAccount("So11111111111111111111111111111111111111112", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").feeAccount, "BhPk4nEvu26LFouQpr9Q391JJrxxxJWhrBkZy9xxhr7Q");
   assert.equal(j.pickFeeAccount("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "So11111111111111111111111111111111111111112").feeAccount, "BhPk4nEvu26LFouQpr9Q391JJrxxxJWhrBkZy9xxhr7Q");
+});
+
+test("L6: the reported platform fee bps come from the decoded routeV2 instruction", async () => {
+  const { readFileSync } = await import("node:fs");
+  const live = JSON.parse(readFileSync(new URL("./fixtures/jupiter/build-live.json", import.meta.url), "utf8")).cases;
+  const ix = (c) => [{ program: c.swapInstruction.programId, accounts: c.swapInstruction.accounts.map((a) => a.pubkey), data: Buffer.from(c.swapInstruction.data, "base64") }];
+  assert.equal(decodedPlatformFeeBps(ix(live.sol_to_usdc_no_fee)), 0);
+  const withFee = decodedPlatformFeeBps(ix(live.sol_to_usdc_fee_wsol));
+  assert.ok(withFee > 0);
+  const t = ix(live.sol_to_usdc_fee_wsol); t[0].data = Buffer.from(t[0].data); t[0].data.writeUInt16LE(withFee + 100, 26);
+  assert.equal(decodedPlatformFeeBps(t), withFee + 100);
+  assert.equal(decodedPlatformFeeBps([]), null, "no swap instruction, nothing to report");
 });

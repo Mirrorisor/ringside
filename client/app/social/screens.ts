@@ -319,7 +319,15 @@ export function mountSocial(root: HTMLElement, tabs: HTMLElement, env: Env, onTa
     ];
     const unk = (v: string | null) => v ?? "unknown";
     // What will be signed, from the build response and the decoded transaction (never the leader's cost basis).
+    const usdc = (x: bigint | null) => (x === null ? "unknown" : `$${(Number(x) / 1e6).toFixed(2)} USDC`);
     const reviewRows = (v: BuiltView) => {
+      if (v.perp) return [
+        h("div", null, h("span", null, "Venue (in the transaction)"), h("b", null, VENUE_TEXT[i.venue] ?? unk(v.venue))),
+        h("div", null, h("span", null, "Position size"), h("b", null, i.side === "close" ? "Closes the whole position" : usdc(v.expectedOut))),
+        h("div", null, h("span", null, "Collateral"), h("b", null, i.side === "close" ? "Returned on fill" : usdc(v.collateralUsdc))),
+        h("div", null, h("span", null, "Trade fee (USDC, taken on fill)"), h("b", null, usdc(v.feeUsdc))),
+        h("div", null, h("span", null, "Fees"), h("b", null, "Your wallet pays the order's rent (refunded on fill). Network fee is paid by the sponsor.")),
+      ];
       const sell = i.side === "sell";
       const out = (x: bigint | null) => (x === null ? "unknown" : sell ? sol(Number(x)) : `${x} tokens (base units)`);
       return [

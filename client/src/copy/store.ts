@@ -11,6 +11,8 @@ export type StoredIntent = CopyIntent & {
   builtExpiresAt?: number;
   /** When the follower reported the signature. */
   sentAt?: number;
+  /** Perp closes: the leader's side that closed. A close only ever touches this side. */
+  perpSide?: "long" | "short";
 };
 export interface CopyPosition { tokens: bigint; costLamports: bigint }
 
@@ -30,10 +32,11 @@ const toIntent = (r: Row): StoredIntent => {
   if (r.source_slot !== null) i.sourceSlot = Number(r.source_slot);
   if (r.built_expires_at !== null) i.builtExpiresAt = Number(r.built_expires_at);
   if (r.sent_at !== null) i.sentAt = Number(r.sent_at);
+  if (r.perp_side !== null && r.perp_side !== undefined) i.perpSide = r.perp_side as "long" | "short";
   return i;
 };
 /** The shape returned to callers outside the service. */
-export const publicIntent = ({ slippageBps: _s, signature: _g, sourceSlot: _o, builtExpiresAt: _b, sentAt: _t, ...i }: StoredIntent): CopyIntent => i;
+export const publicIntent = ({ slippageBps: _s, signature: _g, sourceSlot: _o, builtExpiresAt: _b, sentAt: _t, perpSide: _p, ...i }: StoredIntent): CopyIntent => i;
 
 export class CopyStore {
   private db: DatabaseSync;
@@ -54,6 +57,14 @@ export class CopyStore {
         follower TEXT NOT NULL, mint TEXT NOT NULL, tokens TEXT NOT NULL, cost_lamports TEXT NOT NULL,
         PRIMARY KEY (follower, mint)
       );
+      CREATE TABLE IF NOT EXISTS perp_positions (
+        follower TEXT NOT NULL, leader TEXT NOT NULL, mint TEXT NOT NULL, side TEXT NOT NULL,
+        PRIMARY KEY (follower, leader, mint, side)
+      );
+      CREATE TABLE IF NOT EXISTS leader_perp_sizes (
+        leader TEXT NOT NULL, mint TEXT NOT NULL, side TEXT NOT NULL, size_usd REAL NOT NULL, prev_size_usd REAL, signature TEXT NOT NULL,
+        PRIMARY KEY (leader, mint, side)
+      );
       CREATE TABLE IF NOT EXISTS leader_sells (
         signature TEXT PRIMARY KEY, leader TEXT NOT NULL, mint TEXT NOT NULL, slot INTEGER NOT NULL
       );
@@ -61,7 +72,7 @@ export class CopyStore {
     `);
     // Databases created before these columns existed.
     const have = new Set((this.db.prepare("PRAGMA table_info(intents)").all() as Row[]).map((c) => c.name as string));
-    for (const [col, type] of [["leader_price", "REAL"], ["source_slot", "INTEGER"], ["built_expires_at", "INTEGER"], ["sent_at", "INTEGER"]]) {
+    for (const [col, type] of [["leader_price", "REAL"], ["source_slot", "INTEGER"], ["built_expires_at", "INTEGER"], ["sent_at", "INTEGER"], ["perp_side", "TEXT"]]) {
       if (!have.has(col)) this.db.exec(`ALTER TABLE intents ADD COLUMN ${col} ${type}`);
     }
     // A signature can prove at most one intent.
@@ -71,10 +82,10 @@ export class CopyStore {
   /** Inserts the intent, or returns the existing one for the same (follower, sourceSignature). */
   insert(i: StoredIntent): { intent: StoredIntent; created: boolean } {
     const r = this.db.prepare(`INSERT OR IGNORE INTO intents
-      (id, follower, leader, source_sig, kind, mint, side, venue, lamports, tokens, leverage, created_at, expires_at, status, skip_reason, slippage_bps, leader_price, source_slot)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+      (id, follower, leader, source_sig, kind, mint, side, venue, lamports, tokens, leverage, created_at, expires_at, status, skip_reason, slippage_bps, leader_price, source_slot, perp_side)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
       i.id, i.follower, i.leader, i.sourceSignature, i.kind, i.mint, i.side, i.venue, i.lamports ?? null, i.tokens ?? null, i.leverage ?? null,
-      i.createdAt, i.expiresAt, i.status, i.skipReason ?? null, i.slippageBps, i.leaderPrice ?? null, i.sourceSlot ?? null);
+      i.createdAt, i.expiresAt, i.status, i.skipReason ?? null, i.slippageBps, i.leaderPrice ?? null, i.sourceSlot ?? null, i.perpSide ?? null);
     if (Number(r.changes) === 1) return { intent: i, created: true };
     return { intent: toIntent(this.db.prepare("SELECT * FROM intents WHERE follower=? AND source_sig=?").get(i.follower, i.sourceSignature) as Row), created: false };
   }
@@ -136,6 +147,34 @@ export class CopyStore {
     return Number(r.n);
   }
 
+  /** Whether `follower` holds a perp position on `side` of `mint` that came from copying `leader` (confirmed on chain). */
+  copiedPerp(follower: string, leader: string, mint: string, side: "long" | "short"): boolean {
+    return !!this.db.prepare("SELECT 1 FROM perp_positions WHERE follower=? AND leader=? AND mint=? AND side=?").get(follower, leader, mint, side);
+  }
+
+  /**
+   * Records the leader's position size after a perp open/increase event and returns the size before it, or null if
+   * that is not known (first event seen for this leader/market/side, or the size did not grow, which means the
+   * record is stale, for example after a liquidation that is not an event here). Replaying the same signature
+   * returns the same answer. `prevSizeUsd` is the event's own previous size when the source knows it.
+   */
+  leaderPerpStep(leader: string, mint: string, side: "long" | "short", sizeUsd: number, signature: string, prevSizeUsd?: number): number | null {
+    const r = this.db.prepare("SELECT size_usd, prev_size_usd, signature FROM leader_perp_sizes WHERE leader=? AND mint=? AND side=?").get(leader, mint, side) as Row | undefined;
+    if (r && r.signature === signature) return r.prev_size_usd === null ? null : Number(r.prev_size_usd);
+    let prev: number | null = prevSizeUsd !== undefined && Number.isFinite(prevSizeUsd) && prevSizeUsd >= 0 ? prevSizeUsd : r ? Number(r.size_usd) : null;
+    if (prev !== null && !(sizeUsd > prev)) prev = null;
+    this.db.prepare(`INSERT INTO leader_perp_sizes (leader, mint, side, size_usd, prev_size_usd, signature) VALUES (?,?,?,?,?,?)
+      ON CONFLICT(leader, mint, side) DO UPDATE SET size_usd=excluded.size_usd, prev_size_usd=excluded.prev_size_usd, signature=excluded.signature`)
+      .run(leader, mint, side, sizeUsd, prev, signature);
+    return prev;
+  }
+
+  /** The leader closed a side: its next open starts from zero. */
+  leaderPerpClosed(leader: string, mint: string, side: "long" | "short", signature: string): void {
+    this.db.prepare(`INSERT INTO leader_perp_sizes (leader, mint, side, size_usd, prev_size_usd, signature) VALUES (?,?,?,0,NULL,?)
+      ON CONFLICT(leader, mint, side) DO UPDATE SET size_usd=0, prev_size_usd=NULL, signature=excluded.signature`).run(leader, mint, side, signature);
+  }
+
   /** pending -> built, recording what the builder quoted. The built state lapses at `builtExpiresAt` (ms) if given. */
   markBuilt(id: string, q: { venue: CopyIntent["venue"]; lamports?: number; tokens?: string }, builtExpiresAt?: number): boolean {
     return Number(this.db.prepare("UPDATE intents SET status='built', venue=?, lamports=COALESCE(?,lamports), tokens=COALESCE(?,tokens), built_expires_at=? WHERE id=? AND status='pending'")
@@ -188,6 +227,13 @@ export class CopyStore {
         }
         this.db.prepare("INSERT INTO positions (follower, mint, tokens, cost_lamports) VALUES (?,?,?,?) ON CONFLICT(follower, mint) DO UPDATE SET tokens=excluded.tokens, cost_lamports=excluded.cost_lamports")
           .run(i.follower, i.mint, next.tokens.toString(), next.costLamports.toString());
+      }
+      if (i.kind === "perp") {
+        if (i.side === "long" || i.side === "short") {
+          this.db.prepare("INSERT OR IGNORE INTO perp_positions (follower, leader, mint, side) VALUES (?,?,?,?)").run(i.follower, i.leader, i.mint, i.side);
+        } else if (i.side === "close" && i.perpSide) {
+          this.db.prepare("DELETE FROM perp_positions WHERE follower=? AND leader=? AND mint=? AND side=?").run(i.follower, i.leader, i.mint, i.perpSide);
+        }
       }
       this.db.exec("COMMIT");
     } catch (e) {

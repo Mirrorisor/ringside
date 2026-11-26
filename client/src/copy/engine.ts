@@ -8,7 +8,8 @@
  * unsupported_quote, perps_gate_off, perps_disabled, no_perp_market, no_price,
  * token_age_unknown, token_too_young, flagged:<flag>, over_per_trade_cap,
  * over_daily_cap, sells_disabled, no_copy_position, sell_too_small,
- * leader_trade_too_small (buys only). Build-time refusals (build.ts): price_moved, leader_exited.
+ * leader_trade_too_small (buys only), perp_size_unknown (ratio mode, the leader's size change cannot be determined).
+ * Build-time refusals (build.ts): price_moved, leader_exited.
  *
  * Caps and the token filters (flags, age) apply to entries (buys, opens).
  * Exits (sells, closes) are never blocked by them: a follower must be able to
@@ -84,7 +85,13 @@ export class CopyEngine {
   }
 
   onLeaderPerp(ev: PerpEvent): Promise<CopyIntent[]> {
-    return this.serial(() => this.handle(ev.leader, ev.signature, ev.timestamp, (s) => this.perp(s, ev)));
+    return this.serial(() => {
+      // Track the leader's size once per event, whoever follows: ratio sizing needs the change, not the total.
+      let prev: number | null = null;
+      if (ev.action === "close") this.o.store.leaderPerpClosed(ev.leader, ev.mint, ev.side, ev.signature);
+      else prev = this.o.store.leaderPerpStep(ev.leader, ev.mint, ev.side, ev.sizeUsd, ev.signature, ev.prevSizeUsd);
+      return this.handle(ev.leader, ev.signature, ev.timestamp, (s) => this.perp(s, ev, prev));
+    });
   }
 
   private async handle(leader: string, signature: string, tsSec: number, decide: (s: CopySettings) => Promise<Decision>): Promise<CopyIntent[]> {
@@ -110,7 +117,7 @@ export class CopyEngine {
         slippageBps: isNat(s.slippageBps) ? s.slippageBps : 100,
       };
       const row: StoredIntent = "skip" in d
-        ? { ...base, kind: d.kind ?? "spot", mint: d.mint ?? "", side: d.side ?? "buy", venue: d.venue ?? "jupiter", status: "skipped", skipReason: d.skip }
+        ? { ...base, kind: d.kind ?? "spot", mint: d.mint ?? "", side: d.side ?? "buy", venue: d.venue ?? "jupiter", status: "skipped", skipReason: d.skip, perpSide: d.perpSide }
         : { ...base, ...d.intent, status: "pending" };
       const { intent, created } = this.o.store.insert(row);
       out.push(publicIntent(intent));
@@ -182,13 +189,14 @@ export class CopyEngine {
     return why ? skip(why) : { intent: { ...meta, lamports, leaderPrice: Number.isFinite(leaderPrice) && leaderPrice > 0 ? leaderPrice : undefined, sourceSlot: t.slot } };
   }
 
-  private async perp(s: CopySettings, e: PerpEvent): Promise<Decision> {
-    const meta = { kind: "perp" as const, mint: e.mint, side: e.action === "close" ? ("close" as const) : e.side, venue: "ringside-perps" as const };
+  private async perp(s: CopySettings, e: PerpEvent, prevSizeUsd: number | null): Promise<Decision> {
+    const meta = { kind: "perp" as const, mint: e.mint, side: e.action === "close" ? ("close" as const) : e.side, venue: "ringside-perps" as const, ...(e.action === "close" ? { perpSide: e.side } : {}) };
     const skip = (reason: string): Decision => ({ skip: reason, ...meta });
     if (!this.perpsOn) return skip("perps_gate_off");
     if (!s.copyPerps) return skip("perps_disabled");
     if (e.action === "close") {
-      return this.o.store.openPerps(s.follower, e.mint) > 0 ? { intent: { ...meta } } : skip("no_copy_position");
+      // Only the side the leader closed, and only a position that came from copying this leader.
+      return this.o.store.copiedPerp(s.follower, s.leader, e.mint, e.side) ? { intent: { ...meta } } : skip("no_copy_position");
     }
     const tier = (await this.o.tiers?.tierOf(e.mint)) ?? null;
     if (this.o.tiers && tier === null) return skip("no_perp_market");
@@ -199,7 +207,11 @@ export class CopyEngine {
     else {
       const px = await this.o.solPriceUsd?.();
       if (!px || !(px > 0)) return skip("no_price");
-      lamports = Math.floor(((e.sizeUsd / px) * LAMPORTS_PER_SOL * s.ratioBps) / 10_000);
+      // The event carries the position's total after the fill; copy only what the leader added.
+      if (prevSizeUsd === null) return skip("perp_size_unknown");
+      const added = e.sizeUsd - prevSizeUsd;
+      if (!(added > 0)) return skip("perp_size_unknown");
+      lamports = Math.floor(((added / px) * LAMPORTS_PER_SOL * s.ratioBps) / 10_000);
     }
     if (lamports <= 0) return skip("over_per_trade_cap");
     const why = (await this.tokenSkip(s, e.mint)) ?? this.capSkip(s, lamports);
@@ -207,7 +219,7 @@ export class CopyEngine {
   }
 }
 
-type IntentCore = Pick<CopyIntent, "kind" | "mint" | "side" | "venue"> & Partial<Pick<CopyIntent, "lamports" | "tokens" | "leverage" | "leaderPrice">> & { sourceSlot?: number };
+type IntentCore = Pick<CopyIntent, "kind" | "mint" | "side" | "venue"> & Partial<Pick<CopyIntent, "lamports" | "tokens" | "leverage" | "leaderPrice">> & { sourceSlot?: number; perpSide?: "long" | "short" };
 type Decision = ({ skip: string } & Partial<IntentCore>) | { intent: IntentCore };
 
 /** Venue hint from the leader's trade source; the builder decides for real at build time. */
