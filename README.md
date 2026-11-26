@@ -1,8 +1,6 @@
-# Longshot
+# Ringside
 
-_Formerly Ringside. On-chain program names (`ringside_launch`, `ringside_perps`), seeds and env vars keep the old name, so deployed addresses don't change._
-
-Go long or short any coin from minute one. Longshot is a Solana launchpad and social trading app: every token gets a perpetual futures market from its first block, and you can follow and copy the traders who play them best. Tokens graduate to Raydium when their curve sells out, and Helius Solana Privacy Rings handle private funding and payouts.
+A Solana token launchpad that gives every token a perpetual futures market from its first block. Tokens graduate to Raydium when their curve sells out, and Helius Solana Privacy Rings handle private funding and payouts.
 
 **Status: running end to end on devnet, not audited.** Don't deploy to mainnet with real funds until the launch checklist in the spec (Roadmap → Mainnet launch checklist) is complete.
 
@@ -13,7 +11,7 @@ This code is public and **unaudited**. Treat it as a reference for review, not s
 - **Report vulnerabilities privately.** Use GitHub's private vulnerability reporting on this repo (Security → Report a vulnerability). Please don't open public issues for security bugs. A paid bounty will run on Immunefi before mainnet deposits open.
 - **Scope that matters most:** the graduation CPI into Raydium (lamport accounting, SBF stack frames), mark pricing (curve price, pool TWAP, the price band), Pyth parsing, LP share pricing and the withdrawal delay, per-market loss budgets and ADL, and the admin handover.
 - **Mainnet keys:** upgrade authority, admin and treasury go to a Squads multisig; the manual SOL price authority goes to a key nobody holds. `init-mainnet.ts` refuses a single-key upgrade authority.
-- **Privacy:** Helius Rings' first mainnet ring hides amounts, not who sent to whom. Don't rely on Longshot's private funding to unlink wallets until that's verified on chain.
+- **Privacy:** Helius Rings' first mainnet ring hides amounts, not who sent to whom. Don't rely on Ringside's private funding to unlink wallets until that's verified on chain.
 - **No licence.** All rights reserved; you may read the code, not reuse it.
 
 ## What works on devnet today

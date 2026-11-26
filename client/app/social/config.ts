@@ -20,7 +20,7 @@ export const INDEXER = backendBase("indexer", "/indexer");
 export const SOCIAL = backendBase("social", "/social");
 export const SPONSOR = backendBase("sponsor", "/sponsor");
 export const COPY = backendBase("copy", "/copy");
-/** Longshot fee wallet: the only recipient a copy transaction may pay from the user's SOL. */
+/** Ringside fee wallet: the only recipient a copy transaction may pay from the user's SOL. */
 export const FEE_WALLET = meta.env.VITE_FEE_WALLET ?? "";
 /** Expected gas sponsor (fee payer). When unset, the sponsor's own /health is asked. */
 export const SPONSOR_ADDRESS = meta.env.VITE_SPONSOR_ADDRESS ?? "";
