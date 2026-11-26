@@ -107,7 +107,8 @@ async function main() {
   console.log("\nCreator-fee lock verified on devnet.");
 }
 
-main().catch((e) => {
+// Exit explicitly: the RPC websocket otherwise keeps the process alive after success.
+main().then(() => process.exit(0)).catch((e) => {
   console.error(redact(String(e?.message ?? e)));
   process.exit(1);
 });
