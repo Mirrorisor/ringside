@@ -21,12 +21,14 @@
  * v2 pool after migration), a pool not quoted in plain SOL (`unsupported_quote`),
  * a transfer-hook base mint (`unsupported_token_program`).
  *
- * Token-2022: a base mint with a transfer fee is QUOTED, not refused. DBC fixes
- * the fee on the config (`transferFeeFlag` / `transferFeeBasisPoints`) and the
- * SDK takes it off the tokens a buyer receives and off the tokens a seller
+ * Token-2022: a base mint with a transfer fee is QUOTED, not refused. The SDK
+ * takes the fee off the tokens a buyer receives and off the tokens a seller
  * sends, so `tokensOut` is what lands in the wallet and `tokensIn` is what
- * leaves it. A mint that carries a TransferFeeConfig the pool config does not
- * declare cannot be quoted reliably and is refused.
+ * leaves it. The fee is the mint's own TransferFeeConfig for the CURRENT epoch
+ * (older or newer fee, as Token-2022 itself picks; the epoch comes from the
+ * injected `rpc.getEpochInfo`), not the pool config's stored basis points,
+ * which the authority may have changed since. A mint that carries a
+ * TransferFeeConfig the pool config does not declare is refused.
  *
  * Why `createRequire`: web3.js `PublicKey` must be one class across SDKs
  * (pumpfun.ts loads the CJS graph), and the SDK's ESM build would pull a second
@@ -37,6 +39,7 @@ import { address, type Address, type Instruction } from "@solana/kit";
 import type * as DbcModule from "@meteora-ag/dynamic-bonding-curve-sdk";
 import type * as Web3Module from "@solana/web3.js";
 import type * as SplTokenModule from "@solana/spl-token";
+import type { Mint } from "@solana/spl-token";
 import type { AccountInfo, Commitment, PublicKey, TransactionInstruction } from "@solana/web3.js";
 import type { PoolConfig, VirtualPool } from "@meteora-ag/dynamic-bonding-curve-sdk";
 import {
@@ -64,6 +67,9 @@ export type { BuiltTrade };
 /** Byte offset of `base_mint` in a VirtualPool account: discriminator, volatility tracker, config, creator. */
 export const VIRTUAL_POOL_BASE_MINT_OFFSET = 8 + 64 + 32 + 32;
 
+/** Default time a discovered mint -> pool mapping is trusted before it is looked up again. */
+export const DEFAULT_POOL_CACHE_TTL_MS = 10 * 60 * 1000;
+
 /**
  * The RPC calls this module makes. A web3.js `Connection` satisfies it; tests
  * pass a fake. `getAccountInfo` is for the SDK's `swap2`.
@@ -73,9 +79,11 @@ export interface MeteoraRpc {
   getMultipleAccountsInfo(keys: PublicKey[], commitment?: Commitment): Promise<(AccountInfo<Buffer> | null)[]>;
   getProgramAccounts(
     program: PublicKey,
-    config: { commitment?: Commitment; filters?: unknown[]; dataSlice?: { offset: number; length: number } },
+    config: { commitment?: Commitment; filters?: unknown[] },
   ): Promise<{ pubkey: PublicKey; account: AccountInfo<Buffer> }[]>;
   getSlot(commitment?: Commitment): Promise<number>;
+  /** Current epoch, for the Token-2022 transfer fee in force now. */
+  getEpochInfo(commitment?: Commitment): Promise<{ epoch: number }>;
   getBlockTime(slot: number): Promise<number | null>;
 }
 
@@ -85,6 +93,10 @@ export interface MeteoraTradeConfig {
   feeWallet: Address | string;
   /** Our fee in basis points of the trade's SOL value. Default 50 (0.5%). */
   feeBps?: number | bigint;
+  /** How long a verified mint -> pool lookup is cached, in ms. Default 10 minutes; 0 disables the cache. */
+  poolCacheTtlMs?: number;
+  /** Clock for the cache, in ms. Default `Date.now`. */
+  now?: () => number;
 }
 
 export interface BuyQuote {
@@ -152,6 +164,15 @@ function checkSlippage(bps: number): number {
   return bps;
 }
 
+const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+function bs58Encode(b: Buffer): string {
+  let n = BigInt("0x" + (b.toString("hex") || "0"));
+  let out = "";
+  while (n > 0n) { out = B58[Number(n % 58n)] + out; n /= 58n; }
+  for (const byte of b) { if (byte !== 0) break; out = "1" + out; }
+  return out;
+}
+
 const toBN = (v: bigint) => new BN(v.toString()) as unknown as BNT;
 const toBig = (v: { toString(): string }): bigint => BigInt(v.toString());
 
@@ -164,9 +185,14 @@ export interface PoolState {
   pool: VirtualPool;
   config: PoolConfig;
   currentPoint: BNT;
+  /** The base mint when it is Token-2022, with the epoch its transfer fee is read at. */
+  baseMint?: Mint;
+  currentEpoch?: number;
 }
 
-const poolForMint = new Map<string, string>(); // mint -> pool address; a pool never changes its mint
+// mint -> verified pool address and expiry. Only pools that passed the owner,
+// discriminator and baseMint checks are stored.
+const poolForMint = new Map<string, { pool: string; expires: number }>();
 const POOL_CACHE_MAX = 5_000;
 
 const hasDisc = (program: ReturnType<typeof dbc.createDbcProgram>, name: string, data: Buffer): boolean => {
@@ -180,25 +206,59 @@ export function isGraduatedPool(pool: VirtualPool, config: Pick<PoolConfig, "mig
   return s.isMigrated !== 0 || s.migrationProgress !== 0 || !s.quoteReserve.lt(config.migrationQuoteThreshold);
 }
 
-async function findPoolKey(rpc: MeteoraRpc, mintStr: string, hint?: string): Promise<PublicKey | null> {
+/**
+ * Find the virtual pool for `mintStr`. The RPC filter is the VirtualPool
+ * discriminator (memcmp at 0), its exact size, and the mint at the base-mint
+ * offset, so no other DBC account type can match. Every result is still decoded
+ * and kept only if it is owned by the DBC program and its `baseMint` is the mint.
+ * Several survivors are resolved to the lowest address and logged.
+ */
+async function findPoolKey(cfg: Pick<MeteoraTradeConfig, "rpc" | "poolCacheTtlMs" | "now">, mintStr: string, hint?: string): Promise<PublicKey | null> {
   if (hint) return new web3.PublicKey(hint);
+  const now = (cfg.now ?? Date.now)();
+  const ttl = cfg.poolCacheTtlMs ?? DEFAULT_POOL_CACHE_TTL_MS;
   const cached = poolForMint.get(mintStr);
-  if (cached) return new web3.PublicKey(cached);
-  const found = await rpc.getProgramAccounts(new web3.PublicKey(METEORA_DBC_PROGRAM), {
-    filters: [{ memcmp: { offset: VIRTUAL_POOL_BASE_MINT_OFFSET, bytes: mintStr, encoding: "base58" } }],
-    dataSlice: { offset: 0, length: 0 },
+  if (cached && cached.expires > now) return new web3.PublicKey(cached.pool);
+  if (cached) poolForMint.delete(mintStr);
+
+  const program = dbc.createDbcProgram(cfg.rpc as unknown as Web3Module.Connection);
+  const disc = program.idl.accounts?.find((a) => a.name === "virtualPool")?.discriminator;
+  if (!disc) throw new Error("virtualPool discriminator missing from the DBC IDL");
+  const size = program.coder.accounts.size("virtualPool" as never);
+  const dbcProgram = new web3.PublicKey(METEORA_DBC_PROGRAM);
+  const mintKey = new web3.PublicKey(mintStr);
+  const found = await cfg.rpc.getProgramAccounts(dbcProgram, {
+    filters: [
+      { dataSize: size },
+      { memcmp: { offset: 0, bytes: bs58Encode(Buffer.from(disc)), encoding: "base58" } },
+      { memcmp: { offset: VIRTUAL_POOL_BASE_MINT_OFFSET, bytes: mintStr, encoding: "base58" } },
+    ],
   });
-  const key = found[0]?.pubkey ?? null;
-  if (key) {
+  const verified: PublicKey[] = [];
+  for (const { pubkey, account } of found) {
+    if (!account.owner.equals(dbcProgram) || !hasDisc(program, "virtualPool", account.data)) continue;
+    try {
+      const pool = program.coder.accounts.decode("virtualPool", account.data) as VirtualPool;
+      if (pool.poolState.baseMint.equals(mintKey)) verified.push(pubkey);
+    } catch { /* not a decodable pool */ }
+  }
+  if (verified.length === 0) return null;
+  verified.sort((x, y) => (x.toBase58() < y.toBase58() ? -1 : x.toBase58() > y.toBase58() ? 1 : 0));
+  const key = verified[0];
+  if (verified.length > 1) {
+    console.warn(`meteora: ${verified.length} DBC pools for mint ${mintStr}; using ${key.toBase58()} (lowest address) of ${verified.map((k) => k.toBase58()).join(", ")}`);
+  }
+  if (ttl > 0) {
     if (poolForMint.size >= POOL_CACHE_MAX) poolForMint.clear();
-    poolForMint.set(mintStr, key.toBase58());
+    poolForMint.set(mintStr, { pool: key.toBase58(), expires: now + ttl });
   }
   return key;
 }
 
-async function loadPool(rpc: MeteoraRpc, mintStr: string, poolHint?: string): Promise<PoolState> {
+async function loadPool(cfg: Pick<MeteoraTradeConfig, "rpc" | "poolCacheTtlMs" | "now">, mintStr: string, poolHint?: string): Promise<PoolState> {
+  const rpc = cfg.rpc;
   const program = dbc.createDbcProgram(rpc as unknown as Web3Module.Connection);
-  const poolKey = await findPoolKey(rpc, mintStr, poolHint);
+  const poolKey = await findPoolKey(cfg, mintStr, poolHint);
   if (!poolKey) throw new MeteoraTradeError("not_found", `${mintStr} has no Meteora DBC pool.`);
   const mintKey = new web3.PublicKey(mintStr);
   const [poolInfo, mintInfo] = await rpc.getMultipleAccountsInfo([poolKey, mintKey]);
@@ -234,6 +294,8 @@ async function loadPool(rpc: MeteoraRpc, mintStr: string, poolHint?: string): Pr
   if (!baseProgram.equals(spl.TOKEN_PROGRAM_ID) && !baseProgram.equals(spl.TOKEN_2022_PROGRAM_ID)) {
     throw new MeteoraTradeError("unsupported_token_program", `Mint ${mintStr} is owned by ${baseProgram.toBase58()}.`);
   }
+  let baseMint: Mint | undefined;
+  let currentEpoch: number | undefined;
   if (baseProgram.equals(spl.TOKEN_2022_PROGRAM_ID)) {
     const mint = spl.unpackMint(mintKey, mintInfo, baseProgram);
     const exts = spl.getExtensionTypes(mint.tlvData);
@@ -242,6 +304,11 @@ async function loadPool(rpc: MeteoraRpc, mintStr: string, poolHint?: string): Pr
     }
     if (exts.includes(spl.ExtensionType.TransferFeeConfig) && config.transferFeeFlag !== 1) {
       throw new MeteoraTradeError("unsupported_token_program", `${mintStr} has a Token-2022 transfer fee the pool config does not declare; it cannot be quoted.`);
+    }
+    if (exts.includes(spl.ExtensionType.TransferFeeConfig)) {
+      // The fee in force now is the mint's, by epoch; hand the SDK the mint so it ignores the config's stored bps.
+      baseMint = mint;
+      currentEpoch = (await rpc.getEpochInfo()).epoch;
     }
   }
 
@@ -253,7 +320,7 @@ async function loadPool(rpc: MeteoraRpc, mintStr: string, poolHint?: string): Pr
     if (t === null) throw new MeteoraTradeError("quote_failed", `Block time unavailable for slot ${slot}.`);
     point = t;
   }
-  return { poolKey, pool, config, currentPoint: toBN(BigInt(point)) };
+  return { poolKey, pool, config, currentPoint: toBN(BigInt(point)), baseMint, currentEpoch };
 }
 
 // ---------------------------------------------------------------------------
@@ -276,6 +343,15 @@ export interface SellParams {
   pool?: string;
 }
 
+/** The base mint's transfer fee in basis points for the current epoch: the mint's own when it has one, else the config's. */
+function baseTransferFeeBps(state: PoolState): number {
+  if (state.baseMint) {
+    const tf = spl.getTransferFeeConfig(state.baseMint);
+    if (tf) return Number(spl.getEpochFee(tf, BigInt(state.currentEpoch ?? 0)).transferFeeBasisPoints);
+  }
+  return state.config.transferFeeFlag === 1 ? Number(state.config.transferFeeBasisPoints) : 0;
+}
+
 function swapQuote(state: PoolState, swapBaseForQuote: boolean, amountIn: bigint): { out: bigint; feeBps: number } {
   const client = new dbc.DynamicBondingCurveClient({} as Web3Module.Connection);
   try {
@@ -288,8 +364,9 @@ function swapQuote(state: PoolState, swapBaseForQuote: boolean, amountIn: bigint
       slippageBps: 0,
       hasReferral: false,
       currentPoint: state.currentPoint,
+      ...(state.baseMint ? { baseMint: state.baseMint, currentEpoch: state.currentEpoch } : {}),
     });
-    return { out: toBig(q.excludedTransferFeeAmountOut), feeBps: state.config.transferFeeFlag === 1 ? Number(state.config.transferFeeBasisPoints) : 0 };
+    return { out: toBig(q.excludedTransferFeeAmountOut), feeBps: baseTransferFeeBps(state) };
   } catch (e) {
     throw new MeteoraTradeError("quote_failed", `Meteora quote failed: ${(e as Error).message}`);
   }
@@ -323,12 +400,12 @@ function quoteSellFrom(state: PoolState, cfg: MeteoraTradeConfig, p: SellParams)
 
 /** Quote a buy of `solIn` lamports on the DBC curve. */
 export async function quoteBuy(cfg: MeteoraTradeConfig, p: BuyParams): Promise<BuyQuote> {
-  return quoteBuyFrom(await loadPool(cfg.rpc, p.mint, p.pool), cfg, p);
+  return quoteBuyFrom(await loadPool(cfg, p.mint, p.pool), cfg, p);
 }
 
 /** Quote a sale of `tokensIn` base units on the DBC curve. */
 export async function quoteSell(cfg: MeteoraTradeConfig, p: SellParams): Promise<SellQuote> {
-  return quoteSellFrom(await loadPool(cfg.rpc, p.mint, p.pool), cfg, p);
+  return quoteSellFrom(await loadPool(cfg, p.mint, p.pool), cfg, p);
 }
 
 /**
@@ -337,9 +414,9 @@ export async function quoteSell(cfg: MeteoraTradeConfig, p: SellParams): Promise
  * for a pool this module cannot trade (non-SOL quote, transfer hook). The copy
  * engine and the app use it to choose the venue.
  */
-export async function isMeteoraPool(rpc: MeteoraRpc, mint: string, pool?: string): Promise<boolean> {
+export async function isMeteoraPool(rpc: MeteoraRpc, mint: string, pool?: string, opts: Pick<MeteoraTradeConfig, "poolCacheTtlMs" | "now"> = {}): Promise<boolean> {
   try {
-    await loadPool(rpc, mint, pool);
+    await loadPool({ rpc, ...opts }, mint, pool);
     return true;
   } catch (e) {
     if (e instanceof MeteoraTradeError) return false;
@@ -377,7 +454,7 @@ async function swap2(cfg: MeteoraTradeConfig, state: PoolState, user: PublicKey,
 export async function buildBuy(cfg: MeteoraTradeConfig, p: BuyParams & { user: Address | string }): Promise<BuiltTrade<BuyQuote>> {
   checkBps(cfg.feeBps ?? DEFAULT_FEE_BPS, "feeBps");
   const user = new web3.PublicKey(p.user);
-  const state = await loadPool(cfg.rpc, p.mint, p.pool);
+  const state = await loadPool(cfg, p.mint, p.pool);
   const quote = quoteBuyFrom(state, cfg, p);
   const trade = await swap2(cfg, state, user, false, quote.solIn, quote.minTokensOut);
   return { quote, instructions: [...trade, ...feeTransfer(cfg, user, quote.feeLamports)].map(toKitInstruction) };
@@ -387,7 +464,7 @@ export async function buildBuy(cfg: MeteoraTradeConfig, p: BuyParams & { user: A
 export async function buildSell(cfg: MeteoraTradeConfig, p: SellParams & { user: Address | string }): Promise<BuiltTrade<SellQuote>> {
   checkBps(cfg.feeBps ?? DEFAULT_FEE_BPS, "feeBps");
   const user = new web3.PublicKey(p.user);
-  const state = await loadPool(cfg.rpc, p.mint, p.pool);
+  const state = await loadPool(cfg, p.mint, p.pool);
   const quote = quoteSellFrom(state, cfg, p);
   const trade = await swap2(cfg, state, user, true, quote.tokensIn, quote.minSolOut);
   return { quote, instructions: [...trade, ...feeTransfer(cfg, user, quote.feeLamports)].map(toKitInstruction) };
