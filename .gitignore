@@ -1,5 +1,9 @@
 # Build output
-target/
+target/*
+# Anchor IDLs are committed so CI can run the client tests without building programs
+!target/idl/
+target/idl/*
+!target/idl/*.json
 tests-graduation/target/
 client/node_modules/
 client/dist/

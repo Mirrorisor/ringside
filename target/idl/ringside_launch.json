@@ -1,0 +1,877 @@
+{
+  "address": "AfZWCTaDQEC9CVTwXkH7pFtDXs4RtLWCK5godexWQDVH",
+  "metadata": {
+    "name": "ringside_launch",
+    "version": "0.1.0",
+    "spec": "0.1.0"
+  },
+  "instructions": [
+    {
+      "name": "initialize_global",
+      "discriminator": [
+        47,
+        225,
+        15,
+        112,
+        86,
+        51,
+        190,
+        231
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "global",
+          "writable": true
+        },
+        {
+          "name": "system_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "params",
+          "type": {
+            "defined": {
+              "name": "GlobalParams"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "create_token",
+      "docs": [
+        "Creates the mint, mints the whole supply to the curve, revokes the mint",
+        "authority, opens the curve and optionally performs a locked dev buy."
+      ],
+      "discriminator": [
+        84,
+        52,
+        204,
+        228,
+        24,
+        140,
+        234,
+        75
+      ],
+      "accounts": [
+        {
+          "name": "creator",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "global"
+        },
+        {
+          "name": "mint",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "curve",
+          "writable": true
+        },
+        {
+          "name": "curve_token_vault",
+          "writable": true
+        },
+        {
+          "name": "dev_lock_vault",
+          "writable": true
+        },
+        {
+          "name": "fee_recipient",
+          "writable": true
+        },
+        {
+          "name": "insurance_recipient",
+          "writable": true
+        },
+        {
+          "name": "token_program"
+        },
+        {
+          "name": "associated_token_program"
+        },
+        {
+          "name": "system_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "args",
+          "type": {
+            "defined": {
+              "name": "CreateTokenArgs"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "buy",
+      "discriminator": [
+        102,
+        6,
+        61,
+        18,
+        1,
+        218,
+        235,
+        234
+      ],
+      "accounts": [
+        {
+          "name": "trader",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "global"
+        },
+        {
+          "name": "mint"
+        },
+        {
+          "name": "curve",
+          "writable": true
+        },
+        {
+          "name": "curve_token_vault",
+          "writable": true
+        },
+        {
+          "name": "trader_token_account",
+          "writable": true
+        },
+        {
+          "name": "fee_recipient",
+          "writable": true
+        },
+        {
+          "name": "insurance_recipient",
+          "writable": true
+        },
+        {
+          "name": "token_program"
+        },
+        {
+          "name": "associated_token_program"
+        },
+        {
+          "name": "system_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "sol_in",
+          "type": "u64"
+        },
+        {
+          "name": "min_tokens_out",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "sell",
+      "discriminator": [
+        51,
+        230,
+        133,
+        164,
+        1,
+        127,
+        131,
+        173
+      ],
+      "accounts": [
+        {
+          "name": "trader",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "global"
+        },
+        {
+          "name": "mint"
+        },
+        {
+          "name": "curve",
+          "writable": true
+        },
+        {
+          "name": "curve_token_vault",
+          "writable": true
+        },
+        {
+          "name": "trader_token_account",
+          "writable": true
+        },
+        {
+          "name": "fee_recipient",
+          "writable": true
+        },
+        {
+          "name": "insurance_recipient",
+          "writable": true
+        },
+        {
+          "name": "token_program"
+        },
+        {
+          "name": "associated_token_program"
+        },
+        {
+          "name": "system_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "tokens_in",
+          "type": "u64"
+        },
+        {
+          "name": "min_sol_out",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "claim_creator_fees",
+      "discriminator": [
+        0,
+        23,
+        125,
+        234,
+        156,
+        118,
+        134,
+        89
+      ],
+      "accounts": [
+        {
+          "name": "creator",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "curve",
+          "writable": true
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "release_dev_lock",
+      "discriminator": [
+        103,
+        71,
+        100,
+        104,
+        174,
+        149,
+        125,
+        232
+      ],
+      "accounts": [
+        {
+          "name": "creator",
+          "signer": true
+        },
+        {
+          "name": "curve",
+          "writable": true
+        },
+        {
+          "name": "dev_lock_vault",
+          "writable": true
+        },
+        {
+          "name": "creator_token_account",
+          "writable": true
+        },
+        {
+          "name": "token_program"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "migrate",
+      "docs": [
+        "Hands the raised SOL (minus the graduation fee) and the 200M reserve",
+        "tokens to the migration authority, which seeds the AMM pool and burns",
+        "the LP tokens.",
+        "",
+        "TODO(mainnet): replace the hand-off with a direct CPI into the Meteora",
+        "DAMM v2 or Raydium CPMM pool-creation instruction so no off-chain",
+        "actor ever custodies migration funds."
+      ],
+      "discriminator": [
+        155,
+        234,
+        231,
+        146,
+        236,
+        158,
+        162,
+        30
+      ],
+      "accounts": [
+        {
+          "name": "caller",
+          "signer": true
+        },
+        {
+          "name": "global"
+        },
+        {
+          "name": "curve",
+          "writable": true
+        },
+        {
+          "name": "curve_token_vault",
+          "writable": true
+        },
+        {
+          "name": "fee_recipient",
+          "writable": true
+        },
+        {
+          "name": "migration_authority",
+          "writable": true
+        },
+        {
+          "name": "migration_token_account",
+          "writable": true
+        },
+        {
+          "name": "token_program"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "set_paused",
+      "discriminator": [
+        91,
+        60,
+        125,
+        192,
+        176,
+        225,
+        166,
+        218
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "signer": true
+        },
+        {
+          "name": "global",
+          "writable": true
+        }
+      ],
+      "args": [
+        {
+          "name": "paused",
+          "type": "bool"
+        }
+      ]
+    }
+  ],
+  "accounts": [
+    {
+      "name": "Curve",
+      "discriminator": [
+        191,
+        180,
+        249,
+        66,
+        180,
+        71,
+        51,
+        182
+      ]
+    },
+    {
+      "name": "Global",
+      "discriminator": [
+        167,
+        232,
+        232,
+        177,
+        200,
+        108,
+        114,
+        127
+      ]
+    }
+  ],
+  "types": [
+    {
+      "name": "CreateTokenArgs",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "name",
+            "type": "string"
+          },
+          {
+            "name": "symbol",
+            "type": "string"
+          },
+          {
+            "name": "uri",
+            "type": "string"
+          },
+          {
+            "name": "dev_buy_lamports",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Curve",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "creator",
+            "type": "pubkey"
+          },
+          {
+            "name": "name",
+            "type": "string"
+          },
+          {
+            "name": "symbol",
+            "type": "string"
+          },
+          {
+            "name": "uri",
+            "type": "string"
+          },
+          {
+            "name": "virtual_sol",
+            "type": "u64"
+          },
+          {
+            "name": "virtual_tokens",
+            "type": "u64"
+          },
+          {
+            "name": "real_sol",
+            "type": "u64"
+          },
+          {
+            "name": "real_tokens",
+            "type": "u64"
+          },
+          {
+            "name": "creator_fees_owed",
+            "type": "u64"
+          },
+          {
+            "name": "dev_locked_tokens",
+            "type": "u64"
+          },
+          {
+            "name": "dev_unlock_ts",
+            "type": "i64"
+          },
+          {
+            "name": "complete",
+            "type": "bool"
+          },
+          {
+            "name": "migrated",
+            "type": "bool"
+          },
+          {
+            "name": "created_slot",
+            "type": "u64"
+          },
+          {
+            "name": "created_ts",
+            "type": "i64"
+          },
+          {
+            "name": "price_cumulative",
+            "docs": [
+              "TWAP accumulator: sum of price_q64 * slots, wrapping."
+            ],
+            "type": "u128"
+          },
+          {
+            "name": "last_price_q64",
+            "type": "u128"
+          },
+          {
+            "name": "last_slot",
+            "type": "u64"
+          },
+          {
+            "name": "observations",
+            "type": {
+              "array": [
+                {
+                  "defined": {
+                    "name": "Observation"
+                  }
+                },
+                32
+              ]
+            }
+          },
+          {
+            "name": "obs_index",
+            "type": "u8"
+          },
+          {
+            "name": "obs_count",
+            "type": "u8"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Global",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "fee_recipient",
+            "type": "pubkey"
+          },
+          {
+            "name": "insurance_recipient",
+            "type": "pubkey"
+          },
+          {
+            "name": "migration_authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "launch_fee_lamports",
+            "type": "u64"
+          },
+          {
+            "name": "graduation_fee_lamports",
+            "type": "u64"
+          },
+          {
+            "name": "protocol_fee_bps",
+            "type": "u16"
+          },
+          {
+            "name": "creator_fee_bps",
+            "type": "u16"
+          },
+          {
+            "name": "insurance_fee_bps",
+            "type": "u16"
+          },
+          {
+            "name": "paused",
+            "type": "bool"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "GlobalParams",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "fee_recipient",
+            "type": "pubkey"
+          },
+          {
+            "name": "insurance_recipient",
+            "type": "pubkey"
+          },
+          {
+            "name": "migration_authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "launch_fee_lamports",
+            "type": "u64"
+          },
+          {
+            "name": "graduation_fee_lamports",
+            "type": "u64"
+          },
+          {
+            "name": "protocol_fee_bps",
+            "type": "u16"
+          },
+          {
+            "name": "creator_fee_bps",
+            "type": "u16"
+          },
+          {
+            "name": "insurance_fee_bps",
+            "type": "u16"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Observation",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "slot",
+            "type": "u64"
+          },
+          {
+            "name": "cumulative",
+            "type": "u128"
+          }
+        ]
+      }
+    },
+    {
+      "name": "CurveCompleted",
+      "type": {
+        "fields": [
+          {
+            "name": "mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "real_sol",
+            "type": "u64"
+          },
+          {
+            "name": "slot",
+            "type": "u64"
+          }
+        ],
+        "kind": "struct"
+      }
+    },
+    {
+      "name": "Migrated",
+      "type": {
+        "fields": [
+          {
+            "name": "mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "sol_to_pool",
+            "type": "u64"
+          },
+          {
+            "name": "tokens_to_pool",
+            "type": "u64"
+          }
+        ],
+        "kind": "struct"
+      }
+    },
+    {
+      "name": "TradeEvent",
+      "type": {
+        "fields": [
+          {
+            "name": "mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "is_buy",
+            "type": "bool"
+          },
+          {
+            "name": "sol_amount",
+            "type": "u64"
+          },
+          {
+            "name": "token_amount",
+            "type": "u64"
+          },
+          {
+            "name": "price_q64",
+            "type": "u128"
+          },
+          {
+            "name": "slot",
+            "type": "u64"
+          }
+        ],
+        "kind": "struct"
+      }
+    },
+    {
+      "name": "TokenCreated",
+      "type": {
+        "fields": [
+          {
+            "name": "mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "creator",
+            "type": "pubkey"
+          },
+          {
+            "name": "dev_locked_tokens",
+            "type": "u64"
+          },
+          {
+            "name": "slot",
+            "type": "u64"
+          }
+        ],
+        "kind": "struct"
+      }
+    }
+  ],
+  "errors": [
+    {
+      "code": 6000,
+      "name": "Paused",
+      "msg": "Program is paused"
+    },
+    {
+      "code": 6001,
+      "name": "FeeTooHigh",
+      "msg": "Total fee is too high"
+    },
+    {
+      "code": 6002,
+      "name": "MetadataTooLong",
+      "msg": "Name, symbol or URI too long"
+    },
+    {
+      "code": 6003,
+      "name": "DevBuyTooLarge",
+      "msg": "Dev buy exceeds 5% of supply"
+    },
+    {
+      "code": 6004,
+      "name": "CurveComplete",
+      "msg": "Curve has sold out"
+    },
+    {
+      "code": 6005,
+      "name": "Slippage",
+      "msg": "Slippage limit exceeded"
+    },
+    {
+      "code": 6006,
+      "name": "ZeroAmount",
+      "msg": "Amount must be greater than zero"
+    },
+    {
+      "code": 6007,
+      "name": "InsufficientLiquidity",
+      "msg": "Not enough SOL in the curve"
+    },
+    {
+      "code": 6008,
+      "name": "MathOverflow",
+      "msg": "Math overflow"
+    },
+    {
+      "code": 6009,
+      "name": "StillLocked",
+      "msg": "Dev tokens are still locked"
+    },
+    {
+      "code": 6010,
+      "name": "NotReadyToMigrate",
+      "msg": "Curve is not complete or already migrated"
+    }
+  ],
+  "events": [
+    {
+      "discriminator": [
+        1,
+        174,
+        164,
+        127,
+        219,
+        129,
+        243,
+        14
+      ],
+      "name": "CurveCompleted"
+    },
+    {
+      "discriminator": [
+        2,
+        66,
+        164,
+        53,
+        158,
+        122,
+        128,
+        236
+      ],
+      "name": "Migrated"
+    },
+    {
+      "discriminator": [
+        189,
+        219,
+        127,
+        211,
+        78,
+        230,
+        97,
+        238
+      ],
+      "name": "TradeEvent"
+    },
+    {
+      "discriminator": [
+        236,
+        19,
+        41,
+        255,
+        130,
+        78,
+        147,
+        172
+      ],
+      "name": "TokenCreated"
+    }
+  ]
+}
