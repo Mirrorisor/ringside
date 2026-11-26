@@ -18,6 +18,8 @@
 import { MIN_SECRET_BYTES } from "../session.js";
 import { createSocialServer, LAMPORTS_PER_SOL, DEFAULT_MAX_BODY_BYTES } from "./server.js";
 import { SocialStore } from "./store.js";
+import { installLogRedaction } from "../logredact.js";
+installLogRedaction(); // before anything can log
 
 const num = (name: string, def: number) => {
   const v = process.env[name];

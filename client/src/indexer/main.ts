@@ -16,6 +16,8 @@ import { isAddress } from "./helius.js";
 import { createIndexerServer, DEFAULT_RATE_LIMIT, DEFAULT_REQUEST_TIMEOUT_MS } from "./server.js";
 import { DEFAULT_SIGNER_MIN_INTERVAL_MS, DEFAULT_SIGNER_QUEUE_MAX, RpcSignerPort, SignerQueue } from "./signers.js";
 import { SqliteStore } from "./store.js";
+import { installLogRedaction } from "../logredact.js";
+installLogRedaction(); // before anything can log
 
 const port = Number(process.env.INDEXER_PORT ?? 8787);
 const dbPath = process.env.INDEXER_DB ?? "./indexer.db";

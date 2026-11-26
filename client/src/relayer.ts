@@ -44,6 +44,7 @@ import {
 import { bigintJson, clientIp, decodeWire, quoteAndSimulate, refuse, rpcRetry, type Accepted, type Ix, type Refusal, type SimulationRpc } from "./txpolicy.js";
 import { createHash } from "node:crypto";
 import { detectCluster, resolveNetwork } from "./cluster.js";
+import { installLogRedaction } from "./logredact.js";
 
 export const PROGRAMS = {
   shieldedPool: address("ring1GaLCuJnkUMVkX2JeZLTTX17wKsV4fZmPVzXANW"),
@@ -338,6 +339,7 @@ export function createRelayerServer(relayer: Relayer, opts: { allowOrigin?: stri
 }
 
 async function main() {
+  installLogRedaction();
   const {
     RPC_URL, RELAYER_KEY, RELAYER_KEYPAIR, PORT, ALLOW_ORIGIN, TRUST_PROXY, PINATA_JWT, PINATA_GATEWAY, METADATA_DIR, PUBLIC_URL, NETWORK,
     REDIS_URL, FEE_RECOVERY_TREASURY, FEE_RECOVERY_MIN, SCREENING_URL, SCREENING_KEY,

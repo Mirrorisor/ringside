@@ -68,6 +68,7 @@ import {
   type SimulationRpc,
 } from "./txpolicy.js";
 import { detectCluster } from "./cluster.js";
+import { installLogRedaction } from "./logredact.js";
 
 export type { Accepted, Refusal };
 
@@ -721,6 +722,7 @@ SPONSOR_MIN_ACCOUNT_AGE_SEC (default 3600: account-age gate on the token's first
 SPONSOR_DISABLED=1, SPONSOR_ALLOW_ANON=1 (devnet only: no authentication).`;
 
 async function main() {
+  installLogRedaction();
   const env = process.env;
   const { RPC_URL, SPONSOR_PORT, SPONSOR_KEYPAIR_PATH, SPONSOR_DAILY_LAMPORTS, SPONSOR_FEE_WALLET, SPONSOR_FEE_LAMPORTS, SPONSOR_LOOKUP_TABLES } = env;
   if (!RPC_URL || !SPONSOR_KEYPAIR_PATH) {

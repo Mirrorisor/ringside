@@ -47,6 +47,7 @@ import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import { PythPoster } from "./pyth.js";
 import { Monitor, FILL_LAG_SLOTS, LOW_SOL_LAMPORTS, STALE_PRICE_S, type Condition } from "./monitor.js";
 import { LAUNCH_PROGRAM, decodeCurve, decodeFeeRecipient, graduateMarketIx, migrateIx, priceAccounts, retireMarketIx } from "./graduation.js";
+import { installLogRedaction } from "./logredact.js";
 
 export const PERPS_PROGRAM = address(process.env.PERPS_PROGRAM_ID ?? "DsZ69w3q25nRmAzJCRBMLbwZWN6NyVbYipTWsCAUsg1F");
 export const TOKEN_PROGRAM = address("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
@@ -507,6 +508,7 @@ export async function ata(owner: Address, mint: Address): Promise<Address> {
 // ---------------------------------------------------------------------------
 
 async function main() {
+  installLogRedaction();
   const rpcUrl = process.env.RPC_URL;
   const key = process.env.KEEPER_KEY;
   const keyFile = process.env.KEEPER_KEYPAIR;

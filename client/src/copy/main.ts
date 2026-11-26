@@ -23,8 +23,10 @@ import { indexerFlagsPort } from "./flagsport.js";
 import type { SocialPort } from "./ports.js";
 import { createCopyServer } from "./server.js";
 import { CopyStore } from "./store.js";
+import { installLogRedaction } from "../logredact.js";
 
 export function startCopyService(social: SocialPort, indexer: SqliteStore, env: NodeJS.ProcessEnv = process.env) {
+  installLogRedaction(env); // keys in COPY_RPC_URL, JUPITER_API_KEY etc. never reach the logs
   const need = (k: string) => env[k] || (() => { throw new Error(`${k} is required`); })();
   const store = new CopyStore(env.COPY_DB ?? "copy.sqlite");
   const engine = createCopyEngine({ social, flags: indexerFlagsPort(indexer), store, log: console.error });
