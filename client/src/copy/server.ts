@@ -16,19 +16,22 @@ import { RateLimiter, clientKey, secretMatches } from "../indexer/server.js";
 import type { Trade } from "../indexer/types.js";
 import type { Authenticator } from "../session.js";
 import { buildIntent, BuildError, type BuildDeps } from "./build.js";
+import { confirmIntent, type TxPort } from "./confirm.js";
 import type { CopyEngine } from "./engine.js";
 import type { CopyIntent } from "./ports.js";
 import { publicIntent, type CopyStore } from "./store.js";
 
 export const MAX_BODY_BYTES = 64 * 1024;
 export const MAX_TRADES_PER_INGEST = 50;
-const STATUSES = ["pending", "skipped", "built", "sent", "expired"] as const;
+const STATUSES = ["pending", "skipped", "built", "sent_unconfirmed", "sent", "failed", "expired"] as const;
 const SIG_RE = /^[1-9A-HJ-NP-Za-km-z]{64,90}$/;
 
 export interface CopyServerOptions {
   store: CopyStore;
   engine: CopyEngine;
   build: BuildDeps;
+  /** On-chain verification of reported signatures. Without it intents stay sent_unconfirmed until something else confirms them. */
+  tx?: TxPort;
   authenticate: Authenticator;
   /** Secret for POST /ingest/trade. Required. */
   ingestSecret: string;
@@ -43,7 +46,7 @@ export interface CopyServerOptions {
 
 const STATUS_OF: Record<string, number> = {
   bad_request: 400, unauthorized: 401, not_found: 404, method_not_allowed: 405, conflict: 409, payload_too_large: 413, rate_limited: 429,
-  intent_expired: 410, perps_build_unsupported: 501, venue_unavailable: 422, build_failed: 502, internal_error: 500,
+  intent_expired: 410, price_moved: 422, leader_exited: 422, perps_build_unsupported: 501, venue_unavailable: 422, build_failed: 502, internal_error: 500,
 };
 class ApiError extends Error { constructor(readonly code: string) { super(code); } }
 
@@ -147,8 +150,11 @@ export function createCopyServer(o: CopyServerOptions): Server {
     if (!isObj(body) || typeof body.signature !== "string" || !SIG_RE.test(body.signature)) throw new ApiError("bad_request");
     const own = o.store.get(id);
     if (!own || own.follower !== user.userId) throw new ApiError("not_found");
-    if (!o.store.markSent(id, body.signature, user.userId)) throw new ApiError("conflict");
-    return send(res, 200, { ok: true }, cors);
+    // Repeating the same signature on an unconfirmed intent re-runs the check; anything else is a conflict.
+    const retry = own.status === "sent_unconfirmed" && own.signature === body.signature;
+    if (!retry && !o.store.markSent(id, body.signature, user.userId, now())) throw new ApiError("conflict");
+    if (o.tx) await confirmIntent({ store: o.store, tx: o.tx, now }, id);
+    return send(res, 200, { ok: true, status: o.store.get(id)?.status }, cors);
   }
 
   const server = createServer({ requestTimeout: 10_000, headersTimeout: 10_000 }, (req, res) => {

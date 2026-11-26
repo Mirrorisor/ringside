@@ -21,10 +21,10 @@ import {
 } from "@solana/kit";
 import { checkTransaction, type OrderRequest, type SwapOrder, WSOL_MINT } from "../trade/jupiter.js";
 import { buildBuy, buildSell, PumpTradeError, type BuiltTrade, type BuyQuote, type PumpTradeConfig, type SellQuote } from "../trade/pumpfun.js";
-import type { CopyIntent } from "./ports.js";
+import type { CopyIntent, LeaderExitPort } from "./ports.js";
 import type { CopyStore } from "./store.js";
 
-export type BuildErrorCode = "not_found" | "not_pending" | "expired" | "perps_build_unsupported" | "venue_unavailable" | "build_failed";
+export type BuildErrorCode = "not_found" | "not_pending" | "expired" | "perps_build_unsupported" | "venue_unavailable" | "build_failed" | "price_moved" | "leader_exited";
 export class BuildError extends Error {
   constructor(readonly code: BuildErrorCode, message: string) { super(message); this.name = "BuildError"; }
 }
@@ -35,6 +35,11 @@ export interface BuiltIntent {
   feeLamports: number;
   venue: CopyIntent["venue"];
   lamports: number;
+  /** What the quote expects to receive, as a decimal string: base-unit tokens for a buy, lamports for a sell. */
+  expectedOut: string;
+  /** The least the transaction accepts after slippage, same units as expectedOut. */
+  minOut: string;
+  slippageBps: number;
 }
 
 /** Pump.fun layer as a port. Resolves null when the coin has no Pump curve or pool. Fakeable in tests. */
@@ -50,6 +55,11 @@ export interface ChainPort {
   latestBlockhash(): Promise<{ blockhash: string; lastValidBlockHeight: bigint }>;
 }
 
+export const DEFAULT_BUILT_TTL_MS = 90_000;
+export const DEFAULT_MAX_PRICE_DRIFT_BPS = 1000;
+/** Pump.fun tokens always have 6 decimals; override for other mints. */
+export const DEFAULT_TOKEN_DECIMALS = 6;
+
 export interface BuildDeps {
   store: CopyStore;
   pump: PumpPort;
@@ -58,6 +68,14 @@ export interface BuildDeps {
   /** Gas sponsor address: fee payer when set; the follower is still a required signer. */
   sponsor?: string;
   now?: () => number;
+  /** How long a built intent stays built, about a blockhash lifetime. Default 90 s. */
+  builtTtlMs?: number;
+  /** Refuse a buy when the quote is more than this many bps worse than the leader's fill. Default COPY_MAX_PRICE_DRIFT_BPS or 1000. */
+  maxPriceDriftBps?: number;
+  /** Reports leader sells after the source trade. Defaults to the store's record of leader sells. */
+  exits?: LeaderExitPort;
+  /** Decimals of a mint, to compare the quote with the leader's UI-unit price. Default 6. */
+  tokenDecimals?: (mint: string) => Promise<number> | number;
 }
 
 /** Wraps the real Pump layer; "not_found" (no curve, no pool) means: try Jupiter. */
@@ -82,6 +100,7 @@ export function compileUnsigned(feePayer: string, instructions: Instruction[], l
 }
 
 const num = (b: bigint) => Number(b);
+const envBps = (k: string, d: number) => { const v = Number(process.env[k]); return process.env[k] ? (Number.isFinite(v) && v >= 0 ? v : d) : d; };
 
 /**
  * Validates that `intentId` belongs to `follower`, is pending and unexpired,
@@ -94,8 +113,18 @@ export async function buildIntent(deps: BuildDeps, intentId: string, follower: s
   const i = deps.store.get(intentId);
   if (!i || i.follower !== follower) throw new BuildError("not_found", "No such intent.");
   if (i.status === "expired" || (i.status === "pending" && i.expiresAt <= now)) throw new BuildError("expired", "Intent expired.");
+  // A pending intent can be rebuilt (also after its built window lapsed): the old transaction's blockhash is dead by then.
   if (i.status !== "pending") throw new BuildError("not_pending", "Intent is not pending.");
   if (i.kind === "perp") throw new BuildError("perps_build_unsupported", "Perp copy transactions are not built yet.");
+
+  // A buy is refused once the leader has sold out of the token: this is the exit that bait trades rely on.
+  if (i.side === "buy" && i.sourceSlot !== undefined) {
+    const exited = await (deps.exits ?? deps.store).leaderSoldSince(i.leader, i.mint, { signature: i.sourceSignature, slot: i.sourceSlot });
+    if (exited) {
+      deps.store.markRefused(i.id, "leader_exited");
+      throw new BuildError("leader_exited", "The leader has already sold this token.");
+    }
+  }
 
   const payer = deps.sponsor ?? follower;
   let built: BuiltIntent & { tokens: string };
@@ -107,6 +136,8 @@ export async function buildIntent(deps: BuildDeps, intentId: string, follower: s
         built = {
           transaction: compileUnsigned(payer, pump.instructions, await deps.chain.latestBlockhash()),
           feeLamports: num(pump.quote.feeLamports), venue: "pumpfun", lamports: num(pump.quote.solIn), tokens: pump.quote.tokensOut.toString(),
+          // The curve buy asks for exactly tokensOut; slippage bounds the SOL cost (maxSolCost), not the tokens.
+          expectedOut: pump.quote.tokensOut.toString(), minOut: pump.quote.tokensOut.toString(), slippageBps: pump.quote.slippageBps,
         };
       } else built = await viaJupiter(deps, i, follower, payer, WSOL_MINT, i.mint, solIn);
     } else if (i.side === "sell") {
@@ -116,6 +147,7 @@ export async function buildIntent(deps: BuildDeps, intentId: string, follower: s
         built = {
           transaction: compileUnsigned(payer, pump.instructions, await deps.chain.latestBlockhash()),
           feeLamports: num(pump.quote.feeLamports), venue: "pumpfun", lamports: num(pump.quote.solOut), tokens: tokensIn.toString(),
+          expectedOut: pump.quote.solOut.toString(), minOut: pump.quote.minSolOut.toString(), slippageBps: pump.quote.slippageBps,
         };
       } else built = await viaJupiter(deps, i, follower, payer, i.mint, WSOL_MINT, tokensIn);
     } else throw new BuildError("build_failed", "Unsupported side.");
@@ -124,9 +156,22 @@ export async function buildIntent(deps: BuildDeps, intentId: string, follower: s
     if (e instanceof PumpTradeError && (e.code === "awaiting_migration" || e.code === "unsupported_quote")) throw new BuildError("venue_unavailable", "This token cannot be traded right now.");
     throw new BuildError("build_failed", "Could not build the transaction.");
   }
+  if (i.side === "buy" && i.leaderPrice && i.leaderPrice > 0) {
+    const dec = Number((await deps.tokenDecimals?.(i.mint)) ?? DEFAULT_TOKEN_DECIMALS);
+    const quoted = built.lamports / 1e9 / (Number(built.tokens) / 10 ** dec);
+    const maxDrift = deps.maxPriceDriftBps ?? envBps("COPY_MAX_PRICE_DRIFT_BPS", DEFAULT_MAX_PRICE_DRIFT_BPS);
+    // Worse for a buy means a higher price (fewer tokens for the same SOL). A zero or unreadable quote is refused too.
+    if (!Number.isFinite(quoted) || quoted <= 0 || (quoted / i.leaderPrice - 1) * 10_000 > maxDrift) {
+      throw new BuildError("price_moved", "The price has moved too far from the leader's fill.");
+    }
+  }
   // Re-read the clock: a slow build must not mark an intent that expired meanwhile.
-  if (!deps.store.markBuilt(i.id, { venue: built.venue, lamports: built.lamports, tokens: built.tokens })) throw new BuildError("not_pending", "Intent is not pending.");
-  return { transaction: built.transaction, feeLamports: built.feeLamports, venue: built.venue, lamports: built.lamports };
+  const builtAt = (deps.now ?? Date.now)();
+  if (!deps.store.markBuilt(i.id, { venue: built.venue, lamports: built.lamports, tokens: built.tokens }, builtAt + (deps.builtTtlMs ?? DEFAULT_BUILT_TTL_MS))) throw new BuildError("not_pending", "Intent is not pending.");
+  return {
+    transaction: built.transaction, feeLamports: built.feeLamports, venue: built.venue, lamports: built.lamports,
+    expectedOut: built.expectedOut, minOut: built.minOut, slippageBps: built.slippageBps,
+  };
 }
 
 async function viaJupiter(deps: BuildDeps, i: { side: string; slippageBps: number }, follower: string, payer: string, inputMint: string, outputMint: string, amount: bigint) {
@@ -145,5 +190,6 @@ async function viaJupiter(deps: BuildDeps, i: { side: string; slippageBps: numbe
   return {
     transaction: order.transaction, feeLamports, venue: "jupiter" as const,
     lamports: Number(sol), tokens: (buy ? out : amount).toString(),
+    expectedOut: order.outAmount, minOut: order.otherAmountThreshold, slippageBps: order.slippageBps,
   };
 }

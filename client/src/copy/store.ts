@@ -3,7 +3,15 @@ import { DatabaseSync } from "node:sqlite";
 import type { CopyIntent } from "./ports.js";
 
 /** An intent plus the follower's slippage, which is internal (not part of the shared contract). */
-export type StoredIntent = CopyIntent & { slippageBps: number; signature?: string };
+export type StoredIntent = CopyIntent & {
+  slippageBps: number; signature?: string;
+  /** Slot of the leader's source trade (spot), for the leader-exit check. */
+  sourceSlot?: number;
+  /** While built: when the built window ends. */
+  builtExpiresAt?: number;
+  /** When the follower reported the signature. */
+  sentAt?: number;
+};
 export interface CopyPosition { tokens: bigint; costLamports: bigint }
 
 type Row = Record<string, unknown>;
@@ -18,10 +26,14 @@ const toIntent = (r: Row): StoredIntent => {
   if (r.leverage !== null) i.leverage = Number(r.leverage);
   if (r.skip_reason !== null) i.skipReason = r.skip_reason as string;
   if (r.signature !== null) i.signature = r.signature as string;
+  if (r.leader_price !== null) i.leaderPrice = Number(r.leader_price);
+  if (r.source_slot !== null) i.sourceSlot = Number(r.source_slot);
+  if (r.built_expires_at !== null) i.builtExpiresAt = Number(r.built_expires_at);
+  if (r.sent_at !== null) i.sentAt = Number(r.sent_at);
   return i;
 };
 /** The shape returned to callers outside the service. */
-export const publicIntent = ({ slippageBps: _s, signature: _g, ...i }: StoredIntent): CopyIntent => i;
+export const publicIntent = ({ slippageBps: _s, signature: _g, sourceSlot: _o, builtExpiresAt: _b, sentAt: _t, ...i }: StoredIntent): CopyIntent => i;
 
 export class CopyStore {
   private db: DatabaseSync;
@@ -34,6 +46,7 @@ export class CopyStore {
         lamports INTEGER, tokens TEXT, leverage REAL,
         created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
         status TEXT NOT NULL, skip_reason TEXT, slippage_bps INTEGER NOT NULL DEFAULT 100, signature TEXT,
+        leader_price REAL, source_slot INTEGER, built_expires_at INTEGER, sent_at INTEGER,
         UNIQUE (follower, source_sig)
       );
       CREATE INDEX IF NOT EXISTS intents_follower ON intents (follower, status, created_at);
@@ -41,16 +54,27 @@ export class CopyStore {
         follower TEXT NOT NULL, mint TEXT NOT NULL, tokens TEXT NOT NULL, cost_lamports TEXT NOT NULL,
         PRIMARY KEY (follower, mint)
       );
+      CREATE TABLE IF NOT EXISTS leader_sells (
+        signature TEXT PRIMARY KEY, leader TEXT NOT NULL, mint TEXT NOT NULL, slot INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS leader_sells_lm ON leader_sells (leader, mint, slot);
     `);
+    // Databases created before these columns existed.
+    const have = new Set((this.db.prepare("PRAGMA table_info(intents)").all() as Row[]).map((c) => c.name as string));
+    for (const [col, type] of [["leader_price", "REAL"], ["source_slot", "INTEGER"], ["built_expires_at", "INTEGER"], ["sent_at", "INTEGER"]]) {
+      if (!have.has(col)) this.db.exec(`ALTER TABLE intents ADD COLUMN ${col} ${type}`);
+    }
+    // A signature can prove at most one intent.
+    this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS intents_signature ON intents (signature) WHERE signature IS NOT NULL");
   }
 
   /** Inserts the intent, or returns the existing one for the same (follower, sourceSignature). */
   insert(i: StoredIntent): { intent: StoredIntent; created: boolean } {
     const r = this.db.prepare(`INSERT OR IGNORE INTO intents
-      (id, follower, leader, source_sig, kind, mint, side, venue, lamports, tokens, leverage, created_at, expires_at, status, skip_reason, slippage_bps)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+      (id, follower, leader, source_sig, kind, mint, side, venue, lamports, tokens, leverage, created_at, expires_at, status, skip_reason, slippage_bps, leader_price, source_slot)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
       i.id, i.follower, i.leader, i.sourceSignature, i.kind, i.mint, i.side, i.venue, i.lamports ?? null, i.tokens ?? null, i.leverage ?? null,
-      i.createdAt, i.expiresAt, i.status, i.skipReason ?? null, i.slippageBps);
+      i.createdAt, i.expiresAt, i.status, i.skipReason ?? null, i.slippageBps, i.leaderPrice ?? null, i.sourceSlot ?? null);
     if (Number(r.changes) === 1) return { intent: i, created: true };
     return { intent: toIntent(this.db.prepare("SELECT * FROM intents WHERE follower=? AND source_sig=?").get(i.follower, i.sourceSignature) as Row), created: false };
   }
@@ -65,9 +89,17 @@ export class CopyStore {
     return r ? toIntent(r) : undefined;
   }
 
-  /** Marks pending intents past their expiry as expired. */
+  /**
+   * Time-based transitions. A built intent whose built window ended goes back to
+   * pending if the intent itself has not expired, else expires. Pending intents
+   * past their expiry expire. Both release reservations and daily-cap usage.
+   */
   expireDue(now: number): number {
-    return Number(this.db.prepare("UPDATE intents SET status='expired' WHERE status='pending' AND expires_at<=?").run(now).changes);
+    let n = 0;
+    n += Number(this.db.prepare("UPDATE intents SET status='expired', built_expires_at=NULL WHERE status='built' AND built_expires_at IS NOT NULL AND built_expires_at<=? AND expires_at<=?").run(now, now).changes);
+    n += Number(this.db.prepare("UPDATE intents SET status='pending', built_expires_at=NULL WHERE status='built' AND built_expires_at IS NOT NULL AND built_expires_at<=?").run(now).changes);
+    n += Number(this.db.prepare("UPDATE intents SET status='expired' WHERE status='pending' AND expires_at<=?").run(now).changes);
+    return n;
   }
 
   list(follower: string, status: CopyIntent["status"] | undefined, now: number, limit = 100): StoredIntent[] {
@@ -78,17 +110,17 @@ export class CopyStore {
     return rows.map(toIntent);
   }
 
-  /** Lamports committed since `sinceMs` by intents that can still execute (pending, built, sent). */
+  /** Lamports committed since `sinceMs` by intents that can still execute or may have executed (pending, built, sent_unconfirmed, sent). */
   committedSince(follower: string, sinceMs: number, now: number): number {
     this.expireDue(now);
     const r = this.db.prepare(`SELECT COALESCE(SUM(lamports),0) AS s FROM intents
-      WHERE follower=? AND created_at>=? AND status IN ('pending','built','sent') AND side IN ('buy','long','short')`).get(follower, sinceMs) as Row;
+      WHERE follower=? AND created_at>=? AND status IN ('pending','built','sent_unconfirmed','sent') AND side IN ('buy','long','short')`).get(follower, sinceMs) as Row;
     return Number(r.s);
   }
 
-  /** Tokens in sells that are pending or built (not yet sent), so they are not sold twice. */
+  /** Tokens in sells that are pending, built or sent but not yet confirmed (the position is not reduced yet), so they are not sold twice. */
   reservedSellTokens(follower: string, mint: string): bigint {
-    const rows = this.db.prepare("SELECT tokens FROM intents WHERE follower=? AND mint=? AND side='sell' AND status IN ('pending','built') AND tokens IS NOT NULL").all(follower, mint) as Row[];
+    const rows = this.db.prepare("SELECT tokens FROM intents WHERE follower=? AND mint=? AND side='sell' AND status IN ('pending','built','sent_unconfirmed') AND tokens IS NOT NULL").all(follower, mint) as Row[];
     return rows.reduce((s, r) => s + BigInt(r.tokens as string), 0n);
   }
 
@@ -104,26 +136,49 @@ export class CopyStore {
     return Number(r.n);
   }
 
-  /** pending -> built, recording what the builder quoted. */
-  markBuilt(id: string, q: { venue: CopyIntent["venue"]; lamports?: number; tokens?: string }): boolean {
-    return Number(this.db.prepare("UPDATE intents SET status='built', venue=?, lamports=COALESCE(?,lamports), tokens=COALESCE(?,tokens) WHERE id=? AND status='pending'")
-      .run(q.venue, q.lamports ?? null, q.tokens ?? null, id).changes) === 1;
+  /** pending -> built, recording what the builder quoted. The built state lapses at `builtExpiresAt` (ms) if given. */
+  markBuilt(id: string, q: { venue: CopyIntent["venue"]; lamports?: number; tokens?: string }, builtExpiresAt?: number): boolean {
+    return Number(this.db.prepare("UPDATE intents SET status='built', venue=?, lamports=COALESCE(?,lamports), tokens=COALESCE(?,tokens), built_expires_at=? WHERE id=? AND status='pending'")
+      .run(q.venue, q.lamports ?? null, q.tokens ?? null, builtExpiresAt ?? null, id).changes) === 1;
+  }
+
+  /** pending -> skipped, when a build-time check refuses the intent for good. */
+  markRefused(id: string, reason: string): boolean {
+    return Number(this.db.prepare("UPDATE intents SET status='skipped', skip_reason=? WHERE id=? AND status='pending'").run(reason, id).changes) === 1;
   }
 
   /**
-   * built -> sent, and updates the follower's copy position (spot only). If
-   * `follower` is given it must own the intent. Returns false if the intent
-   * is missing, not the follower's or not in `built`.
+   * built -> sent_unconfirmed. This only records the signature the follower
+   * reports; nothing is proven and no position changes until `confirmSent`.
+   * The signature must be unused by any other intent. If `follower` is given
+   * it must own the intent. Returns false if the intent is missing, not the
+   * follower's, not in `built`, or the signature is taken.
    */
-  markSent(id: string, signature: string, follower?: string): boolean {
+  markSent(id: string, signature: string, follower?: string, now = Date.now()): boolean {
     const i = this.get(id);
     if (!i || i.status !== "built" || (follower !== undefined && i.follower !== follower)) return false;
+    try {
+      return Number(this.db.prepare("UPDATE intents SET status='sent_unconfirmed', signature=?, sent_at=?, built_expires_at=NULL WHERE id=? AND status='built'").run(signature, now, id).changes) === 1;
+    } catch (e) {
+      if (/UNIQUE|constraint/i.test((e as Error).message)) return false;
+      throw e;
+    }
+  }
+
+  /**
+   * sent_unconfirmed -> sent, once the chain proved it. `tokenDelta` is the
+   * follower's actual token balance change in the transaction (positive for a
+   * buy, the amount sold for a sell); it, not the quote, moves the position (spot only).
+   */
+  confirmSent(id: string, tokenDelta: bigint): boolean {
+    const i = this.get(id);
+    if (!i || i.status !== "sent_unconfirmed") return false;
     this.db.exec("BEGIN");
     try {
-      this.db.prepare("UPDATE intents SET status='sent', signature=? WHERE id=? AND status='built'").run(signature, id);
-      if (i.kind === "spot" && i.tokens) {
+      this.db.prepare("UPDATE intents SET status='sent' WHERE id=? AND status='sent_unconfirmed'").run(id);
+      if (i.kind === "spot") {
         const p = this.position(i.follower, i.mint);
-        const t = BigInt(i.tokens);
+        const t = tokenDelta < 0n ? -tokenDelta : tokenDelta;
         let next: CopyPosition;
         if (i.side === "buy") next = { tokens: p.tokens + t, costLamports: p.costLamports + BigInt(i.lamports ?? 0) };
         else {
@@ -140,6 +195,25 @@ export class CopyStore {
       throw e;
     }
     return true;
+  }
+
+  /** sent_unconfirmed -> failed: the chain refused it, or it never landed. Releases the reservation and cap usage. */
+  markFailed(id: string): boolean {
+    return Number(this.db.prepare("UPDATE intents SET status='failed' WHERE id=? AND status='sent_unconfirmed'").run(id).changes) === 1;
+  }
+
+  unconfirmed(limit = 200): StoredIntent[] {
+    return (this.db.prepare("SELECT * FROM intents WHERE status='sent_unconfirmed' ORDER BY sent_at LIMIT ?").all(limit) as Row[]).map(toIntent);
+  }
+
+  /** Records a leader's sell, so builds of that leader's earlier buys can be refused. */
+  recordLeaderSell(leader: string, mint: string, slot: number, signature: string): void {
+    this.db.prepare("INSERT OR IGNORE INTO leader_sells (signature, leader, mint, slot) VALUES (?,?,?,?)").run(signature, leader, mint, slot);
+  }
+
+  /** LeaderExitPort: did the leader sell `mint` in or after the source trade's slot (another transaction)? */
+  async leaderSoldSince(leader: string, mint: string, source: { signature: string; slot: number }): Promise<boolean> {
+    return !!this.db.prepare("SELECT 1 FROM leader_sells WHERE leader=? AND mint=? AND slot>=? AND signature<>? LIMIT 1").get(leader, mint, source.slot, source.signature);
   }
 
   close() { this.db.close(); }

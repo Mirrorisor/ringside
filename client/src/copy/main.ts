@@ -1,6 +1,6 @@
 /**
  * Copy service entry point. Env: SESSION_SECRET, COPY_INGEST_SECRET,
- * COPY_PORT (8793), COPY_CORS_ORIGIN, COPY_DB (default ./copy.sqlite),
+ * COPY_PORT (8793), COPY_HOST (127.0.0.1), COPY_CORS_ORIGIN, COPY_DB (default ./copy.sqlite),
  * COPY_RPC_URL, COPY_FEE_WALLET, JUPITER_API_KEY, SPONSOR_ADDRESS (optional).
  *
  * TODO(social): the SocialPort is the social backend's; until it is wired,
@@ -13,6 +13,7 @@ import { SqliteStore } from "../indexer/store.js";
 import { hmacSessionAuth } from "../session.js";
 import { Jupiter } from "../trade/jupiter.js";
 import { type BuildDeps, pumpPort } from "./build.js";
+import { confirmPending, rpcTxPort } from "./confirm.js";
 import { createCopyEngine } from "./engine.js";
 import { indexerFlagsPort } from "./flagsport.js";
 import type { SocialPort } from "./ports.js";
@@ -33,14 +34,19 @@ export function startCopyService(social: SocialPort, indexer: SqliteStore, env: 
     chain: { latestBlockhash: async () => (await rpc.getLatestBlockhash().send()).value },
     sponsor: env.SPONSOR_ADDRESS,
   };
+  const tx = rpcTxPort(rpc as never);
+  const sweep = setInterval(() => { confirmPending({ store, tx }).catch((e) => console.error(`[copy] confirm sweep: ${(e as Error).message}`)); }, 15_000);
+  sweep.unref();
   const server = createCopyServer({
     store, engine, build,
     // aud "copy": tokens for other services are refused. Revocation: see RevocationPort (multi-process gap).
     authenticate: hmacSessionAuth(need("SESSION_SECRET"), { aud: "copy" }),
     ingestSecret: need("COPY_INGEST_SECRET"),
+    tx,
     corsOrigin: env.COPY_CORS_ORIGIN,
     trustProxy: env.COPY_TRUST_PROXY === "1",
   });
-  server.listen(Number(env.COPY_PORT ?? 8793));
+  // Loopback unless told otherwise: put a proxy in front, or set COPY_HOST deliberately.
+  server.listen(Number(env.COPY_PORT ?? 8793), env.COPY_HOST || "127.0.0.1");
   return { server, store, engine };
 }

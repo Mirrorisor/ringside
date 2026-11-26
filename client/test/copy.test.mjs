@@ -3,6 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createCopyEngine } from "../dist/copy/engine.js";
 import { CopyStore } from "../dist/copy/store.js";
+import { confirmIntent, confirmPending } from "../dist/copy/confirm.js";
 import { buildIntent, compileUnsigned, BuildError } from "../dist/copy/build.js";
 import { createCopyServer, parseTrade } from "../dist/copy/server.js";
 import { cappedLeverage, tierMaxLeverage, TIER_MAX_LEVERAGE } from "../dist/copy/perps.js";
@@ -85,6 +86,7 @@ test("flags and age do not block an exit", async () => {
   const r = rig({ list: [settings({ skipFlags: ["sniper"], minTokenAgeSec: 600 })], facts: { [MINT]: { flags: ["sniper"], ageSec: 1 } } });
   r.store.insert({ id: "seed", follower: ALICE, leader: LEADER, sourceSignature: "x", kind: "spot", mint: MINT, side: "buy", venue: "pumpfun", lamports: 1, tokens: "100", createdAt: T0, expiresAt: T0, status: "built", slippageBps: 100 });
   r.store.markSent("seed", SIG(9));
+  r.store.confirmSent("seed", 100n);
   assert.equal((await one(r, trade({ side: "sell", quoteAmount: 5 }))).status, "pending");
 });
 
@@ -145,7 +147,7 @@ test("daily cap: exactly reaching the cap is allowed; the window is 24 h", async
   const mk = async (n) => { const i = await one(r, trade({ signature: SIG(n), timestamp: Math.floor(r.clock.t / 1000) })); return i; };
   const a = await mk(1), b = await mk(2);
   assert.deepEqual([a.status, b.status], ["pending", "pending"]);
-  for (const i of [a, b]) { r.store.markBuilt(i.id, { venue: "pumpfun" }); r.store.markSent(i.id, SIG(50)); }
+  for (const [k, i] of [a, b].entries()) { r.store.markBuilt(i.id, { venue: "pumpfun" }); r.store.markSent(i.id, SIG(50 + k)); }
   assert.equal((await mk(3)).skipReason, "over_daily_cap");
   r.clock.t = T0 + 24 * 3600 * 1000 + 1;
   assert.equal((await mk(4)).status, "pending");
@@ -162,16 +164,17 @@ test("ratio mode sizes from the leader's trade and is checked against the per-tr
 
 const cuLimit = { programAddress: "ComputeBudget111111111111111111111111111111", data: Uint8Array.from([2, 0x40, 0x0d, 0x03, 0x00]) };
 const BLOCKHASH = { blockhash: "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi", lastValidBlockHeight: 100n };
-const pumpFake = (venue = "curve", tokensOut = 1000n) => ({
+// trade() fills at 0.001 SOL per UI token, so 0.1 SOL buys 100 tokens = 100_000_000 raw (6 decimals)
+const pumpFake = (venue = "curve", tokensOut = 100_000_000n) => ({
   calls: [],
-  async buy(p) { this.calls.push(["buy", p]); return { instructions: [cuLimit], quote: { venue, solIn: p.solIn, tokensOut, feeLamports: p.solIn / 200n } }; },
-  async sell(p) { this.calls.push(["sell", p]); return { instructions: [cuLimit], quote: { venue, tokensIn: p.tokensIn, solOut: p.tokensIn * 2n, feeLamports: 7n } }; },
+  async buy(p) { this.calls.push(["buy", p]); return { instructions: [cuLimit], quote: { venue, solIn: p.solIn, tokensOut, slippageBps: 100, maxSolCost: p.solIn, feeLamports: p.solIn / 200n } }; },
+  async sell(p) { this.calls.push(["sell", p]); return { instructions: [cuLimit], quote: { venue, tokensIn: p.tokensIn, solOut: p.tokensIn * 2n, minSolOut: p.tokensIn * 2n - 1n, slippageBps: 100, feeLamports: 7n } }; },
 });
 const jupFake = (follower) => ({
   calls: [],
   async order(req) {
     this.calls.push(req);
-    return { inputMint: req.inputMint, outputMint: req.outputMint, inAmount: String(req.amount), outAmount: "5000", feeBps: 50, slippageBps: 100, requestId: "r",
+    return { inputMint: req.inputMint, outputMint: req.outputMint, inAmount: String(req.amount), outAmount: "100000000", feeBps: 50, slippageBps: 100, requestId: "r",
       transaction: compileUnsigned(req.payer ?? follower, [cuLimit], BLOCKHASH) };
   },
 });
@@ -180,7 +183,7 @@ const chain = { latestBlockhash: async () => BLOCKHASH };
 test("build: Pump curve while on the curve, unsigned transaction, fee and lamports reported", async () => {
   const r = rig();
   const i = await one(r);
-  const pump = pumpFake("curve", 4242n);
+  const pump = pumpFake("curve", 100_004_242n);
   const b = await buildIntent({ store: r.store, pump, jupiter: jupFake(ALICE), chain, now: () => r.clock.t }, i.id, ALICE);
   assert.equal(b.venue, "pumpfun");
   assert.equal(b.lamports, 0.1 * SOL);
@@ -189,7 +192,7 @@ test("build: Pump curve while on the curve, unsigned transaction, fee and lampor
   assert.equal(pump.calls[0][1].user, ALICE);
   const row = r.store.get(i.id);
   assert.equal(row.status, "built");
-  assert.equal(row.tokens, "4242");
+  assert.equal(row.tokens, "100004242");
   await assert.rejects(buildIntent({ store: r.store, pump, jupiter: jupFake(ALICE), chain }, i.id, ALICE), (e) => e.code === "not_pending");
 });
 
@@ -203,7 +206,7 @@ test("build: graduated coins (AMM) and non-Pump coins go through Jupiter, with t
     assert.equal(jup.calls[0].taker, ALICE);
     assert.equal(jup.calls[0].inputMint, "So11111111111111111111111111111111111111112");
     assert.equal(b.feeLamports, Math.floor((0.1 * SOL * 50) / 10_000));
-    assert.equal(r.store.get(i.id).tokens, "5000");
+    assert.equal(r.store.get(i.id).tokens, "100000000");
   }
   const r = rig();
   const i = await one(r);
@@ -225,6 +228,7 @@ async function copyBuy(r, n, lamports, tokens) {
   const i = await one(r, trade({ signature: SIG(n), quoteAmount: 1 }));
   r.store.markBuilt(i.id, { venue: "pumpfun", lamports, tokens: String(tokens) });
   assert.ok(r.store.markSent(i.id, SIG(100 + n)));
+  assert.ok(r.store.confirmSent(i.id, BigInt(tokens)));
   return i;
 }
 
@@ -253,6 +257,7 @@ test("ratio sells larger than the position are clamped; sending a sell reduces p
   assert.equal(sell.tokens, "300"); // 0.1 of 0.3 SOL cost
   r.store.markBuilt(sell.id, { venue: "jupiter", lamports: 0.12 * SOL });
   r.store.markSent(sell.id, SIG(77));
+  r.store.confirmSent(sell.id, 300n);
   assert.deepEqual(r.store.position(ALICE, MINT), { tokens: 600n, costLamports: BigInt(0.2 * SOL) });
   const big = await one(r, trade({ signature: SIG(3), side: "sell", quoteAmount: 99 }));
   assert.equal(big.tokens, "600");
@@ -265,8 +270,9 @@ test("markSent needs the built state and the owner", async () => {
   r.store.markBuilt(i.id, { venue: "pumpfun", tokens: "10" });
   assert.equal(r.store.markSent(i.id, SIG(9), BOB), false);
   assert.equal(r.store.markSent(i.id, SIG(9), ALICE), true);
-  assert.equal(r.store.markSent(i.id, SIG(9), ALICE), false); // not twice: the position is counted once
-  assert.equal(r.store.position(ALICE, MINT).tokens, 10n);
+  assert.equal(r.store.get(i.id).status, "sent_unconfirmed");
+  assert.equal(r.store.markSent(i.id, SIG(9), ALICE), false); // not twice
+  assert.equal(r.store.position(ALICE, MINT).tokens, 0n, "reported, not proven: no position yet");
 });
 
 // ---- perps --------------------------------------------------------------------------------
@@ -328,6 +334,7 @@ test("perp close is copied only when the follower has a sent open", async () => 
   const [open] = await r.engine.onLeaderPerp(perp({ signature: SIG(31) }));
   r.store.markBuilt(open.id, { venue: "ringside-perps" });
   r.store.markSent(open.id, SIG(90));
+  r.store.confirmSent(open.id, 0n);
   const [c] = await r.engine.onLeaderPerp(close(32));
   assert.equal(c.status, "pending");
   assert.equal(c.side, "close");
@@ -335,11 +342,17 @@ test("perp close is copied only when the follower has a sent open", async () => 
 
 // ---- HTTP: isolation and ingest auth ------------------------------------------------------
 
+const okTx = (owner, delta, o = {}) => ({
+  err: null, signers: [owner], accounts: [MINT],
+  preTokenBalances: [{ owner, mint: MINT, amount: "0" }], postTokenBalances: [{ owner, mint: MINT, amount: String(delta) }], ...o,
+});
+
 async function http(extra = {}) {
   const r = rig({ list: [settings(), settings({ follower: BOB })] });
   const server = createCopyServer({
     store: r.store, engine: r.engine,
     build: { store: r.store, pump: pumpFake("curve"), jupiter: jupFake(ALICE), chain },
+    tx: { getTransaction: async () => okTx(ALICE, 100_000_000n) },
     authenticate: hmacSessionAuth(SESSION, { aud: "copy" }), ingestSecret: INGEST, corsOrigin: "https://app.example", now: () => r.clock.t, ...extra,
   });
   server.listen(0);
@@ -393,14 +406,15 @@ test("one follower cannot see, build or mark sent another's intent", async () =>
 
     const built = await h.call("POST", `/intents/${aliceId}/build`, { headers: h.tok(ALICE) });
     assert.equal(built.status, 200);
-    assert.deepEqual(Object.keys(built.body).sort(), ["feeLamports", "lamports", "transaction", "venue"]);
+    assert.deepEqual(Object.keys(built.body).sort(), ["expectedOut", "feeLamports", "lamports", "minOut", "slippageBps", "transaction", "venue"]);
 
     const theft = await h.call("POST", `/intents/${aliceId}/sent`, { headers: h.tok(BOB), body: { signature: SIG(7) } });
     assert.equal(theft.status, 404);
     assert.equal(h.r.store.get(aliceId).status, "built");
     const sent = await h.call("POST", `/intents/${aliceId}/sent`, { headers: h.tok(ALICE), body: { signature: SIG(7) } });
     assert.equal(sent.status, 200);
-    assert.equal(h.r.store.position(ALICE, MINT).tokens, 1000n);
+    assert.equal(sent.body.status, "sent"); // confirmed by the fake chain
+    assert.equal(h.r.store.position(ALICE, MINT).tokens, 100_000_000n);
     assert.equal(h.r.store.position(BOB, MINT).tokens, 0n);
     assert.equal((await h.call("POST", `/intents/${aliceId}/sent`, { headers: h.tok(ALICE), body: { signature: SIG(7) } })).status, 409);
   } finally { h.stop(); }
@@ -441,4 +455,248 @@ test("body size limit and rate limits", async () => {
 test("parseTrade rejects malformed input", () => {
   assert.ok(parseTrade(trade()));
   for (const bad of [null, [], { ...trade(), side: "hold" }, { ...trade(), quoteAmount: -1 }, { ...trade(), signature: "short" }, { ...trade(), timestamp: 1.5 }, { ...trade(), mint: "x" }]) assert.equal(parseTrade(bad), null);
+});
+
+// ---- review fixes: bait trades, stuck intents, unproven sends, bind address ----------------
+
+const deps = (r, o = {}) => ({ store: r.store, pump: pumpFake("curve"), jupiter: jupFake(ALICE), chain, now: () => r.clock.t, ...o });
+
+test("H2: a 1-lamport leader buy does not trigger a follower buy; the floor scales with the copy size", async () => {
+  const r = rig();
+  const i = await one(r, trade({ quoteAmount: 1e-9 }));
+  assert.equal(i.status, "skipped");
+  assert.equal(i.skipReason, "leader_trade_too_small");
+  assert.equal(r.notified.length, 0);
+  // 0.04 SOL is under the 0.05 SOL floor; 0.05 passes
+  assert.equal((await one(r, trade({ signature: SIG(2), quoteAmount: 0.04 }))).skipReason, "leader_trade_too_small");
+  assert.equal((await one(r, trade({ signature: SIG(3), quoteAmount: 0.05 }))).status, "pending");
+  // a follower copying 0.4 SOL needs a leader trade of at least 0.2 SOL (ratio 0.5)
+  const big = rig({ list: [settings({ fixedLamports: 0.4 * SOL })] });
+  assert.equal((await one(big, trade({ quoteAmount: 0.19 }))).skipReason, "leader_trade_too_small");
+  assert.equal((await one(big, trade({ signature: SIG(2), quoteAmount: 0.2 }))).status, "pending");
+  // exits are never blocked by the floor
+  await copyBuy(big, 5, 0.1 * SOL, 100);
+  assert.equal((await one(big, trade({ signature: SIG(6), side: "sell", quoteAmount: 0.0001 }))).status, "pending");
+});
+
+test("H2: a buy is refused when the price has moved more than 10% against the follower since the leader's fill", async () => {
+  const r = rig();
+  const i = await one(r);
+  assert.equal(i.leaderPrice, 0.001);
+  // 0.1 SOL at 0.001/token = 100_000_000 raw; 10% worse = 90_909_090 raw
+  const worse = (tokensOut) => deps(r, { pump: pumpFake("curve", tokensOut) });
+  await assert.rejects(buildIntent(worse(90_000_000n), i.id, ALICE), (e) => e instanceof BuildError && e.code === "price_moved");
+  assert.equal(r.store.get(i.id).status, "pending", "a price refusal can be retried while the intent lives");
+  await buildIntent(worse(91_000_000n), i.id, ALICE); // within 10%
+  assert.equal(r.store.get(i.id).status, "built");
+  // a better price always builds
+  const r2 = rig();
+  const j = await one(r2);
+  await buildIntent(deps(r2, { pump: pumpFake("curve", 500_000_000n) }), j.id, ALICE);
+  // the drift limit is configurable
+  const r3 = rig();
+  const k = await one(r3);
+  await assert.rejects(buildIntent(deps(r3, { pump: pumpFake("curve", 95_000_000n), maxPriceDriftBps: 100 }), k.id, ALICE), (e) => e.code === "price_moved");
+});
+
+test("H2: a buy is refused once the leader has sold the mint after the source trade", async () => {
+  const r = rig();
+  const i = await one(r, trade({ slot: 100 }));
+  await r.engine.onLeaderTrade(trade({ signature: SIG(2), side: "sell", slot: 101 })); // leader dumps
+  await assert.rejects(buildIntent(deps(r), i.id, ALICE), (e) => e instanceof BuildError && e.code === "leader_exited");
+  assert.equal(r.store.get(i.id).status, "skipped");
+  assert.equal(r.store.get(i.id).skipReason, "leader_exited");
+  // a sell of another mint, or before the buy, does not count
+  const r2 = rig();
+  await r2.engine.onLeaderTrade(trade({ signature: SIG(8), side: "sell", slot: 99 }));
+  await r2.engine.onLeaderTrade(trade({ signature: SIG(9), side: "sell", slot: 150, mint: MINT2 }));
+  const j = await one(r2, trade({ slot: 100 }));
+  await buildIntent(deps(r2), j.id, ALICE);
+  // the port is injectable
+  const r3 = rig();
+  const k = await one(r3);
+  await assert.rejects(buildIntent(deps(r3, { exits: { leaderSoldSince: async () => true } }), k.id, ALICE), (e) => e.code === "leader_exited");
+});
+
+test("M1: built expiry (90 s) -> pending if the intent lives on, else expired; cap and reservations are released", async () => {
+  // an engine with a long intent ttl, so the intent outlives the built window
+  const store = new CopyStore(":memory:");
+  const clock = { t: T0 };
+  const social = { copySettingsForLeader: async () => [settings({ fixedLamports: 0.5 * SOL, dailyCapLamports: 1 * SOL })], notify: async () => {} };
+  const engine = createCopyEngine({ social, flags: { tokenFacts: async () => ({ flags: [], ageSec: 1 }) }, store, perpsEnabled: false, now: () => clock.t, ttlMs: 600_000 });
+  const [i] = await engine.onLeaderTrade(trade());
+  await buildIntent({ store, pump: pumpFake("curve", 500_000_000n), jupiter: jupFake(ALICE), chain, now: () => clock.t }, i.id, ALICE);
+  assert.equal(store.get(i.id).builtExpiresAt, T0 + 90_000);
+  assert.equal(store.committedSince(ALICE, 0, clock.t), 0.5 * SOL);
+  clock.t = T0 + 89_999;
+  store.expireDue(clock.t);
+  assert.equal(store.get(i.id).status, "built");
+  clock.t = T0 + 90_000;
+  store.expireDue(clock.t);
+  assert.equal(store.get(i.id).status, "pending");
+  await buildIntent({ store, pump: pumpFake("curve", 500_000_000n), jupiter: jupFake(ALICE), chain, now: () => clock.t }, i.id, ALICE); // rebuild
+  assert.equal(store.get(i.id).status, "built");
+  // past the intent's own expiry the built intent expires, and the cap is free again
+  clock.t = T0 + 600_001;
+  store.expireDue(clock.t);
+  assert.equal(store.get(i.id).status, "expired");
+  assert.equal(store.committedSince(ALICE, 0, clock.t), 0);
+});
+
+test("M1 (reviewer PoC): a built-but-never-sent sell no longer locks the position", async () => {
+  const r = rig();
+  const [b] = await r.engine.onLeaderTrade(trade());
+  await buildIntent(deps(r), b.id, ALICE);
+  r.store.markSent(b.id, SIG(9), ALICE);
+  r.store.confirmSent(b.id, 100_000_000n);
+  const [s] = await r.engine.onLeaderTrade(trade({ signature: SIG(2), side: "sell" }));
+  await buildIntent(deps(r), s.id, ALICE);
+  r.clock.t += 7 * 86_400_000;
+  r.store.expireDue(r.clock.t);
+  assert.equal(r.store.get(s.id).status, "expired");
+  assert.equal(r.store.reservedSellTokens(ALICE, MINT), 0n);
+  const [s2] = await r.engine.onLeaderTrade(trade({ signature: SIG(3), side: "sell", timestamp: Math.floor(r.clock.t / 1000) }));
+  assert.equal(s2.status, "pending");
+});
+
+test("L2: a signature is unique across intents (reviewer PoC)", async () => {
+  const r = rig();
+  const ids = [];
+  for (const n of [1, 2]) {
+    const i = await one(r, trade({ signature: SIG(n) }));
+    r.store.markBuilt(i.id, { venue: "pumpfun", tokens: "10" });
+    ids.push(i.id);
+  }
+  assert.equal(r.store.markSent(ids[0], "1".repeat(88), ALICE), true);
+  assert.equal(r.store.markSent(ids[1], "1".repeat(88), ALICE), false);
+  assert.equal(r.store.get(ids[1]).status, "built");
+});
+
+async function sentIntent(r, sig = SIG(9), tokensOut = 100_000_000n) {
+  const i = await one(r);
+  await buildIntent(deps(r, { pump: pumpFake("curve", tokensOut) }), i.id, ALICE);
+  assert.ok(r.store.markSent(i.id, sig, ALICE, r.clock.t));
+  return i;
+}
+
+test("L2: sent_unconfirmed is not a position; confirmation records the actual token delta, not the quote", async () => {
+  const r = rig();
+  const i = await sentIntent(r);
+  assert.equal(r.store.get(i.id).status, "sent_unconfirmed");
+  assert.equal(r.store.position(ALICE, MINT).tokens, 0n);
+  // a sell cannot be copied yet either
+  assert.equal((await one(r, trade({ signature: SIG(2), side: "sell" }))).skipReason, "no_copy_position");
+  // the quote said 100_000_000; the chain says 93_000_000 (slippage)
+  const tx = { getTransaction: async () => okTx(ALICE, 93_000_000n) };
+  assert.equal(await confirmIntent({ store: r.store, tx, now: () => r.clock.t }, i.id), "confirmed");
+  assert.equal(r.store.get(i.id).status, "sent");
+  assert.equal(r.store.position(ALICE, MINT).tokens, 93_000_000n);
+});
+
+test("L2: unconfirmed buys still count toward the daily cap", async () => {
+  const r = rig({ list: [settings({ fixedLamports: 0.5 * SOL, dailyCapLamports: 0.5 * SOL })] });
+  await sentIntent(r, SIG(9), 500_000_000n);
+  assert.equal((await one(r, trade({ signature: SIG(2) }))).skipReason, "over_daily_cap");
+});
+
+test("L2: a missing, failed, foreign-signed or wrong-mint transaction never becomes a position", async () => {
+  const bad = {
+    "not signed by the follower": okTx(ALICE, 5n, { signers: [BOB] }),
+    "failed on chain": okTx(ALICE, 5n, { err: { InstructionError: [0, "Custom"] } }),
+    "other mint": { ...okTx(ALICE, 5n), accounts: [MINT2], preTokenBalances: [{ owner: ALICE, mint: MINT2, amount: "0" }], postTokenBalances: [{ owner: ALICE, mint: MINT2, amount: "5" }] },
+    "no token received": okTx(ALICE, 0n),
+    "tokens went to someone else": okTx(BOB, 5n, { signers: [ALICE] }),
+  };
+  for (const [why, chainTx] of Object.entries(bad)) {
+    const r = rig();
+    const i = await sentIntent(r);
+    assert.equal(await confirmIntent({ store: r.store, tx: { getTransaction: async () => chainTx }, now: () => r.clock.t }, i.id), "failed", why);
+    assert.equal(r.store.get(i.id).status, "failed", why);
+    assert.equal(r.store.position(ALICE, MINT).tokens, 0n, why);
+  }
+});
+
+test("L2: a transaction not found stays unconfirmed until its blockhash is dead, then fails and frees the cap", async () => {
+  const r = rig({ list: [settings({ fixedLamports: 0.5 * SOL, dailyCapLamports: 0.5 * SOL })] });
+  const i = await sentIntent(r, SIG(9), 500_000_000n);
+  const missing = { getTransaction: async () => null };
+  const d = () => ({ store: r.store, tx: missing, now: () => r.clock.t });
+  r.clock.t += 60_000;
+  assert.equal(await confirmIntent(d(), i.id), "unconfirmed");
+  const flaky = { getTransaction: async () => { throw new Error("rpc down"); } };
+  assert.equal(await confirmIntent({ ...d(), tx: flaky }, i.id), "unconfirmed");
+  r.clock.t += 130_000;
+  assert.equal(await confirmPending(d()), 0);
+  assert.equal(r.store.get(i.id).status, "failed");
+  assert.equal(r.store.committedSince(ALICE, 0, r.clock.t), 0);
+  // later confirmation by the sweep
+  const r2 = rig();
+  const j = await sentIntent(r2);
+  assert.equal(await confirmPending({ store: r2.store, tx: { getTransaction: async () => okTx(ALICE, 7n) }, now: () => r2.clock.t }), 1);
+  assert.equal(r2.store.position(ALICE, MINT).tokens, 7n);
+  void j;
+});
+
+test("L2: a confirmed sell reduces the position by the tokens actually sold", async () => {
+  const r = rig();
+  await copyBuy(r, 1, 0.1 * SOL, 1000);
+  const s = await one(r, trade({ signature: SIG(2), side: "sell", quoteAmount: 1 }));
+  r.store.markBuilt(s.id, { venue: "pumpfun" });
+  r.store.markSent(s.id, SIG(60), ALICE);
+  const tx = { getTransaction: async () => ({ ...okTx(ALICE, 0n), preTokenBalances: [{ owner: ALICE, mint: MINT, amount: "1000" }], postTokenBalances: [{ owner: ALICE, mint: MINT, amount: "600" }] }) };
+  assert.equal(await confirmIntent({ store: r.store, tx }, s.id), "confirmed");
+  assert.equal(r.store.position(ALICE, MINT).tokens, 600n);
+});
+
+test("L2: HTTP /sent with a signature that another intent used is a conflict", async () => {
+  const h = await http();
+  try {
+    await ingest(h);
+    await ingest(h, trade({ signature: SIG(2) }));
+    const [a, b] = (await h.call("GET", "/intents?status=pending", { headers: h.tok(ALICE) })).body.intents;
+    for (const i of [a, b]) await h.call("POST", `/intents/${i.id}/build`, { headers: h.tok(ALICE) });
+    assert.equal((await h.call("POST", `/intents/${a.id}/sent`, { headers: h.tok(ALICE), body: { signature: SIG(7) } })).status, 200);
+    assert.equal((await h.call("POST", `/intents/${b.id}/sent`, { headers: h.tok(ALICE), body: { signature: SIG(7) } })).status, 409);
+    assert.equal(h.r.store.position(ALICE, MINT).tokens, 100_000_000n, "counted once");
+  } finally { h.stop(); }
+});
+
+test("L6: the service binds to COPY_HOST, default 127.0.0.1", async () => {
+  const { startCopyService } = await import("../dist/copy/main.js");
+  const mk = (env) => {
+    const social = { copySettingsForLeader: async () => [], notify: async () => {} };
+    const base = { SESSION_SECRET: SESSION, COPY_INGEST_SECRET: INGEST, COPY_RPC_URL: "http://127.0.0.1:1", COPY_FEE_WALLET: ALICE, COPY_PORT: "0", COPY_DB: ":memory:" };
+    return startCopyService(social, {}, { ...base, ...env });
+  };
+  for (const [env, want] of [[{}, "127.0.0.1"], [{ COPY_HOST: "127.0.0.2" }, "127.0.0.2"]]) {
+    const svc = mk(env);
+    await new Promise((res) => svc.server.once("listening", res));
+    assert.equal(svc.server.address().address, want);
+    svc.server.close();
+  }
+});
+
+test("build response carries expectedOut, minOut and slippageBps, consistent for both venues", async () => {
+  const isDec = (v) => typeof v === "string" && /^\d+$/.test(v);
+  const check = (b) => { assert.ok(isDec(b.expectedOut) && isDec(b.minOut)); assert.ok(BigInt(b.minOut) <= BigInt(b.expectedOut)); assert.equal(b.slippageBps, 100); };
+  // Pump buy: tokens out
+  let r = rig(); let i = await one(r);
+  let b = await buildIntent(deps(r, { pump: pumpFake("curve", 100_000_123n) }), i.id, ALICE);
+  check(b); assert.equal(b.expectedOut, "100000123"); assert.equal(b.expectedOut, r.store.get(i.id).tokens);
+  // Jupiter buy: outAmount and otherAmountThreshold
+  r = rig(); i = await one(r);
+  const jb = jupFake(ALICE); const orig = jb.order.bind(jb);
+  jb.order = async (q) => ({ ...(await orig(q)), otherAmountThreshold: "99000000" });
+  b = await buildIntent(deps(r, { pump: pumpFake("amm"), jupiter: jb }), i.id, ALICE);
+  check(b); assert.equal(b.venue, "jupiter"); assert.equal(b.expectedOut, "100000000"); assert.equal(b.minOut, "99000000");
+  // sells: lamports out
+  for (const venue of ["pumpfun", "jupiter"]) {
+    r = rig(); await copyBuy(r, 1, 0.1 * SOL, 1000);
+    const s = await one(r, trade({ signature: SIG(2), side: "sell", quoteAmount: 1 }));
+    const j = jupFake(ALICE); const o2 = j.order.bind(j);
+    j.order = async (q) => ({ ...(await o2(q)), otherAmountThreshold: "4900" });
+    const sb = await buildIntent(deps(r, venue === "pumpfun" ? { jupiter: j } : { pump: pumpFake("amm"), jupiter: j }), s.id, ALICE);
+    check(sb); assert.equal(sb.venue, venue);
+    if (venue === "pumpfun") assert.equal(sb.expectedOut, String(sb.lamports)); else assert.equal(sb.minOut, "4900");
+  }
 });

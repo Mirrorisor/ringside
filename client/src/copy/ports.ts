@@ -20,7 +20,13 @@ export interface CopyIntent {
   venue: "jupiter" | "pumpfun" | "ringside-perps";
   lamports?: number; tokens?: string; leverage?: number;
   createdAt: number; expiresAt: number;
-  status: "pending" | "skipped" | "built" | "sent" | "expired"; skipReason?: string;
+  /**
+   * pending -> built -> sent_unconfirmed -> sent (confirmed on chain; counts as a position).
+   * built falls back to pending (or expired) when its short window passes; sent_unconfirmed can end as failed.
+   */
+  status: "pending" | "skipped" | "built" | "sent_unconfirmed" | "sent" | "failed" | "expired"; skipReason?: string;
+  /** Leader's fill price on the source trade: SOL per UI token (quoteAmount / tokenAmount). Spot buys and sells. */
+  leaderPrice?: number;
 }
 
 export interface SocialPort {
@@ -50,4 +56,9 @@ export interface PerpEvent {
   sizeUsd: number; leverage: number;
   signature: string; slot: number; timestamp: number; // unix seconds
   action: "open" | "close";
+}
+
+/** Reports whether a leader sold a mint after a source trade. The default is backed by CopyStore. */
+export interface LeaderExitPort {
+  leaderSoldSince(leader: string, mint: string, source: { signature: string; slot: number }): Promise<boolean>;
 }

@@ -10,21 +10,27 @@ export interface Signer {
 }
 
 const KEY = "ringside.social.token";
-let token: string | null = null;
+/** Each service only accepts a token issued for it (its audience). */
+export type Aud = "social" | "copy" | "sponsor";
+export type Tokens = Record<Aud, string>;
+let tokens: Tokens | null = null;
 let tokenWallet: string | null = null;
 try {
   const raw = sessionStorage.getItem(KEY);
-  if (raw) { const o = JSON.parse(raw) as { t?: string; w?: string }; if (o.t && o.w) { token = o.t; tokenWallet = o.w; } }
+  if (raw) {
+    const o = JSON.parse(raw) as { t?: Partial<Tokens>; w?: string };
+    if (o.t?.social && o.t.copy && o.t.sponsor && o.w) { tokens = o.t as Tokens; tokenWallet = o.w; }
+  }
 } catch { /* sessionStorage unavailable */ }
 
-export const getToken = () => token;
+export const getToken = (aud: Aud = "social") => tokens?.[aud] ?? null;
 export const tokenFor = () => tokenWallet;
 export function clearToken() {
-  token = null; tokenWallet = null;
+  tokens = null; tokenWallet = null;
   try { sessionStorage.removeItem(KEY); } catch { /* ignore */ }
 }
-function setToken(t: string, w: string) {
-  token = t; tokenWallet = w;
+function setTokens(t: Tokens, w: string) {
+  tokens = t; tokenWallet = w;
   try { sessionStorage.setItem(KEY, JSON.stringify({ t, w })); } catch { /* memory only */ }
 }
 
@@ -32,7 +38,7 @@ export const b64 = (u: Uint8Array) => { let s = ""; for (const b of u) s += Stri
 export const unb64 = (s: string) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
 
 /** Signed in as the signer's current wallet? */
-export const signedIn = (s: Signer) => !!token && tokenWallet === s.address();
+export const signedIn = (s: Signer) => !!tokens && tokenWallet === s.address();
 
 /** Sign-in with a wallet signature over the server's message; keeps the token in memory and sessionStorage. */
 export async function signIn(s: Signer): Promise<void> {
@@ -41,5 +47,5 @@ export async function signIn(s: Signer): Promise<void> {
   // Never sign a message another site could replay: it must name this site and this wallet, in the SIWS layout.
   checkSiwsMessage(message, { host: location.host, wallet });
   const sig = await s.signMessage(new TextEncoder().encode(message));
-  setToken(await social.verify(wallet, message, b64(sig)), wallet);
+  setTokens(await social.verify(wallet, message, b64(sig)), wallet);
 }

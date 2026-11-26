@@ -1,16 +1,16 @@
 import { COPY, INDEXER, SOCIAL, SPONSOR } from "./config";
-import { getToken, clearToken } from "./auth";
+import { getToken, clearToken, type Aud, type Tokens } from "./auth";
 import type { CopyIntent, CopySettings, LeaderRow, TokenFlags, Trade, Window, WalletStats } from "./types";
 
 export class ApiError extends Error {
   constructor(message: string, public status: number, public code?: string) { super(message); }
 }
 
-async function call(base: string, path: string, opts: { method?: string; body?: unknown; auth?: boolean } = {}): Promise<unknown> {
+async function call(base: string, path: string, opts: { method?: string; body?: unknown; auth?: Aud } = {}): Promise<unknown> {
   const headers: Record<string, string> = {};
   if (opts.body !== undefined) headers["content-type"] = "application/json";
-  const token = getToken();
-  if (opts.auth && token) headers.authorization = `Bearer ${token}`;
+  const token = opts.auth ? getToken(opts.auth) : null;
+  if (token) headers.authorization = `Bearer ${token}`;
   let res: Response;
   try {
     res = await fetch(base + path, {
@@ -56,43 +56,44 @@ export const social = {
   },
   verify: async (wallet: string, message: string, signature: string) => {
     const d = obj(await call(SOCIAL, "/auth/verify", { method: "POST", body: { wallet, message, signature } }));
-    if (typeof d.token !== "string") throw new ApiError("Sign-in was refused.", 0);
-    return d.token;
+    const t = obj(d.tokens);
+    if (typeof t.social !== "string" || typeof t.copy !== "string" || typeof t.sponsor !== "string") throw new ApiError("Sign-in was refused.", 0);
+    return { social: t.social, copy: t.copy, sponsor: t.sponsor } as Tokens;
   },
-  me: async () => obj(await call(SOCIAL, "/me", { auth: true })),
-  putMe: async (body: Record<string, unknown>) => obj(await call(SOCIAL, "/me", { method: "PUT", body, auth: true })),
-  user: async (wallet: string) => obj(await call(SOCIAL, `/users/${enc(wallet)}`, { auth: true })),
+  me: async () => obj(await call(SOCIAL, "/me", { auth: "social" })),
+  putMe: async (body: Record<string, unknown>) => obj(await call(SOCIAL, "/me", { method: "PUT", body, auth: "social" })),
+  user: async (wallet: string) => obj(await call(SOCIAL, `/users/${enc(wallet)}`, { auth: "social" })),
   follows: async (): Promise<string[]> => {
-    const rows = list(await call(SOCIAL, "/follows", { auth: true }), "follows");
+    const rows = list(await call(SOCIAL, "/follows", { auth: "social" }), "follows");
     return rows.map((r) => typeof r === "string" ? r : String(obj(r).wallet ?? obj(r).leader ?? obj(r).following ?? "")).filter(Boolean);
   },
-  follow: (w: string) => call(SOCIAL, `/follows/${enc(w)}`, { method: "POST", auth: true }),
-  unfollow: (w: string) => call(SOCIAL, `/follows/${enc(w)}`, { method: "DELETE", auth: true }),
+  follow: (w: string) => call(SOCIAL, `/follows/${enc(w)}`, { method: "POST", auth: "social" }),
+  unfollow: (w: string) => call(SOCIAL, `/follows/${enc(w)}`, { method: "DELETE", auth: "social" }),
   getCopy: async (leader: string): Promise<CopySettings | null> => {
-    try { return (await call(SOCIAL, `/copy-settings/${enc(leader)}`, { auth: true })) as CopySettings | null; }
+    try { return (await call(SOCIAL, `/copy-settings/${enc(leader)}`, { auth: "social" })) as CopySettings | null; }
     catch (e) { if (e instanceof ApiError && e.status === 404) return null; throw e; }
   },
   putCopy: async (leader: string, s: CopySettings) =>
-    (await call(SOCIAL, `/copy-settings/${enc(leader)}`, { method: "PUT", body: s, auth: true })) as CopySettings,
-  notifications: async () => list(await call(SOCIAL, "/notifications", { auth: true }), "notifications"),
+    (await call(SOCIAL, `/copy-settings/${enc(leader)}`, { method: "PUT", body: s, auth: "social" })) as CopySettings,
+  notifications: async () => list(await call(SOCIAL, "/notifications", { auth: "social" }), "notifications"),
 };
 
 // --- Copy engine (bearer token) ----------------------------------------------
 export const copy = {
   pending: async (): Promise<CopyIntent[]> =>
-    list(await call(COPY, "/intents?status=pending", { auth: true }), "intents") as CopyIntent[],
+    list(await call(COPY, "/intents?status=pending", { auth: "copy" }), "intents") as CopyIntent[],
   /** Unsigned transaction (base64) plus any extra fields the engine returns (e.g. fees). */
   build: async (id: string) => {
-    const d = obj(await call(COPY, `/intents/${enc(id)}/build`, { method: "POST", auth: true }));
+    const d = obj(await call(COPY, `/intents/${enc(id)}/build`, { method: "POST", auth: "copy" }));
     if (typeof d.transaction !== "string") throw new ApiError("The copy engine returned no transaction.", 0);
     return d as { transaction: string } & Record<string, unknown>;
   },
-  sent: (id: string, signature: string) => call(COPY, `/intents/${enc(id)}/sent`, { method: "POST", body: { signature }, auth: true }),
+  sent: (id: string, signature: string) => call(COPY, `/intents/${enc(id)}/sent`, { method: "POST", body: { signature }, auth: "copy" }),
 };
 
 // --- Sponsor ------------------------------------------------------------------
 export async function sponsorSend(transaction: string): Promise<{ signature: string; spentLamports?: string }> {
-  const d = obj(await call(SPONSOR, "/sponsor", { method: "POST", body: { transaction }, auth: true }));
+  const d = obj(await call(SPONSOR, "/sponsor", { method: "POST", body: { transaction }, auth: "sponsor" }));
   if (typeof d.signature !== "string") throw new ApiError("The sponsor returned no signature.", 0);
   return { signature: d.signature, spentLamports: d.spentLamports === undefined ? undefined : String(d.spentLamports) };
 }
@@ -104,7 +105,7 @@ export function streamNotifications(onEvent: () => void): () => void {
   (async () => {
     while (!stopped) {
       try {
-        const token = getToken();
+        const token = getToken("social");
         if (!token) { await new Promise((r) => setTimeout(r, 5000)); continue; }
         const res = await fetch(`${SOCIAL}/notifications/stream`, { headers: { authorization: `Bearer ${token}`, accept: "text/event-stream" }, signal: ctrl.signal });
         if (!res.ok || !res.body) throw new Error(String(res.status));
