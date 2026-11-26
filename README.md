@@ -56,7 +56,7 @@ The `devnet` feature gives curves 0.5 virtual SOL (so a curve sells out for ~1.5
 
 - `bash scripts/devnet.sh` — first-time setup: toolchain, wallet, build, deploy, smoke test.
 - `bash scripts/upgrade.sh` — rebuilds with the devnet feature, **refuses to deploy if any function overflows the 4 KB SBF stack frame**, upgrades only programs that changed, restarts the keeper and relayer, and runs the graduation and Pyth test.
-- `bash scripts/services.sh` / `scripts/app.sh` — keeper and relayer, then the web app on :5173.
+- `bash scripts/services.sh` / `scripts/app.sh` — keeper and relayer, then the web app on :5173. `services.sh start|stop|status indexer|social|sponsor` manages the backend services (see Services).
 - On Windows, run these in WSL (Ubuntu) from a copy in the Linux home; the `.bat` launchers in Documents do that.
 
 ## Mainnet
@@ -68,6 +68,137 @@ The `devnet` feature gives curves 0.5 virtual SOL (so a curve sells out for ~1.5
 - **Alerts.** The keeper posts to `ALERT_WEBHOOK_URL` (Slack or Discord) when the SOL price is over 90 s old, an order sits 30+ slots past its fill delay, a market goes reduce-only or into ADL, the keeper or relayer drops below 0.2 SOL, or the loop fails 5 times in a row. Each alert fires once and again when it clears (repeated hourly while open). `GET :8789/health` returns 503 when the loop hasn't succeeded for a minute.
 - **Sponsorship fee.** With `FEE_RECOVERY_TREASURY` set, the relayer requires a small USDC transfer to that treasury in each sponsored order; the app adds it automatically from `/v1/info`.
 - **Protocol-owned liquidity ($RING).** The keeper compounds protocol fees into treasury LP shares hourly (`COMPOUND_PROTOCOL_FEES=0` turns it off). `npx tsx scripts/treasury.ts sweep` (treasury key as `ANCHOR_WALLET`, `RING_MINT` set) claims $RING's creator fees and deposits them; `treasury.ts limits <mint> 0 1` keeps $RING's market reduce-only. See the spec's $RING section.
+
+## Services
+
+The backend for the social trading app lives in `client/src`. Build once with `cd client && npm run build`, then run each service from `client/` with `node dist/<entry>.js`, or use `bash scripts/services.sh start|stop|status <service>...` (pid files and logs in `$LOG_DIR`, default `Documents/ringside-logs`). The script sets ports 8790 (indexer), 8791 (social), 8792 (sponsor) and 8793 (copy); the services' own defaults differ where noted, because 8787 is the relayer and 8788 the devnet faucet. Secrets come from the environment and are never printed by the script. "Required" means the process refuses to start without it.
+
+**Safety defaults**
+
+- **Session secret:** at least 32 bytes (`MIN_SECRET_BYTES` in `session.ts`); a shorter one stops the service at startup.
+- **Token audiences:** the social backend mints three tokens per sign-in, with `aud` set to `social`, `copy` and `sponsor`. Each service accepts only its own audience, so a token for one service is useless at another. Tokens live 12 h (`SOCIAL_SESSION_TTL_SECONDS`) and `verifySessionToken` refuses any claiming more than 7 days.
+- **Anonymous sponsor:** `SPONSOR_ALLOW_ANON=1` is for devnet only. It takes effect only when no session secret is set, and is refused when `RPC_URL` contains `mainnet`. Without a secret and without it, the sponsor will not start.
+- **Copy perps:** `RINGSIDE_COPY_PERPS` is off unless it is exactly `1`. Even on, building a perp copy is refused when the copy RPC URL contains `mainnet` (devnet only).
+- **CORS:** the sponsor and copy services take one exact origin; copy refuses `*`, the sponsor only warns. Social takes a comma-separated list of exact origins, no `*`.
+- **Revocation gap:** logout is enforced only where the social store is injected; the sponsor and a separate copy process cannot see it, so the token lifetime bounds the exposure.
+
+### Indexer (`client/src/indexer/main.ts`)
+
+Receives Helius webhooks, stores trades, SOL transfers and launches in SQLite, and serves the feed, wallet stats, token risk flags and leaderboard. Payloads in Helius's enhanced-transaction format and in the newer parsed-events format are both parsed. Sponsor, relayer and fee wallets (`INDEXER_SPONSOR_ADDRESSES`) are never taken as the trader.
+
+Run: `HELIUS_WEBHOOK_SECRET=... node dist/indexer/main.js`. Routes: `POST /webhooks/helius`, `GET /feed`, `/wallet/:addr`, `/token/:mint/flags`, `/leaderboard`, `/health`.
+
+| Variable | Default | Required | Purpose |
+| --- | --- | --- | --- |
+| `HELIUS_WEBHOOK_SECRET` | none | yes (16+ characters) | Compared with the webhook's `Authorization` header |
+| `INDEXER_PORT` | `8787` (`services.sh`: `8790`) | no | HTTP port |
+| `INDEXER_DB` | `./indexer.db` | no | SQLite file |
+| `INDEXER_SPONSOR_ADDRESSES` | empty (warns) | no | Comma-separated wallets never taken as traders; SOL transfers to or from them are not stored |
+| `INDEXER_RATE_LIMIT_MAX` | `120` | no | Read requests per client IP per window; `0` disables |
+| `INDEXER_RATE_LIMIT_WINDOW_MS` | `60000` | no | Rate-limit window |
+| `INDEXER_REQUEST_TIMEOUT_MS` | `10000` | no | Whole-request timeout |
+| `INDEXER_TRUST_PROXY` | off | no | `1` keys clients by the last `X-Forwarded-For` entry (one trusted proxy) |
+
+### Social backend (`client/src/social/main.ts`)
+
+Sign-in with a Solana wallet (SIWS), profiles, follows, per-leader copy settings and notifications (including a stream). It mints the per-service session tokens and implements the copy engine's `SocialPort`.
+
+Run: `SESSION_SECRET=... SOCIAL_DOMAIN=... node dist/social/main.js`. Binds to `127.0.0.1`; `GET /health` is unauthenticated.
+
+| Variable | Default | Required | Purpose |
+| --- | --- | --- | --- |
+| `SESSION_SECRET` | none | yes (32+ bytes) | HMAC key for all session tokens; shared with the sponsor and copy services |
+| `SOCIAL_DOMAIN` | none | yes | Domain named in the sign-in message |
+| `SOCIAL_PORT` | `8791` | no | HTTP port |
+| `SOCIAL_HOST` | `127.0.0.1` | no | Bind address |
+| `SOCIAL_DB` | `./social.db` | no | SQLite file |
+| `SOCIAL_CORS_ORIGIN` | empty | no | Comma-separated exact origins |
+| `SOCIAL_MAX_FOLLOWS` | `500` | no | Follows per user |
+| `SOCIAL_MAX_TRADE_SOL` | `5` | no | Server cap on a copy's per-trade size, in SOL |
+| `SOCIAL_MAX_BODY_BYTES` | `16384` | no | JSON body limit |
+| `SOCIAL_RATE_LIMIT_IP` / `_USER` / `_AUTH` | `300` / `120` / `20` | no | Requests per minute; `0` disables |
+| `SOCIAL_SESSION_TTL_SECONDS` | `43200` | no | Token lifetime (12 h) |
+| `SOCIAL_NONCE_BIND_IP` | on | no | `0` stops binding sign-in nonces to the requesting IP |
+| `SOCIAL_MAX_STREAMS` / `SOCIAL_MAX_STREAMS_PER_IP` | `2000` / `20` | no | Open notification streams, total and per IP |
+| `SOCIAL_TRUST_PROXY` | off | no | `1` keys clients by the last `X-Forwarded-For` entry |
+
+### Gas sponsor (`client/src/sponsor.ts`)
+
+Pays the network fee for app users who hold no SOL. The app builds a transaction with the sponsor as fee payer, the user signs, and the sponsor co-signs only if it passes the checks (program allowlist, no sponsor key in any instruction, compute and fee caps, per-user, per-wallet and global daily budgets, simulation) and then sends it. It never pays rent. Per-user budget is 0.005 SOL a day and the global default is 2 SOL a day. The account must be at least `SPONSOR_MIN_ACCOUNT_AGE_SEC` old.
+
+Run: `RPC_URL=... SPONSOR_KEYPAIR_PATH=... SPONSOR_SESSION_SECRET=... node dist/sponsor.js`. `GET /health` is unauthenticated.
+
+| Variable | Default | Required | Purpose |
+| --- | --- | --- | --- |
+| `RPC_URL` | none | yes | Solana RPC |
+| `SPONSOR_KEYPAIR_PATH` | none | yes | Fee payer, a Solana CLI keypair file (`chmod 600`); contents are never logged |
+| `SPONSOR_SESSION_SECRET` | falls back to `SESSION_SECRET` | yes, unless `SESSION_SECRET` is set (32+ bytes) | Verifies `sponsor`-audience tokens |
+| `SESSION_SECRET` | none | no | Fallback for the above |
+| `SPONSOR_ALLOW_ANON` | off | no | `1` runs with no authentication: devnet only, see above |
+| `SPONSOR_PORT` | `8788` (`services.sh`: `8792`) | no | HTTP port |
+| `SPONSOR_CORS_ORIGIN` | unset (warns) | no | The app's origin; `*` is allowed but warns |
+| `TRUST_PROXY`, `TRUST_PROXY_HOPS` | off, `1` | no | Trust `X-Forwarded-For` through that many proxies |
+| `SPONSOR_REDIS_URL` | unset | no | Shared limits across instances |
+| `SPONSOR_STATE_FILE` | `sponsor-state.json` | no | Single-instance limits file, used when no Redis URL is set |
+| `SPONSOR_DAILY_LAMPORTS` | `2000000000` | no | Global daily budget |
+| `SPONSOR_MAX_FAILURES` | `3` | no | On-chain failures per hour before a block |
+| `SPONSOR_FEE_WALLET`, `SPONSOR_FEE_LAMPORTS` | unset, `10000` | no | Require a fee-recovery transfer to this wallet of at least this many lamports; the amount applies only with a wallet |
+| `SPONSOR_LOOKUP_TABLES` | off | no | `1` resolves address lookup tables |
+| `SPONSOR_MIN_ACCOUNT_AGE_SEC` | `3600` | no | Minimum account age, from the token's `firstSeen` claim |
+| `SPONSOR_DISABLED` | off | no | `1` kill switch, read on every request |
+
+### Session tokens (`client/src/session.ts`)
+
+A library, not a process. `createSessionToken` mints `v1.<payload>.<mac>`, an HMAC-SHA256 over `{sub, iat, exp, aud, firstSeen}`; `verifySessionToken` and `hmacSessionAuth` check the MAC in constant time, the expiry and the exact audience. Tokens are sent as `Authorization: Bearer`. The social backend mints them; the sponsor and copy service verify them. It reads no environment itself: the secret is passed in by each service.
+
+| Variable | Default | Required | Purpose |
+| --- | --- | --- | --- |
+| `SESSION_SECRET` | none | yes, for social and copy (32+ bytes) | Read by `social/main.ts`, `copy/main.ts` and, as a fallback, `sponsor.ts` |
+| `SPONSOR_SESSION_SECRET` | none | no | Sponsor-only override of `SESSION_SECRET` |
+
+### Copy engine (`client/src/copy/main.ts`)
+
+Turns a leader's indexed trade into one-tap copy intents for followers: it checks their settings and risk flags, then builds the unsigned transaction on the right venue (Pump.fun, Meteora, Jupiter, or Ringside perps) for the follower to sign. The indexer reports trades to `POST /ingest/trade`. Follower routes need a `copy` token; `GET /health` is unauthenticated.
+
+Run: **not yet runnable on its own.** `main.ts` exports `startCopyService(social, indexerStore)` and has no entry point; the social port is not wired (see the TODO in the file). It listens on `127.0.0.1:8793`.
+
+| Variable | Default | Required | Purpose |
+| --- | --- | --- | --- |
+| `SESSION_SECRET` | none | yes (32+ bytes) | Verifies `copy`-audience tokens |
+| `COPY_INGEST_SECRET` | none | yes | Secret for `POST /ingest/trade` |
+| `COPY_RPC_URL` | none | yes | Solana RPC for building and confirming |
+| `COPY_FEE_WALLET` | none | yes | Receives the Pump.fun and Meteora trade fee |
+| `COPY_PORT` | `8793` | no | HTTP port |
+| `COPY_HOST` | `127.0.0.1` | no | Bind address |
+| `COPY_DB` | `copy.sqlite` | no | SQLite file |
+| `COPY_CORS_ORIGIN` | unset | no | One exact origin; `*` is refused |
+| `COPY_TRUST_PROXY` | off | no | `1` keys clients by the last `X-Forwarded-For` entry |
+| `SPONSOR_ADDRESS` | unset | no | Gas sponsor address, used as fee payer when set |
+| `JUPITER_API_KEY` | none | needed for Jupiter routes | See the Jupiter layer |
+| `RINGSIDE_COPY_PERPS` | off | no | `1` turns on perp copying (devnet only, see above) |
+| `RINGSIDE_PERPS_IDL` | none | with perps | Path to `target/idl/ringside_perps.json` |
+| `COPY_MIN_LEADER_LAMPORTS` | `50000000` | no | Smallest leader buy that is copied (0.05 SOL) |
+| `COPY_MIN_LEADER_RATIO` | `0.5` | no | In fixed mode, the leader's trade must also be at least this fraction of the follower's copy size |
+| `COPY_MAX_PRICE_DRIFT_BPS` | `1000` | no | Largest price move from the leader's fill before a build is refused |
+
+### Trade layers (`client/src/trade/`)
+
+Libraries, not processes: each builds quotes and unsigned instructions for the user to sign and hands them to the gas sponsor or the user's wallet. None signs with a server key. Run their tests with `cd client && npm test` (`jupiter.test.mjs`, `pumpfun.test.mjs`, `meteora.test.mjs`).
+
+- **Jupiter** (`jupiter.ts`): Swap V2 order and execute, Trigger V2 (price and DCA orders), Tokens V2 and Price V3 against `https://api.jup.ag`. Every returned transaction is decoded and refused unless the fee payer, programs, transfers and fees are expected (`checkTransaction`). A referral fee of 50 to 255 bps is added when an account is configured.
+- **Pump.fun** (`pumpfun.ts`): buys and sells on a live bonding curve, or on the coin's PumpSwap pool once it has graduated, with a 50 bps SOL fee to Ringside by default and 100 bps default slippage. SOL-quoted coins only.
+- **Meteora** (`meteora.ts`): buys and sells on a Dynamic Bonding Curve (Bags, Believe, Jupiter Studio launches) using the SDK's offline quote, with the same fee model. Graduated pools, non-SOL quotes and transfer-hook mints are refused.
+
+| Variable | Default | Required | Purpose |
+| --- | --- | --- | --- |
+| `JUPITER_API_KEY` | none | yes, for any Jupiter call (or pass `apiKey`) | Sent as `x-api-key`; without one calls fail with `no_api_key` |
+| `JUPITER_REFERRAL_ACCOUNT` | none | no | Referral account for fees (or pass `referralAccount`; `null` turns fees off) |
+
+Pump.fun and Meteora read no environment variables: the RPC, fee wallet, `feeBps` and slippage are passed in by the caller (the copy service passes `COPY_RPC_URL` and `COPY_FEE_WALLET`).
+
+### Perps module (`client/src/perps/`)
+
+The shared Ringside perps client, used by the copy engine and the app: PDA derivation, tier and cap maths, account decoding from the IDL, the `request_order` builder for open, increase and close, and decoding of `PositionChanged` and `PositionClosed` events from logs. A library with no process of its own; it needs `target/idl/ringside_perps.json` and reads no environment variables (the copy service passes the IDL path from `RINGSIDE_PERPS_IDL`). Test: `node --test test/perps.test.mjs` after a build.
 
 ## Key design choices
 
