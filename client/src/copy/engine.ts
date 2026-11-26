@@ -7,7 +7,8 @@
  * Skip reasons (CopyIntent.skipReason): disabled, bad_settings, leader_trade_stale,
  * unsupported_quote, perps_gate_off, perps_disabled, no_perp_market, no_price,
  * token_age_unknown, token_too_young, flagged:<flag>, over_per_trade_cap,
- * over_daily_cap, sells_disabled, no_copy_position, sell_too_small.
+ * over_daily_cap, sells_disabled, no_copy_position, sell_too_small,
+ * leader_trade_too_small (buys only). Build-time refusals (build.ts): price_moved, leader_exited.
  *
  * Caps and the token filters (flags, age) apply to entries (buys, opens).
  * Exits (sells, closes) are never blocked by them: a follower must be able to
@@ -22,6 +23,9 @@ import { CopyStore, publicIntent, type StoredIntent } from "./store.js";
 export const MAX_LEADER_AGE_SEC = 30;
 export const DEFAULT_INTENT_TTL_MS = 60_000;
 export const DAILY_WINDOW_MS = 24 * 3600 * 1000;
+export const DEFAULT_MIN_LEADER_LAMPORTS = 0.05 * LAMPORTS_PER_SOL;
+export const DEFAULT_MIN_LEADER_RATIO = 0.5;
+const envNum = (k: string, d: number): number => { const v = Number(process.env[k]); return process.env[k] !== undefined && process.env[k] !== "" && Number.isFinite(v) && v >= 0 ? v : d; };
 const RISK_FLAGS: RiskFlag[] = ["sniper", "bundle", "insider", "concentrated"];
 
 export interface EngineOptions {
@@ -37,6 +41,10 @@ export interface EngineOptions {
   /** SOL price in USD, needed to size perp copies in ratio mode. */
   solPriceUsd?: () => Promise<number | undefined>;
   log?: (msg: string) => void;
+  /** A buy is copied only if the leader's trade is at least this many lamports. Defaults to COPY_MIN_LEADER_LAMPORTS (0.05 SOL). */
+  minLeaderLamports?: number;
+  /** ... and at least this fraction of the follower's copy size (fixed mode). Defaults to COPY_MIN_LEADER_RATIO (0.5). */
+  minLeaderRatio?: number;
 }
 
 const isNat = (n: unknown): n is number => typeof n === "number" && Number.isSafeInteger(n) && n >= 0;
@@ -53,10 +61,14 @@ export class CopyEngine {
   private now: () => number;
   private ttl: number;
   private perpsOn: boolean;
+  private minLeaderLamports: number;
+  private minLeaderRatio: number;
   constructor(private o: EngineOptions) {
     this.now = o.now ?? Date.now;
     this.ttl = o.ttlMs ?? DEFAULT_INTENT_TTL_MS;
     this.perpsOn = o.perpsEnabled ?? perpsGateFromEnv();
+    this.minLeaderLamports = o.minLeaderLamports ?? envNum("COPY_MIN_LEADER_LAMPORTS", DEFAULT_MIN_LEADER_LAMPORTS);
+    this.minLeaderRatio = o.minLeaderRatio ?? envNum("COPY_MIN_LEADER_RATIO", DEFAULT_MIN_LEADER_RATIO);
   }
 
   /** Runs one leader event at a time, so two events cannot both pass one follower's daily cap. */
@@ -67,6 +79,7 @@ export class CopyEngine {
   }
 
   onLeaderTrade(trade: Trade): Promise<CopyIntent[]> {
+    if (trade.side === "sell") this.o.store.recordLeaderSell(trade.wallet, trade.mint, trade.slot, trade.signature);
     return this.serial(() => this.handle(trade.wallet, trade.signature, trade.timestamp, (s) => this.spot(s, trade)));
   }
 
@@ -160,8 +173,13 @@ export class CopyEngine {
       return { intent: { ...meta, lamports, tokens: tokens.toString() } };
     }
 
+    // A dust buy must not trigger a full-size copy: the leader could pre-buy, signal with dust and sell into followers.
+    // In ratio mode the copy is already proportional to the leader, so only the absolute floor applies.
+    const floor = Math.max(this.minLeaderLamports, s.mode === "fixed" ? lamports * this.minLeaderRatio : 0);
+    if (leaderLamports < floor) return skip("leader_trade_too_small");
     const why = (await this.tokenSkip(s, t.mint)) ?? this.capSkip(s, lamports);
-    return why ? skip(why) : { intent: { ...meta, lamports } };
+    const leaderPrice = t.quoteAmount / t.tokenAmount;
+    return why ? skip(why) : { intent: { ...meta, lamports, leaderPrice: Number.isFinite(leaderPrice) && leaderPrice > 0 ? leaderPrice : undefined, sourceSlot: t.slot } };
   }
 
   private async perp(s: CopySettings, e: PerpEvent): Promise<Decision> {
@@ -189,7 +207,7 @@ export class CopyEngine {
   }
 }
 
-type IntentCore = Pick<CopyIntent, "kind" | "mint" | "side" | "venue"> & Partial<Pick<CopyIntent, "lamports" | "tokens" | "leverage">>;
+type IntentCore = Pick<CopyIntent, "kind" | "mint" | "side" | "venue"> & Partial<Pick<CopyIntent, "lamports" | "tokens" | "leverage" | "leaderPrice">> & { sourceSlot?: number };
 type Decision = ({ skip: string } & Partial<IntentCore>) | { intent: IntentCore };
 
 /** Venue hint from the leader's trade source; the builder decides for real at build time. */
