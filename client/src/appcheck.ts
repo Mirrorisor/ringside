@@ -9,7 +9,7 @@
  * a fee-wallet outflow cap and a mint match.
  */
 import type { Address } from "@solana/kit";
-import { associatedTokenAddress, checkPlatformFee, checkTransaction, instructionsOf, TX_PROGRAMS, DEFAULT_TX_POLICY, type TxCheck } from "./trade/jupiter.js";
+import { associatedTokenAddress, checkMeteoraSwap, checkPlatformFee, checkSwapIntent, checkTransaction, instructionsOf, TX_PROGRAMS, DEFAULT_TX_POLICY, WSOL_MINT, type TxCheck } from "./trade/jupiter.js";
 
 export const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P" as Address;
 export const PUMPSWAP_PROGRAM = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA" as Address;
@@ -89,6 +89,12 @@ export interface BuiltCheckOpts {
    * output token, not as a SOL transfer, so it needs no allowance in the outflow cap.
    */
   feeAccounts?: string[] | null;
+  /**
+   * What the review step shows: the intent's side and slippage and the build response. Required for a Jupiter swap:
+   * its instruction must take exactly the displayed input, guarantee the displayed minimum, stay within the
+   * slippage, send the output to the user's own token account and carry the displayed fee (`swap_*` codes).
+   */
+  swap?: { side: string; built: Record<string, unknown>; slippageBps?: number };
 }
 
 export interface BuiltCheck {
@@ -128,7 +134,32 @@ export async function checkBuiltTransaction(wire: string, o: BuiltCheckOpts): Pr
   if (!accounts.has(o.mint) && !ata.some((a) => accounts.has(a))) {
     throw new AppCheckError("mint_mismatch", "Refusing to sign: the transaction does not trade the token in this copy.");
   }
+  if (o.venue === "jupiter") await checkJupiterIntent(ixs, o);
+  if (o.venue === "meteora") await checkMeteoraSwap(ixs, { user, mint: o.mint as Address });
   return { tx, feePayer: tx.inspection.feePayer, venues, feeLamportsInTx: tx.outflow, rentLamports: tx.rentLamports };
+}
+
+/** The Jupiter swap instruction must be the swap the review step displays. */
+async function checkJupiterIntent(ixs: Parameters<typeof checkSwapIntent>[0], o: BuiltCheckOpts): Promise<void> {
+  const bad = (code: string, why: string): never => { throw new AppCheckError(code, `Refusing to sign: ${why}.`); };
+  if (!o.swap) return bad("swap_unverified", "the swap was not checked against what is shown");
+  const buy = o.swap.side === "buy";
+  if (!buy && o.swap.side !== "sell") return bad("swap_unverified", "the swap side is unknown");
+  const view = describeBuilt(o.swap.side, o.swap.built, o.swap.slippageBps);
+  const amount = big(buy ? o.swap.built.lamports : o.swap.built.tokens);
+  const maxSlippageBps = o.swap.slippageBps ?? Number(big(o.swap.built.slippageBps) ?? -1);
+  if (amount === null || amount <= 0n || view.minOut === null || !Number.isInteger(maxSlippageBps) || maxSlippageBps < 0) return bad("swap_unverified", "the build does not say what it swaps");
+  // The fee shown pins the platform fee bps: fee = floor(SOL side x bps / 10000).
+  const solSide = buy ? amount : view.expectedOut;
+  const fee = BigInt(o.feeLamports !== null && Number.isSafeInteger(o.feeLamports) && o.feeLamports >= 0 ? o.feeLamports : 0);
+  if (solSide === null) return bad("swap_unverified", "the build does not say what it pays out");
+  const bps = fee === 0n || solSide === 0n ? 0n : (fee * 10_000n + solSide - 1n) / solSide;
+  if ((solSide * bps) / 10_000n !== fee && fee !== 0n) return bad("swap_fee_bps", "the fee shown does not match a whole-basis-point fee");
+  const dec = await checkSwapIntent(ixs, {
+    taker: o.user as Address, inputMint: buy ? WSOL_MINT : (o.mint as Address), outputMint: buy ? (o.mint as Address) : WSOL_MINT,
+    amount, minOut: view.minOut, maxSlippageBps, platformFeeBps: Number(bps),
+  });
+  if (view.expectedOut !== null && dec.quotedOut !== view.expectedOut) bad("swap_slippage", `the swap quotes ${dec.quotedOut} out, not the ${view.expectedOut} shown`);
 }
 
 // ---- What the review step shows --------------------------------------------------

@@ -549,11 +549,29 @@ function swapJson(taker, filler, feeSlot, kind = "shared") {
   accounts[FEE_SLOT[kind]] = acct(feeSlot ?? PROGRAM, feeSlot !== null, false);
   return ixJson(PROGRAM, accounts, [...DISC[kind], 0, 0, 0, 0]);
 }
+/** A routeV2 swap instruction as /swap/v2/build returns it (layout verified against build-live.json). `o` overrides what a tampered response would change. */
+async function routeV2Json(req, taker, filler, feeSlot, o = {}) {
+  const ata = (m) => associatedTokenAddress(taker, m, TX_PROGRAMS.token);
+  const bps = o.bps ?? (req.platformFeeBps !== undefined ? Number(req.platformFeeBps) : feeSlot ? 50 : 0);
+  const data = Buffer.alloc(40);
+  Buffer.from("bb64facc31c4af14", "hex").copy(data);
+  data.writeBigUInt64LE(o.inAmount ?? BigInt(req.amount), 8);
+  data.writeBigUInt64LE(o.quotedOut ?? 150_000_000n, 16);
+  data.writeUInt16LE(o.slippage ?? Number(req.slippageBps ?? 50), 24);
+  data.writeUInt16LE(bps, 26);
+  const accounts = [
+    acct(taker, false, true), acct(await ata(req.inputMint)), acct(o.destination ?? await ata(req.outputMint)), acct(req.inputMint, false), acct(req.outputMint, false),
+    acct(TX_PROGRAMS.token, false), acct(TX_PROGRAMS.token, false), acct(o.slot7 ?? PROGRAM, false), acct(filler, false), acct(PROGRAM, false),
+    acct(feeSlot ?? filler, feeSlot !== null),
+  ];
+  return ixJson(PROGRAM, accounts, data);
+}
+const thresholdFor = (req) => String((150_000_000n * BigInt(10_000 - Number(req.slippageBps ?? 50)) + 9_999n) / 10_000n);
 const priceIx = ixJson(TX_PROGRAMS.computeBudget, [], [3, 100, 0, 0, 0, 0, 0, 0, 0]);
 
 function buildBody(req, swap, extra = {}) {
   return {
-    inputMint: req.inputMint, outputMint: req.outputMint, inAmount: req.amount, outAmount: "150000000", otherAmountThreshold: "149250000",
+    inputMint: req.inputMint, outputMint: req.outputMint, inAmount: req.amount, outAmount: "150000000", otherAmountThreshold: thresholdFor(req),
     swapMode: "ExactIn", slippageBps: Number(req.slippageBps ?? 50), priceImpactPct: "0.001", routePlan: [],
     computeBudgetInstructions: [priceIx], setupInstructions: [], swapInstruction: swap, cleanupInstruction: null, otherInstructions: [],
     tipInstruction: null, addressesByLookupTableAddress: {}, transactionVersion: 0, ...extra,
@@ -565,11 +583,12 @@ async function buildSetup(feeAccounts, { respond, ...opts } = {}) {
   const accounts = feeAccounts === undefined ? { [SOL]: feeSol.address, [USDC]: feeUsdc.address } : feeAccounts(feeSol.address, feeUsdc.address);
   const q = {};
   const f = fakeFetch({
-    "GET /swap/v2/build": (u) => {
+    "GET /swap/v2/build": async (u) => {
       const req = Object.fromEntries(u.searchParams);
       q.last = req;
-      const swap = swapJson(taker.address, filler.address, respond ? respond(req, { attacker: attacker.address, feeSol: feeSol.address, feeUsdc: feeUsdc.address }) : (req.feeAccount ?? null));
-      return [200, buildBody(req, swap)];
+      const o = {};
+      const slot = respond ? respond(req, { attacker: attacker.address, feeSol: feeSol.address, feeUsdc: feeUsdc.address, o }) : (req.feeAccount ?? null);
+      return [200, buildBody(req, await routeV2Json(req, taker.address, filler.address, slot, o))];
     },
   });
   const jup = new Jupiter({ apiKey: KEY, fetch: f, feeAccounts: accounts, latestBlockhash: async () => BH, ...opts });
@@ -584,7 +603,7 @@ test("buildSwap: query, response mapping and an unsigned v0 transaction with our
   assert.equal(c.f.calls[0].headers["x-api-key"], KEY);
   assert.deepEqual(c.q.last, { inputMint: SOL, outputMint: USDC, amount: "1000000000", taker: c.taker, slippageBps: "100", payer: c.sponsor, platformFeeBps: "50", feeAccount: c.feeSol, transactionVersion: "0" });
   assert.equal(out.outAmount, "150000000");
-  assert.equal(out.otherAmountThreshold, "149250000");
+  assert.equal(out.otherAmountThreshold, "148500000"); // from the instruction: 150000000 less 100 bps
   assert.equal(out.slippageBps, 100);
   assert.deepEqual(out.platformFee, { feeBps: 50, feeAccount: c.feeSol, feeMint: SOL });
   assert.equal(out.feeLamports, 5_000_000); // wSOL side 1 SOL x 50 bps
@@ -728,4 +747,65 @@ test("fee account choice prefers wrapped SOL when either side is SOL", () => {
   const j = new Jupiter({ feeAccounts: { So11111111111111111111111111111111111111112: "BhPk4nEvu26LFouQpr9Q391JJrxxxJWhrBkZy9xxhr7Q", EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v: "8iHT9Q9BH3vvhrJHE8pK7tpWueueJokBEw8Kb6F2rZNK" } });
   assert.equal(j.pickFeeAccount("So11111111111111111111111111111111111111112", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").feeAccount, "BhPk4nEvu26LFouQpr9Q391JJrxxxJWhrBkZy9xxhr7Q");
   assert.equal(j.pickFeeAccount("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "So11111111111111111111111111111111111111112").feeAccount, "BhPk4nEvu26LFouQpr9Q391JJrxxxJWhrBkZy9xxhr7Q");
+});
+
+// ---- checkSwapIntent: the swap instruction must be the swap we show ---------------------------
+
+import { checkSwapIntent, checkMeteoraSwap } from "../dist/trade/jupiter.js";
+
+test("buildSwap: a tampered routeV2 (output to the attacker, in_amount, slippage, fee bps) is refused; the honest one passes", async () => {
+  const run = (respond, req = {}) => buildSetup(undefined, { respond }).then((c) => ({ c, p: c.jup.buildSwap({ inputMint: SOL, outputMint: USDC, amount: 10_000_000n, taker: c.taker, slippageBps: 50, ...req }) }));
+  const bad = async (tamper, code) => { const { p } = await run((q, a) => { tamper(a); return q.feeAccount ?? null; }); await assert.rejects(p, { code }); };
+  const ok = await run((q) => q.feeAccount ?? null);
+  const out = await ok.p;
+  assert.equal(out.otherAmountThreshold, "149250000");
+  await bad((a) => { a.o.destination = a.attacker; }, "swap_destination");
+  await bad((a) => { a.o.slot7 = a.attacker; }, "swap_destination");
+  await bad((a) => { a.o.inAmount = 10_000_000_000n; }, "swap_amount_mismatch");
+  await bad((a) => { a.o.quotedOut = 1n; a.o.slippage = 10_000; }, "swap_slippage"); // the reviewer's PoC
+  await bad((a) => { a.o.slippage = 10_000; }, "swap_slippage");
+  await bad((a) => { a.o.quotedOut = 1n; }, "swap_slippage");
+  await bad((a) => { a.o.bps = 255; }, "swap_fee_bps");
+  await bad((a) => { a.o.bps = 0; }, "fee_account_mismatch"); // fee dropped: refused by the fee check first
+});
+
+test("checkSwapIntent: live routeV2 fixtures pass; tampered copies and unknown layouts are refused", async () => {
+  const { readFileSync } = await import("node:fs");
+  const live = JSON.parse(readFileSync(new URL("./fixtures/jupiter/build-live.json", import.meta.url), "utf8")).cases;
+  const TAKER = "Gh4sC2HFUH8ZvAuxRcoAtiz5QEQzq1yBra7haXMDPkrZ";
+  const ix = (c, patch) => { const x = structuredClone(c.swapInstruction); patch?.(x); return [{ program: x.programId, accounts: x.accounts.map((a) => a.pubkey), data: Buffer.from(x.data, "base64") }]; };
+  const exp = (c, inMint, outMint, amt, fee) => ({ taker: TAKER, inputMint: inMint, outputMint: outMint, amount: amt, minOut: c.otherAmountThreshold, maxSlippageBps: 100, platformFeeBps: fee });
+  for (const [k, i, o, amt, fee] of [["sol_to_usdc_fee_usdc", SOL, USDC, "10000000", 50], ["sol_to_usdc_fee_wsol", SOL, USDC, "10000000", 50], ["sol_to_usdc_no_fee", SOL, USDC, "10000000", 0], ["usdc_to_sol_fee_wsol", USDC, SOL, "1000000", 50]]) {
+    const d = await checkSwapIntent(ix(live[k]), exp(live[k], i, o, amt, fee));
+    assert.equal(d.quotedOut.toString(), live[k].outAmount);
+    assert.equal(d.minOut.toString(), live[k].otherAmountThreshold);
+  }
+  const c = live.sol_to_usdc_fee_wsol, e = exp(c, SOL, USDC, "10000000", 50);
+  const thief = "9iFER3bpjf1PTTCQCfTRu17EJgvsxo9pVyA9QWwEuX4x";
+  await assert.rejects(checkSwapIntent(ix(c, (x) => { x.accounts[2].pubkey = thief; }), e), { code: "swap_destination" });
+  await assert.rejects(checkSwapIntent(ix(c, (x) => { x.accounts[7].pubkey = thief; }), e), { code: "swap_destination" });
+  await assert.rejects(checkSwapIntent(ix(c, (x) => { x.accounts[0].pubkey = thief; }), e), { code: "swap_destination" });
+  await assert.rejects(checkSwapIntent(ix(c, (x) => { x.accounts[4].pubkey = SOL; }), e), { code: "swap_mint" });
+  await assert.rejects(checkSwapIntent(ix(c), { ...e, platformFeeBps: 0 }), { code: "swap_fee_bps" });
+  await assert.rejects(checkSwapIntent(ix(c), { ...e, amount: "9999999" }), { code: "swap_amount_mismatch" });
+  await assert.rejects(checkSwapIntent(ix(c), { ...e, maxSlippageBps: 99 }), { code: "swap_slippage" });
+  await assert.rejects(checkSwapIntent(ix(c), { ...e, minOut: "707575" }), { code: "swap_slippage" });
+  await assert.rejects(checkSwapIntent(ix(c, (x) => { x.data = Buffer.from([229, 23, 203, 151, 122, 227, 173, 42, 0, 0, 0, 0]).toString("base64"); }), e), { code: "swap_unverified" });
+  await assert.rejects(checkSwapIntent([...ix(c), ...ix(c)], e), { code: "swap_unverified" });
+});
+
+test("checkMeteoraSwap: output to the user's own account passes; a stranger's account or referral is refused", async () => {
+  const [user, thief, filler] = ["99cnRnduE5KdqhuJmYN5YH3WcnSiPQ152bF3hbxSfvKU", "s7KMacZHd83q5bUtXhVkPPwRsxut1ipy93wfxmWpnn8", "8y5FVi7aTTSjwvLQkXFyRojbDrL8w9svysX8mZcEgmyK"];
+  const MINT = "AbYGhAcF86iLQpQQynmZPZAyMejskVFowy2P2LBktuaH", DBC = "dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN";
+  const tok = TX_PROGRAMS.token;
+  const [baseAta, wsolAta] = [await associatedTokenAddress(user, MINT, tok), await associatedTokenAddress(user, SOL, tok)];
+  const mk = (o = {}) => [{ program: DBC, data: Buffer.concat([Buffer.from("414b3f4ceb5b5b88", "hex"), Buffer.alloc(17)]),
+    accounts: [filler, filler, filler, o.input ?? wsolAta, o.output ?? baseAta, filler, filler, MINT, SOL, user, tok, tok, o.referral ?? DBC, filler, DBC] }];
+  await checkMeteoraSwap(mk(), { user, mint: MINT });
+  await checkMeteoraSwap(mk({ input: baseAta, output: wsolAta }), { user, mint: MINT }); // a sell
+  await assert.rejects(checkMeteoraSwap(mk({ output: await associatedTokenAddress(thief, MINT, tok) }), { user, mint: MINT }), { code: "swap_destination" });
+  await assert.rejects(checkMeteoraSwap(mk({ output: await associatedTokenAddress(thief, SOL, tok), input: baseAta }), { user, mint: MINT }), { code: "swap_destination" });
+  await assert.rejects(checkMeteoraSwap(mk({ referral: thief }), { user, mint: MINT }), { code: "swap_referral" });
+  await checkMeteoraSwap(mk({ referral: thief }), { user, mint: MINT, referral: [thief] });
+  await assert.rejects(checkMeteoraSwap(mk(), { user: thief, mint: MINT }), { code: "swap_destination" });
 });

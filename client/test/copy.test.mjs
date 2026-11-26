@@ -7,7 +7,7 @@ import { confirmIntent, confirmPending } from "../dist/copy/confirm.js";
 import { buildIntent, compileUnsigned, BuildError } from "../dist/copy/build.js";
 import { createCopyServer, parseTrade } from "../dist/copy/server.js";
 import { cappedLeverage, tierMaxLeverage, TIER_MAX_LEVERAGE } from "../dist/copy/perps.js";
-import { Jupiter } from "../dist/trade/jupiter.js";
+import { Jupiter, associatedTokenAddress, TX_PROGRAMS } from "../dist/trade/jupiter.js";
 import { createSessionToken, hmacSessionAuth } from "../dist/session.js";
 
 const LEADER = "22S3bVxfkoJB5L5EhFo1Hp3T9EtX1qLG4dP9UDcRQN6B";
@@ -747,12 +747,15 @@ test("build: a graduated-coin copy goes through /swap/v2/build with our platform
       const u = new URL(url);
       paths.push([u.pathname, Object.fromEntries(u.searchParams)]);
       const q = Object.fromEntries(u.searchParams);
-      const accounts = Array.from({ length: 13 }, () => ({ pubkey: MINT, isWritable: true, isSigner: false }));
-      accounts[2] = { pubkey: ALICE, isWritable: false, isSigner: true };
-      accounts[9] = { pubkey: feeSlot(q), isWritable: true, isSigner: false };
-      const swap = { programId: JUP, accounts, data: Buffer.from([193, 32, 155, 51, 65, 214, 156, 129, 0]).toString("base64") };
+      const ata = (m) => associatedTokenAddress(ALICE, m, TX_PROGRAMS.token);
+      const acc = (pubkey, isSigner = false) => ({ pubkey, isWritable: !isSigner && pubkey !== JUP && pubkey !== TX_PROGRAMS.token, isSigner });
+      const accounts = [acc(ALICE, true), acc(await ata(q.inputMint)), acc(await ata(q.outputMint)), acc(q.inputMint), acc(q.outputMint), acc(TX_PROGRAMS.token), acc(TX_PROGRAMS.token), acc(JUP), acc(MINT), acc(JUP), acc(feeSlot(q))];
+      const data = Buffer.alloc(40);
+      Buffer.from("bb64facc31c4af14", "hex").copy(data);
+      data.writeBigUInt64LE(BigInt(q.amount), 8); data.writeBigUInt64LE(123_456_789n, 16); data.writeUInt16LE(Number(q.slippageBps), 24); data.writeUInt16LE(50, 26);
+      const swap = { programId: JUP, accounts, data: data.toString("base64") };
       return new Response(JSON.stringify({
-        inputMint: q.inputMint, outputMint: q.outputMint, inAmount: q.amount, outAmount: "123456789", otherAmountThreshold: "122000000", slippageBps: Number(q.slippageBps),
+        inputMint: q.inputMint, outputMint: q.outputMint, inAmount: q.amount, outAmount: "123456789", otherAmountThreshold: "122222222", slippageBps: Number(q.slippageBps),
         computeBudgetInstructions: [], setupInstructions: [], swapInstruction: swap, cleanupInstruction: null, otherInstructions: [], tipInstruction: null,
         addressesByLookupTableAddress: {}, transactionVersion: 0,
       }), { status: 200 });
@@ -773,7 +776,7 @@ test("build: a graduated-coin copy goes through /swap/v2/build with our platform
   assert.equal(t.paths[0][1].feeAccount, FEE_ACC);
   assert.equal(b.venue, "jupiter");
   assert.equal(b.expectedOut, "123456789");
-  assert.equal(b.minOut, "122000000");
+  assert.equal(b.minOut, "122222222"); // 123456789 less 100 bps, from the instruction
   assert.equal(b.slippageBps, 100);
   assert.equal(b.feeLamports, Math.floor((0.1 * SOL * 50) / 10_000));
   assert.equal(t.r.store.get(t.i.id).tokens, "123456789");

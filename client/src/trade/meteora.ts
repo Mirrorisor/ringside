@@ -48,6 +48,7 @@ import {
   DEFAULT_SLIPPAGE_BPS,
   type BuiltTrade,
 } from "./pumpfun.js";
+import { checkMeteoraSwap, JupiterError, type CheckIx } from "./jupiter.js";
 
 const require = createRequire(import.meta.url);
 const dbc = require("@meteora-ag/dynamic-bonding-curve-sdk") as typeof DbcModule;
@@ -129,6 +130,10 @@ export type MeteoraTradeErrorCode =
   | "unsupported_quote" // quote mint is not plain SOL
   | "unsupported_token_program" // transfer hook, or an undeclared transfer fee
   | "bad_amount"
+  | "swap_unverified" // the SDK's swap instruction failed our self-check (also swap_destination, swap_mint, swap_referral)
+  | "swap_destination"
+  | "swap_mint"
+  | "swap_referral"
   | "too_small"
   | "quote_failed"; // the SDK's math rejected the trade (e.g. it overruns the curve)
 
@@ -367,6 +372,11 @@ async function swap2(cfg: MeteoraTradeConfig, state: PoolState, user: PublicKey,
     amountIn: toBN(amountIn),
     minimumAmountOut: toBN(minimumAmountOut),
   });
+  // Self-check: the SDK's output must pay the user's own token account and no one else's referral slot.
+  const kit = tx.instructions.map(toKitInstruction);
+  const ixs: CheckIx[] = kit.map((k) => ({ program: k.programAddress, accounts: (k.accounts ?? []).map((a) => a.address), data: Uint8Array.from(k.data ?? []) }));
+  try { await checkMeteoraSwap(ixs, { user: address(user.toBase58()), mint: address(state.pool.poolState.baseMint.toBase58()) }); }
+  catch (e) { if (e instanceof JupiterError) throw new MeteoraTradeError(e.code as MeteoraTradeErrorCode, `Refusing to build: ${e.message}`); throw e; }
   return tx.instructions;
 }
 

@@ -625,6 +625,114 @@ export function checkPlatformFee(ixs: CheckIx[], o: { expected?: Address | null;
   }
 }
 
+/** Largest slippage a build may carry when the caller did not request one (Jupiter's own default is 100). */
+export const DEFAULT_MAX_SLIPPAGE_BPS = 100;
+const ROUTE_V2_DISC = "bb64facc31c4af14";
+const U64_MAX = (1n << 64n) - 1n;
+
+export interface SwapIntent {
+  taker: Address;
+  inputMint: Address;
+  outputMint: Address;
+  /** Exact input, base units. */
+  amount: bigint | string;
+  /** The least output we show the user (`otherAmountThreshold`). */
+  minOut: bigint | string;
+  /** Requested slippage; the instruction may not carry more. */
+  maxSlippageBps: number;
+  /** Requested platform fee (0 for none); the instruction must carry exactly this. */
+  platformFeeBps: number;
+}
+
+/** What the swap instruction itself says, which is what executes. */
+export interface DecodedSwap {
+  inAmount: bigint;
+  quotedOut: bigint;
+  slippageBps: number;
+  /** `ceil(quotedOut x (10000 - slippageBps) / 10000)`, the rounding Jupiter's `otherAmountThreshold` uses. */
+  minOut: bigint;
+  platformFeeBps: number;
+}
+
+/**
+ * Refuses a transaction whose Jupiter swap differs from the swap we show. The
+ * JSON fields of a /build response are not what executes: the routeV2
+ * instruction is, so its own amounts and accounts are checked against `expected`.
+ * Only routeV2 is decoded (data: in_amount u64 @8, quoted_out_amount u64 @16,
+ * slippage_bps u16 @24, platform_fee_bps u16 @26; accounts: 0 taker, 1 source
+ * token account, 2 destination token account, 3 source mint, 4 destination
+ * mint, 7 optional destinationTokenAccount). Exactly one swap instruction.
+ * The minimum output is checked rounded UP, as Jupiter rounds it (live
+ * fixtures: 707574 at 100 bps gives 700499, not 700498).
+ * Codes: swap_unverified, swap_amount_mismatch, swap_slippage, swap_fee_bps, swap_destination, swap_mint.
+ * Returns the decoded numbers: show those, not the JSON's.
+ */
+export async function checkSwapIntent(ixs: CheckIx[], expected: SwapIntent): Promise<DecodedSwap> {
+  const swaps = ixs.map((ix, i) => ({ ix, i })).filter(({ ix }) => ix.program === TX_PROGRAMS.jupiterSwap);
+  if (swaps.length === 0) refuse("swap_unverified", undefined, "the transaction has no Jupiter swap instruction to verify.");
+  if (swaps.length > 1) refuse("swap_unverified", swaps[1].i, "more than one Jupiter swap instruction.");
+  const { ix, i } = swaps[0];
+  if (hex(ix.data.subarray(0, 8)) !== ROUTE_V2_DISC) refuse("swap_unverified", i, "unknown Jupiter swap instruction layout: cannot verify what it swaps.");
+  if (ix.data.length < 28) refuse("swap_unverified", i, "Jupiter swap instruction too short to read.");
+  const inAmount = rdU64(ix.data, 8), quotedOut = rdU64(ix.data, 16);
+  const slippageBps = ix.data[24] | (ix.data[25] << 8), platformFeeBps = ix.data[26] | (ix.data[27] << 8);
+
+  let amount: bigint, minOut: bigint;
+  try { amount = BigInt(expected.amount); minOut = BigInt(expected.minOut); } catch { return refuse("swap_unverified", i, "expected amount is not an integer."); }
+  if (inAmount !== amount) refuse("swap_amount_mismatch", i, `swap takes ${inAmount} of the input, not ${amount}.`);
+  if (!Number.isInteger(expected.maxSlippageBps) || slippageBps > expected.maxSlippageBps) refuse("swap_slippage", i, `swap allows ${slippageBps} bps of slippage, more than the ${expected.maxSlippageBps} requested.`);
+  const floor = (quotedOut * BigInt(10_000 - slippageBps) + 9_999n) / 10_000n;
+  if (quotedOut > U64_MAX || floor < minOut) refuse("swap_slippage", i, `swap guarantees only ${floor} of the output, less than the ${minOut} shown.`);
+  if (platformFeeBps !== expected.platformFeeBps) refuse("swap_fee_bps", i, `swap takes a ${platformFeeBps} bps platform fee, not ${expected.platformFeeBps}.`);
+
+  const a = ix.accounts;
+  if (a.length < 10) refuse("swap_unverified", i, "Jupiter swap instruction has too few accounts.");
+  if (a[0] !== expected.taker) refuse("swap_destination", i, `swap is authorised by ${a[0] ?? "a lookup-table account"}, not the taker.`);
+  for (const [slot, mint, what] of [[1, expected.inputMint, "source"], [2, expected.outputMint, "destination"]] as const) {
+    const ok = [TX_PROGRAMS.token, TX_PROGRAMS.token2022];
+    const atas = await Promise.all(ok.map((p) => associatedTokenAddress(expected.taker, mint, p)));
+    if (a[slot] === null || !atas.includes(a[slot] as Address)) refuse("swap_destination", i, `swap ${what} token account ${a[slot] ?? "(lookup table)"} is not the taker's account for ${mint}.`);
+  }
+  if (a[3] !== expected.inputMint) refuse("swap_mint", i, `swap source mint is ${a[3] ?? "unknown"}, not ${expected.inputMint}.`);
+  if (a[4] !== expected.outputMint) refuse("swap_mint", i, `swap destination mint is ${a[4] ?? "unknown"}, not ${expected.outputMint}.`);
+  if (a[7] !== TX_PROGRAMS.jupiterSwap) refuse("swap_destination", i, `swap sends its output to ${a[7] ?? "a lookup-table account"} through the optional destination slot.`);
+  return { inAmount, quotedOut, slippageBps, minOut: floor, platformFeeBps };
+}
+
+const DBC_PROGRAM = "dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN" as Address;
+// From the DBC IDL (@meteora-ag/dynamic-bonding-curve-sdk): swap and swap2 share the account order
+// 0 poolAuthority, 1 config, 2 pool, 3 inputTokenAccount, 4 outputTokenAccount, 5 baseVault, 6 quoteVault,
+// 7 baseMint, 8 quoteMint, 9 payer, 10 tokenBaseProgram, 11 tokenQuoteProgram, 12 referralTokenAccount (optional), 13 eventAuthority, 14 program.
+const DBC_SWAP_DISCS = ["f8c69e91e17587c8" /* swap */, "414b3f4ceb5b5b88" /* swap2 */];
+
+/**
+ * Refuses a Meteora DBC swap that pays its output anywhere but the user's own
+ * token account, or that pays a referral to someone else. A buy outputs the
+ * base token to the user's ATA for `mint`; a sell outputs wrapped SOL to the
+ * user's wSOL ATA (the SDK unwraps it after). The input account must be the
+ * user's too, and the pool's mints must be `mint` and wSOL. The referral slot
+ * must be empty (the program id) or one of `referral`. Any other DBC
+ * instruction is refused. Codes: swap_unverified, swap_destination, swap_mint, swap_referral.
+ */
+export async function checkMeteoraSwap(ixs: CheckIx[], o: { user: Address; mint: Address; referral?: Address[] }): Promise<void> {
+  for (const [i, ix] of ixs.entries()) {
+    if (ix.program !== DBC_PROGRAM) continue;
+    if (!DBC_SWAP_DISCS.includes(hex(ix.data.subarray(0, 8)))) refuse("swap_unverified", i, "unknown Meteora instruction: cannot verify where its output goes.");
+    const a = ix.accounts;
+    if (a.length < 15) refuse("swap_unverified", i, "Meteora swap instruction has too few accounts.");
+    if (a[7] !== o.mint) refuse("swap_mint", i, `Meteora swap base mint is ${a[7] ?? "unknown"}, not ${o.mint}.`);
+    if (a[8] !== WSOL_MINT) refuse("swap_mint", i, `Meteora swap quote mint is ${a[8] ?? "unknown"}, not wrapped SOL.`);
+    if (a[9] !== o.user) refuse("swap_destination", i, `Meteora swap is paid by ${a[9] ?? "a lookup-table account"}, not the user.`);
+    const ata = async (mint: Address) => Promise.all([TX_PROGRAMS.token, TX_PROGRAMS.token2022].map((p) => associatedTokenAddress(o.user, mint, p)));
+    const [base, quote] = [await ata(o.mint), await ata(WSOL_MINT)];
+    const buy = a[4] !== null && base.includes(a[4]), sell = a[4] !== null && quote.includes(a[4]);
+    if (!buy && !sell) refuse("swap_destination", i, `Meteora swap output goes to ${a[4] ?? "a lookup-table account"}, not the user's token account.`);
+    const input = buy ? quote : base;
+    if (a[3] === null || !input.includes(a[3])) refuse("swap_destination", i, `Meteora swap input is ${a[3] ?? "a lookup-table account"}, not the user's token account.`);
+    if (a[12] === null || (a[12] !== DBC_PROGRAM && !(o.referral ?? []).includes(a[12]))) refuse("swap_referral", i, `Meteora swap pays a referral to ${a[12] ?? "a lookup-table account"}, not to us.`);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Swap V2 types
 // ---------------------------------------------------------------------------
@@ -909,7 +1017,8 @@ export class Jupiter {
    * payer, our blockhash, lookup tables resolved through
    * `opts.resolveLookupTables`) and refuse it unless it is safe for the taker to
    * sign (`checkTransaction`) and sends the platform fee only to our configured
-   * account (`checkPlatformFee`). Nothing is signed.
+   * account (`checkPlatformFee`) and does what we show (`checkSwapIntent`: the amounts and accounts come
+   * from the swap instruction, not the JSON). Nothing is signed.
    */
   async buildSwap(req: BuildSwapRequest): Promise<BuiltSwap> {
     const inputMint = addr(req.inputMint, "inputMint");
@@ -978,12 +1087,18 @@ export class Jupiter {
     const transaction = getBase64EncodedWireTransaction(compileTransaction(msg));
 
     await checkTransaction(transaction, { user: taker, feePayers: [payer], policy: this.opts.txPolicy, lookups });
-    checkPlatformFee(instructionsOf(transaction, lookups).ixs, { expected: fee ? fee.feeAccount : null });
+    const built = instructionsOf(transaction, lookups).ixs;
+    checkPlatformFee(built, { expected: fee ? fee.feeAccount : null });
+    // The JSON fields are not what executes; the swap instruction is. It must match the swap we show.
+    const dec = await checkSwapIntent(built, {
+      taker, inputMint, outputMint, amount, minOut: r.otherAmountThreshold,
+      maxSlippageBps: req.slippageBps ?? DEFAULT_MAX_SLIPPAGE_BPS, platformFeeBps: fee ? bps : 0,
+    });
 
-    const solSide = inputMint === WSOL_MINT ? BigInt(amount) : outputMint === WSOL_MINT ? BigInt(r.outAmount) : 0n;
+    const solSide = inputMint === WSOL_MINT ? BigInt(amount) : outputMint === WSOL_MINT ? dec.quotedOut : 0n;
     return {
-      transaction, inputMint, outputMint, inAmount: r.inAmount, outAmount: r.outAmount, otherAmountThreshold: r.otherAmountThreshold,
-      slippageBps: r.slippageBps, priceImpactPct: r.priceImpactPct,
+      transaction, inputMint, outputMint, inAmount: dec.inAmount.toString(), outAmount: dec.quotedOut.toString(), otherAmountThreshold: dec.minOut.toString(),
+      slippageBps: dec.slippageBps, priceImpactPct: r.priceImpactPct,
       platformFee: fee ? { feeBps: bps, feeAccount: fee.feeAccount, feeMint: fee.feeMint } : null,
       feeLamports: fee ? Number((solSide * BigInt(bps)) / 10_000n) : 0,
       lastValidBlockHeight: life.lastValidBlockHeight, taker, payer,

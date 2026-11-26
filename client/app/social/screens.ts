@@ -356,7 +356,7 @@ export function mountSocial(root: HTMLElement, tabs: HTMLElement, env: Env, onTa
         const claimedFee = view.feeLamports;
         let checked;
         try {
-          checked = await checkBuiltTransaction(built.transaction, { user: env.signer.address(), sponsor: await expectedSponsor(), mint: i.mint, venue: i.venue, feeWallet: FEE_WALLET || null, feeLamports: claimedFee, feeAccounts: JUPITER_FEE_ACCOUNTS.length ? JUPITER_FEE_ACCOUNTS : null });
+          checked = await checkBuiltTransaction(built.transaction, { user: env.signer.address(), sponsor: await expectedSponsor(), mint: i.mint, venue: i.venue, feeWallet: FEE_WALLET || null, feeLamports: claimedFee, feeAccounts: JUPITER_FEE_ACCOUNTS.length ? JUPITER_FEE_ACCOUNTS : null, swap: { side: i.side, built, slippageBps: i.slippageBps } });
         } catch (e) {
           show(null); out.className = "err";
           out.textContent = e instanceof AppCheckError ? e.message : `Refusing to sign: this transaction failed the safety check (${errMsg(e)}).`;
