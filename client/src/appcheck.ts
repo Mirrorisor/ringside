@@ -13,6 +13,7 @@ import { associatedTokenAddress, checkTransaction, instructionsOf, TX_PROGRAMS, 
 
 export const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P" as Address;
 export const PUMPSWAP_PROGRAM = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA" as Address;
+export const METEORA_DBC_PROGRAM = "dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN" as Address;
 
 export class AppCheckError extends Error {
   constructor(public code: string, message: string) { super(message); this.name = "AppCheckError"; }
@@ -76,7 +77,7 @@ export interface BuiltCheckOpts {
   /** Expected fee payer other than the user (the gas sponsor). */
   sponsor?: string | null;
   mint: string;
-  venue: "jupiter" | "pumpfun" | "ringside-perps";
+  venue: "jupiter" | "pumpfun" | "meteora" | "ringside-perps";
   /** Ringside fee wallet (VITE_FEE_WALLET); the only place a user SOL transfer may go. */
   feeWallet?: string | null;
   /** Displayed fee; the user's transfer to the fee wallet may not exceed it. */
@@ -86,7 +87,7 @@ export interface BuiltCheckOpts {
 export interface BuiltCheck {
   tx: TxCheck;
   feePayer: string;
-  venues: ("jupiter" | "pumpfun")[];
+  venues: ("jupiter" | "pumpfun" | "meteora")[];
   /** What the transaction itself sends from the user to the fee wallet. */
   feeLamportsInTx: bigint;
   rentLamports: bigint;
@@ -94,10 +95,10 @@ export interface BuiltCheck {
 
 /** Decodes the built transaction and refuses it unless it is safe for `user` to sign and matches the intent. Throws AppCheckError or JupiterError. */
 export async function checkBuiltTransaction(wire: string, o: BuiltCheckOpts): Promise<BuiltCheck> {
-  if (o.venue !== "jupiter" && o.venue !== "pumpfun") throw new AppCheckError("venue_unsupported", "Refusing to sign: this venue cannot be checked in the app.");
+  if (o.venue !== "jupiter" && o.venue !== "pumpfun" && o.venue !== "meteora") throw new AppCheckError("venue_unsupported", "Refusing to sign: this venue cannot be checked in the app.");
   const user = o.user as Address;
   const feePayers = [user, ...(o.sponsor ? [o.sponsor as Address] : [])];
-  const programs = [...DEFAULT_TX_POLICY.programs, PUMP_PROGRAM, PUMPSWAP_PROGRAM];
+  const programs = [...DEFAULT_TX_POLICY.programs, PUMP_PROGRAM, PUMPSWAP_PROGRAM, METEORA_DBC_PROGRAM];
   const fee = o.feeLamports !== null && Number.isSafeInteger(o.feeLamports) && o.feeLamports >= 0 ? BigInt(o.feeLamports) : 0n;
   const tx = await checkTransaction(wire, {
     user, feePayers, policy: { programs },
@@ -109,7 +110,8 @@ export async function checkBuiltTransaction(wire: string, o: BuiltCheckOpts): Pr
   const venues: BuiltCheck["venues"] = [];
   if (used.has(TX_PROGRAMS.jupiterSwap) || used.has(TX_PROGRAMS.jupiterOrderEngine)) venues.push("jupiter");
   if (used.has(PUMP_PROGRAM) || used.has(PUMPSWAP_PROGRAM)) venues.push("pumpfun");
-  if (!venues.includes(o.venue)) throw new AppCheckError("venue_mismatch", `Refusing to sign: the transaction does not use ${o.venue === "jupiter" ? "Jupiter" : "Pump.fun"}, which this copy claims.`);
+  if (used.has(METEORA_DBC_PROGRAM)) venues.push("meteora");
+  if (!venues.includes(o.venue)) throw new AppCheckError("venue_mismatch", `Refusing to sign: the transaction does not use ${o.venue === "jupiter" ? "Jupiter" : o.venue === "meteora" ? "Meteora" : "Pump.fun"}, which this copy claims.`);
   if (venues.length > 1) throw new AppCheckError("venue_mismatch", "Refusing to sign: the transaction mixes venues.");
 
   // Mint: the intent's mint (or the user's token account for it) must be named by the transaction.

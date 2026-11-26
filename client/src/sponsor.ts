@@ -77,6 +77,8 @@ export const SPONSOR_PROGRAMS = {
   jupiter: address("JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"),
   pump: address("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"),
   pumpSwap: address("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"),
+  /** Meteora Dynamic Bonding Curve (Bags, Believe, Jupiter Studio coins before graduation). Matches the SDK's program id. */
+  meteoraDbc: address("dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN"),
   system: address("11111111111111111111111111111111"),
   token: address("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"),
   token2022: address("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"),
@@ -98,7 +100,7 @@ export const JUPITER_OPTIONAL = {
  * instruction must call one of these. System, Token, ATA and ComputeBudget
  * are allowed only alongside them, so the sponsor is not a free transfer service.
  */
-export const APP_PROGRAMS: Address[] = [SPONSOR_PROGRAMS.launch, SPONSOR_PROGRAMS.perps, SPONSOR_PROGRAMS.jupiter, SPONSOR_PROGRAMS.pump, SPONSOR_PROGRAMS.pumpSwap];
+export const APP_PROGRAMS: Address[] = [SPONSOR_PROGRAMS.launch, SPONSOR_PROGRAMS.perps, SPONSOR_PROGRAMS.jupiter, SPONSOR_PROGRAMS.pump, SPONSOR_PROGRAMS.pumpSwap, SPONSOR_PROGRAMS.meteoraDbc];
 
 export interface SponsorPolicy {
   /** Programs a sponsored transaction may call (top level). */
