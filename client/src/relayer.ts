@@ -43,6 +43,7 @@ import {
 } from "@solana/kit";
 import { bigintJson, clientIp, decodeWire, quoteAndSimulate, refuse, rpcRetry, type Accepted, type Ix, type Refusal, type SimulationRpc } from "./txpolicy.js";
 import { createHash } from "node:crypto";
+import { detectCluster, resolveNetwork } from "./cluster.js";
 
 export const PROGRAMS = {
   shieldedPool: address("ring1GaLCuJnkUMVkX2JeZLTTX17wKsV4fZmPVzXANW"),
@@ -349,17 +350,26 @@ async function main() {
     ? Uint8Array.from(JSON.parse((await import("node:fs")).readFileSync(RELAYER_KEYPAIR, "utf8")))
     : new Uint8Array(getBase58Encoder().encode(RELAYER_KEY!));
   const signer = await createKeyPairSignerFromBytes(secret);
-  if (NETWORK === "mainnet" && !SCREENING_URL) console.warn("[relayer] WARNING: mainnet without SCREENING_URL — sponsored accounts are not screened");
-  const relayer = new Relayer(createSolanaRpc(RPC_URL) as unknown as RelayerRpc, signer, {
+  const rpc = createSolanaRpc(RPC_URL);
+  // Mainnet safeguards (screening warning, IPFS metadata) follow the RPC's real cluster, not NETWORK alone.
+  const net = resolveNetwork(NETWORK, await detectCluster(() => rpc.getGenesisHash().send()));
+  if (net.error) {
+    console.error(`[relayer] ${net.error}. Refusing to start.`);
+    process.exit(1);
+  }
+  if (net.warning) console.warn(`[relayer] WARNING: ${net.warning}`);
+  const isMainnet = net.network === "mainnet";
+  if (isMainnet && !SCREENING_URL) console.warn("[relayer] WARNING: mainnet without SCREENING_URL — sponsored accounts are not screened");
+  const relayer = new Relayer(rpc as unknown as RelayerRpc, signer, {
     budget: REDIS_URL ? new RedisBudget(new RespClient(REDIS_URL)) : new MemoryBudget(),
     feeRecovery: FEE_RECOVERY_TREASURY ? { treasury: address(FEE_RECOVERY_TREASURY), minAmount: BigInt(FEE_RECOVERY_MIN ?? "10000") } : undefined,
     screen: SCREENING_URL ? httpScreen(SCREENING_URL, SCREENING_KEY) : undefined,
   });
   console.log(`[relayer] limits in ${REDIS_URL ? "Redis (shared)" : "memory (single instance)"}; fee recovery ${FEE_RECOVERY_TREASURY ? `${FEE_RECOVERY_MIN ?? "10000"} to ${FEE_RECOVERY_TREASURY}` : "off"}; screening ${SCREENING_URL ? "on" : "off"}`);
   const metadata = new MetadataStore({
-    pinataJwt: PINATA_JWT, gateway: PINATA_GATEWAY, localDir: METADATA_DIR, publicUrl: PUBLIC_URL, mainnet: NETWORK === "mainnet",
+    pinataJwt: PINATA_JWT, gateway: PINATA_GATEWAY, localDir: METADATA_DIR, publicUrl: PUBLIC_URL, mainnet: isMainnet,
   });
-  console.log(`[relayer] token metadata: ${PINATA_JWT ? "IPFS via Pinata" : NETWORK === "mainnet" ? "NOT CONFIGURED (set PINATA_JWT)" : "local store (devnet)"}`);
+  console.log(`[relayer] token metadata: ${PINATA_JWT ? "IPFS via Pinata" : isMainnet ? "NOT CONFIGURED (set PINATA_JWT)" : "local store (devnet)"}`);
   createRelayerServer(relayer, { allowOrigin: ALLOW_ORIGIN, trustProxy: TRUST_PROXY === "1", metadata }).listen(Number(PORT ?? 8787), () =>
     console.log(`[relayer] ${signer.address} listening on :${PORT ?? 8787}`),
   );

@@ -13,6 +13,7 @@ import { resolve } from "node:path";
 import { createServer } from "node:http";
 import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction } from "@solana/web3.js";
 import { getOrCreateAssociatedTokenAccount, mintTo } from "@solana/spl-token";
+import { clusterOf } from "../src/cluster.js";
 
 const ROOT = resolve(import.meta.dirname, "../..");
 const url = process.env.RPC_URL ?? "https://api.devnet.solana.com";
@@ -20,6 +21,10 @@ if (!/devnet/.test(url) && process.env.FAUCET_ALLOW_ANY_RPC !== "1") throw new E
 const payer = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(readFileSync(process.env.FAUCET_KEYPAIR!, "utf8"))));
 const usdcMint = new PublicKey(JSON.parse(readFileSync(resolve(ROOT, "devnet-deployment.json"), "utf8")).usdcMint);
 const connection = new Connection(url, "confirmed");
+// It hands out SOL from your wallet: prove the cluster is devnet, whatever the URL says.
+if (process.env.FAUCET_ALLOW_ANY_RPC !== "1" && clusterOf(await connection.getGenesisHash()) !== "devnet") {
+  throw new Error("The faucet only runs against devnet (the RPC's genesis hash is not devnet's).");
+}
 const SOL_DRIP = 0.25 * LAMPORTS_PER_SOL;
 const USDC_DRIP = 50_000_000;
 const COOLDOWN_MS = 10 * 60_000;

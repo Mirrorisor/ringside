@@ -67,6 +67,7 @@ import {
   type Refusal,
   type SimulationRpc,
 } from "./txpolicy.js";
+import { detectCluster } from "./cluster.js";
 
 export type { Accepted, Refusal };
 
@@ -739,8 +740,10 @@ async function main() {
     }
     authenticate = hmacSessionAuth(sessionSecret, { aud: "sponsor" }); // revocation: see RevocationPort (multi-process gap)
   } else if (anon) {
-    if (/mainnet/i.test(RPC_URL)) {
-      console.error("SPONSOR_ALLOW_ANON=1 is refused on mainnet. Set SPONSOR_SESSION_SECRET.");
+    // Devnet only, proven by the RPC's genesis hash: a URL check alone misses mainnet RPCs without "mainnet" in the host.
+    const cluster = /mainnet/i.test(RPC_URL) ? "mainnet" : await detectCluster(() => createSolanaRpc(RPC_URL).getGenesisHash().send());
+    if (cluster !== "devnet") {
+      console.error(`SPONSOR_ALLOW_ANON=1 is devnet only, and this RPC is ${cluster === "mainnet" ? "mainnet" : "not verifiably devnet"}. Set SPONSOR_SESSION_SECRET.`);
       process.exit(1);
     }
     console.warn("[sponsor] ******************************************************************");

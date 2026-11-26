@@ -41,7 +41,9 @@ fi
 solana --version; anchor --version
 
 # --- Wallet and SOL ------------------------------------------------------------
-solana config set --url "$RPC" >/dev/null
+# Global CLI default: the public devnet moniker, never $RPC (it may carry an API key, which would
+# then sit in ~/.config/solana/cli/config.yml and show in every `solana config get`).
+solana config set --url devnet >/dev/null
 WALLET="$HOME/.config/solana/id.json"
 if [ ! -f "$WALLET" ]; then
   say "Creating a devnet wallet at $WALLET"

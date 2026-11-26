@@ -47,6 +47,11 @@ build
 # finishes), plus a small permanent amount if the program grew.
 lamports_per_byte=6960
 ADDR=$(solana address)
+# Deploys sign with the CLI's configured keypair; the tests use $WALLET. They must be the same wallet.
+if [ "$ADDR" != "$(solana address -k "$WALLET")" ]; then
+  echo "Not deploying: the Solana CLI keypair ($ADDR) is not $WALLET. Run: solana config set --keypair $WALLET"
+  exit 1
+fi
 RELAYER_KP="$HOME/.config/solana/relayer.json"
 bal() { solana balance --url "$RPC" --lamports | awk '{print $1}'; }
 sol() { awk -v l="$1" 'BEGIN{printf "%.2f", l/1e9}'; }

@@ -6,7 +6,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "build": "tsc --outDir dist",
-    "test": "tsc --outDir dist && node --test test/relayer.test.mjs test/addresses.test.mjs test/metadata.test.mjs test/hardening.test.mjs test/monitor.test.mjs test/indexer.test.mjs test/jupiter.test.mjs test/pumpfun.test.mjs test/meteora.test.mjs test/sponsor.test.mjs test/social.test.mjs test/copy.test.mjs test/appcheck.test.mjs test/perps.test.mjs",
+    "test": "tsc --outDir dist && node --test test/relayer.test.mjs test/addresses.test.mjs test/metadata.test.mjs test/hardening.test.mjs test/monitor.test.mjs test/indexer.test.mjs test/jupiter.test.mjs test/pumpfun.test.mjs test/meteora.test.mjs test/sponsor.test.mjs test/social.test.mjs test/copy.test.mjs test/appcheck.test.mjs test/perps.test.mjs test/cluster.test.mjs",
     "relayer": "npm run build && node dist/relayer.js",
     "keeper": "npm run build && node dist/keeper.js"
   },
