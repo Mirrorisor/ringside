@@ -273,7 +273,7 @@ export function mountSocial(root: HTMLElement, tabs: HTMLElement, env: Env, onTa
 
   // ---- Copy inbox -------------------------------------------------------------
   const SIDE_TEXT: Record<CopyIntent["side"], string> = { buy: "Buy", sell: "Sell", long: "Long", short: "Short", close: "Close" };
-  const VENUE_TEXT: Record<CopyIntent["venue"], string> = { jupiter: "Jupiter", pumpfun: "Pump.fun", "ringside-perps": "Ringside perps (devnet)" };
+  const VENUE_TEXT: Record<CopyIntent["venue"], string> = { jupiter: "Jupiter", pumpfun: "Pump.fun", "ringside-perps": "Longshot perps (devnet)" };
   const amountText = (i: CopyIntent) => [
     // For a sell, intent.lamports is the leader's trade size, not what you will receive; proceeds come from the build.
     i.lamports !== undefined && i.side !== "sell" ? sol(i.lamports) : null,
@@ -326,7 +326,7 @@ export function mountSocial(root: HTMLElement, tabs: HTMLElement, env: Env, onTa
         h("div", null, h("span", null, "Venue (in the transaction)"), h("b", null, VENUE_TEXT[i.venue] ?? unk(v.venue))),
         h("div", null, h("span", null, sell ? "Expected proceeds" : "Expected output"), h("b", null, out(v.expectedOut))),
         h("div", null, h("span", null, "Minimum after slippage"), h("b", null, out(v.minOut))),
-        h("div", null, h("span", null, "Ringside fee"), h("b", null, v.feeLamports === null ? "unknown" : `${sol(v.feeLamports)}. Network fee is paid by the sponsor.`)),
+        h("div", null, h("span", null, "Longshot fee"), h("b", null, v.feeLamports === null ? "unknown" : `${sol(v.feeLamports)}. Network fee is paid by the sponsor.`)),
       ];
     };
     const setBusy = (b: boolean) => { copyBtn.disabled = b || expired; };
@@ -369,7 +369,7 @@ export function mountSocial(root: HTMLElement, tabs: HTMLElement, env: Env, onTa
         const confirm = h("button", { class: "primary", onclick: () => void sign(built.transaction, confirm as HTMLButtonElement) }, "Confirm and sign") as HTMLButtonElement;
         const cancel = h("button", { onclick: () => { clear(out); setBusy(false); show(null); } }, "Cancel");
         const parts: Node[] = [h("p", { class: "muted" }, "Review the details above, then confirm. The transaction passed the safety check (fee payer, programs, transfers, token and approvals).")];
-        if (checked.feeLamportsInTx > 0n) parts.push(h("p", { class: "muted" }, `The transaction pays ${sol(Number(checked.feeLamportsInTx))} to the Ringside fee wallet.`));
+        if (checked.feeLamportsInTx > 0n) parts.push(h("p", { class: "muted" }, `The transaction pays ${sol(Number(checked.feeLamportsInTx))} to the Longshot fee wallet.`));
         if (view.unknown.length) {
           const ack = h("input", { type: "checkbox", id: `ack-${i.id}`, onchange: () => { confirm.disabled = !(ack as HTMLInputElement).checked; } });
           confirm.disabled = true;
