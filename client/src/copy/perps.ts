@@ -1,8 +1,8 @@
 /** Ringside perps pieces of the copy engine. */
-import type { PerpEvent } from "./ports.js";
+import { tierParams } from "../perps/math.js";
 
-/** Mirrors `tier_params` in programs/ringside_perps (same table as client/app/main.ts TIER). Max leverage by tier. */
-export const TIER_MAX_LEVERAGE = [2, 5, 10] as const;
+/** Max leverage by tier, from the shared tier table (mirrors `tier_params`, lib.rs:121). */
+export const TIER_MAX_LEVERAGE: readonly number[] = [0, 1, 2].map((t) => Number(tierParams(t).maxLeverage));
 
 export function tierMaxLeverage(tier: number | null | undefined): number {
   const t = Number.isInteger(tier) ? Math.min(Math.max(tier as number, 0), 2) : 0;
@@ -19,11 +19,7 @@ export function cappedLeverage(leaderLeverage: number, maxLeverage: number, tier
 export const perpsGateFromEnv = (env: NodeJS.ProcessEnv = process.env) => env.RINGSIDE_COPY_PERPS === "1";
 
 /**
- * TODO(perps-decode): decode Ringside perps open/close instructions from an
- * indexer transaction (Helius enhanced tx, program ringside_perps) into
- * PerpEvents. Needs the IDL's instruction discriminators and account order
- * (target/idl/ringside_perps.json). Not implemented: returns no events.
+ * Decodes Ringside perps events (PositionChanged = open or increase, PositionClosed reason 0 = close)
+ * from a transaction's logs into PerpEvents. See ../perps/events.ts.
  */
-export function decodePerpEvents(_tx: unknown): PerpEvent[] {
-  return [];
-}
+export { decodePerpEvents, decodeRawEvents } from "../perps/events.js";
