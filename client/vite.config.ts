@@ -23,6 +23,10 @@ export default defineConfig({
     proxy: {
       "/relayer": { target: "http://127.0.0.1:8787", rewrite: (p) => p.replace(/^\/relayer/, "") },
       "/faucet": { target: "http://127.0.0.1:8788", rewrite: (p) => p.replace(/^\/faucet/, "") },
+      "/indexer": { target: "http://127.0.0.1:8790", rewrite: (p) => p.replace(/^\/indexer/, "") },
+      "/social": { target: "http://127.0.0.1:8791", rewrite: (p) => p.replace(/^\/social/, "") },
+      "/sponsor": { target: "http://127.0.0.1:8792", rewrite: (p) => p.replace(/^\/sponsor/, "") },
+      "/copy": { target: "http://127.0.0.1:8793", rewrite: (p) => p.replace(/^\/copy/, "") },
       "/helius": { target: "https://devnet.helius-rpc.com", changeOrigin: true, secure: true, ws: true, rewrite: withKey },
     },
   },

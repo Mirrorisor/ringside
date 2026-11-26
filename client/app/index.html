@@ -48,6 +48,30 @@ th,td{padding:8px 6px;border-bottom:1px solid var(--line)}.n{text-align:right;wh
 .log a{color:var(--ring)}
 .note{font-size:12px;color:var(--soft);margin-top:10px}
 .stack{display:grid;gap:16px;align-content:start}
+main[hidden],#social[hidden]{display:none}
+.tabs{display:flex;gap:6px;padding:8px max(3vw,16px);background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}
+.tabs button{flex:1;position:relative;min-height:44px}.tabs button[aria-pressed=true]{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+.badge{position:absolute;top:2px;right:4px;background:var(--rope);color:#fff;border-radius:99px;font-size:11px;padding:0 6px;line-height:18px}
+#social{max-width:640px;margin:0 auto;padding:14px max(3vw,16px) 48px}
+.pane{display:grid;gap:12px;align-content:start}
+.sh{display:flex;align-items:center;gap:8px}.back{min-height:40px;width:40px;padding:0;font-size:22px}
+.row{display:flex;gap:10px;align-items:center;padding:10px 0;border-bottom:1px solid var(--line)}.row:last-child{border-bottom:0}
+.grow{flex:1}.list2 h3{margin-bottom:6px}
+.lnk{min-height:auto;border:0;background:none;padding:0;color:var(--ring);font-weight:600;text-decoration:underline}
+.rank{width:24px;text-align:center}.err{color:var(--short);font-size:14px}
+.av{display:inline-block;border-radius:50%;background:var(--tint);object-fit:cover;flex:none}
+.prof{display:flex;gap:12px;align-items:center}.two{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.seg3{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;background:var(--tint);padding:4px;border-radius:12px}
+.seg3 button{border:0;background:transparent;min-height:40px}.seg3 button[aria-pressed=true]{background:var(--panel);box-shadow:0 1px 3px #0002}
+.stats3{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.flag{padding:10px 0;border-bottom:1px solid var(--line);display:grid;gap:4px}.flag:last-child{border-bottom:0}
+.flag.hit{border-left:4px solid var(--short);padding-left:10px}.tag{font-size:12px;border:1px solid var(--line);border-radius:99px;padding:1px 8px}
+.flag.hit .tag{color:var(--short);border-color:var(--short)}.flag.ok .tag{color:var(--long)}
+.form .f{margin-bottom:6px}.chk{display:flex;gap:10px;align-items:center;color:var(--ink);font-size:15px;margin:12px 0}.chk input{width:22px;min-height:22px}
+select{width:100%;min-height:42px;font-size:16px;border:1px solid var(--line);border-radius:10px;background:var(--bg);padding:0 12px;color:inherit}
+.warn{border:1px solid var(--short);background:var(--tint);border-radius:10px;padding:10px;font-size:14px;margin:8px 0}
+.intent{display:grid;gap:10px}.ihead{display:flex;justify-content:space-between}.cd{color:var(--rope)}
+.rows2{display:grid;gap:6px;font-size:14px}.rows2>div{display:flex;justify-content:space-between;gap:12px}.rows2 span{color:var(--soft)}.rows2 b{text-align:right}
 @media(max-width:1100px){main{grid-template-columns:minmax(0,1fr)}}
 </style>
 </head>
@@ -62,7 +86,9 @@ th,td{padding:8px 6px;border-bottom:1px solid var(--line)}.n{text-align:right;wh
     <button id="faucet">Get test funds</button>
   </div>
 </header>
-<main>
+<nav class="tabs" id="tabs" aria-label="Sections"></nav>
+<section id="social" hidden></section>
+<main id="trade">
   <div class="stack">
     <div class="card">
       <h3>Launch a token</h3>
