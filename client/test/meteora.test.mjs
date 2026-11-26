@@ -77,29 +77,47 @@ function mintData(supply, extensions = []) {
   spl.MintLayout.encode({ mintAuthorityOption: 0, mintAuthority: PublicKey.default, supply, decimals: 6, isInitialized: true, freezeAuthorityOption: 0, freezeAuthority: PublicKey.default }, base);
   if (!extensions.length) return base;
   // Token-2022: pad to the account size, account-type byte (1 = Mint), then TLV entries.
-  const tlv = Buffer.concat(extensions.map(([type, len]) => {
+  const tlv = Buffer.concat(extensions.map(([type, body]) => {
+    const payload = Buffer.isBuffer(body) ? body : Buffer.alloc(body);
     const h = Buffer.alloc(4);
-    h.writeUInt16LE(type, 0); h.writeUInt16LE(len, 2);
-    return Buffer.concat([h, Buffer.alloc(len)]);
+    h.writeUInt16LE(type, 0); h.writeUInt16LE(payload.length, 2);
+    return Buffer.concat([h, payload]);
   }));
   return Buffer.concat([base, Buffer.alloc(spl.ACCOUNT_SIZE - spl.MINT_SIZE), Buffer.from([1]), tlv]);
 }
 
-function fakeRpc(accounts) {
-  const calls = { gpa: 0 };
+/** A Token-2022 TransferFeeConfig extension: `older` applies before `newer.epoch`, `newer` from it on. */
+function transferFeeExt(older, newer) {
+  const buf = Buffer.alloc(spl.TRANSFER_FEE_CONFIG_SIZE);
+  const fee = (f) => ({ epoch: BigInt(f.epoch), maximumFee: BigInt(f.max ?? 2n ** 64n - 1n), transferFeeBasisPoints: f.bps });
+  spl.TransferFeeConfigLayout.encode({
+    transferFeeConfigAuthority: PublicKey.default, withdrawWithheldAuthority: PublicKey.default, withheldAmount: 0n,
+    olderTransferFee: fee(older), newerTransferFee: fee(newer),
+  }, buf);
+  return [spl.ExtensionType.TransferFeeConfig, buf];
+}
+
+function fakeRpc(accounts, { epoch = 0, leak = [] } = {}) {
+  const calls = { gpa: 0, filters: [] };
   return {
     calls, accounts,
     async getAccountInfo(k) { return accounts.get(k.toBase58()) ?? null; },
     async getMultipleAccountsInfo(keys) { return keys.map((k) => accounts.get(k.toBase58()) ?? null); },
-    async getProgramAccounts(program, { filters }) {
+    async getProgramAccounts(program, { filters, dataSlice }) {
       calls.gpa++;
+      calls.filters.push(filters);
       assert.equal(program.toBase58(), METEORA_DBC_PROGRAM);
-      const m = filters[0].memcmp;
-      assert.equal(m.offset, VIRTUAL_POOL_BASE_MINT_OFFSET);
-      const want = new PublicKey(m.bytes).toBuffer();
-      return [...accounts].filter(([, a]) => a.owner.equals(PROGRAM.programId) && a.data.length > m.offset + 32 && a.data.subarray(m.offset, m.offset + 32).equals(want))
+      assert.equal(dataSlice, undefined, "pool accounts are decoded, so the data must come back");
+      const ok = (a) => a.owner.equals(PROGRAM.programId) && filters.every((f) => {
+        if (f.dataSize !== undefined) return a.data.length === f.dataSize;
+        const want = Buffer.from((require("bs58").decode ?? require("bs58").default.decode)(f.memcmp.bytes));
+        return a.data.length >= f.memcmp.offset + want.length && a.data.subarray(f.memcmp.offset, f.memcmp.offset + want.length).equals(want);
+      });
+      // `leak`: accounts a misbehaving RPC returns whatever the filters say.
+      return [...[...accounts].filter(([, a]) => ok(a)).map(([k, a]) => [k, a]), ...leak]
         .map(([k, a]) => ({ pubkey: new PublicKey(k), account: a }));
     },
+    async getEpochInfo() { return { epoch }; },
     async getSlot() { return 1000; },
     async getBlockTime() { return 1_700_000_000; },
   };
@@ -119,7 +137,7 @@ const SELL = SOLD0 / 4n;
 
 async function world({
   tokenProgram = spl.TOKEN_PROGRAM_ID, quoteMint = spl.NATIVE_MINT, quoteTokenFlag = 0,
-  transferFeeBps = 0, mintExtensions = [], quoteReserve = RESERVE0, isMigrated = 0, migrationProgress = 0, withPoolMint = true,
+  transferFeeBps = 0, mintExtensions = [], quoteReserve = RESERVE0, isMigrated = 0, migrationProgress = 0, withPoolMint = true, epoch = 0,
 } = {}) {
   const mint = rnd(), config = rnd(), pool = rnd();
   const accounts = new Map();
@@ -140,7 +158,7 @@ async function world({
     },
   }), PROGRAM.programId));
   if (withPoolMint) accounts.set(mint.toBase58(), info(mintData(1_000_000_000_000_000n, mintExtensions), tokenProgram));
-  return { mint, pool, config, accounts, rpc: fakeRpc(accounts) };
+  return { mint, pool, config, accounts, rpc: fakeRpc(accounts, { epoch }) };
 }
 
 // Independent reimplementation of the single-segment curve (Q64.64 sqrt prices).
@@ -335,7 +353,7 @@ test("a non-SOL quote mint is refused with `unsupported_quote`", async () => {
 // ---- Token-2022 ---------------------------------------------------------------
 
 test("Token-2022 base mint with a declared transfer fee: the fee is included in quotes", async () => {
-  const { mint, rpc } = await world({ tokenProgram: spl.TOKEN_2022_PROGRAM_ID, transferFeeBps: 500, mintExtensions: [[1, 108]] });
+  const { mint, rpc } = await world({ tokenProgram: spl.TOKEN_2022_PROGRAM_ID, transferFeeBps: 500, mintExtensions: [transferFeeExt({ epoch: 0, bps: 500 }, { epoch: 0, bps: 500 })] });
   const m = mint.toBase58();
   const solIn = 1_000_000_000n;
   const buy = await quoteBuy(cfg(rpc), { mint: m, solIn });
@@ -353,11 +371,101 @@ test("Token-2022 base mint with a declared transfer fee: the fee is included in 
 });
 
 test("Token-2022 mint with a transfer fee the pool config does not declare, or a hook, is refused", async () => {
-  const undeclared = await world({ tokenProgram: spl.TOKEN_2022_PROGRAM_ID, mintExtensions: [[1, 108]] });
+  const undeclared = await world({ tokenProgram: spl.TOKEN_2022_PROGRAM_ID, mintExtensions: [transferFeeExt({ epoch: 0, bps: 500 }, { epoch: 0, bps: 500 })] });
   await assert.rejects(quoteBuy(cfg(undeclared.rpc), { mint: undeclared.mint.toBase58(), solIn: 1_000_000_000n }), refusal("unsupported_token_program"));
   const hook = await world({ tokenProgram: spl.TOKEN_2022_PROGRAM_ID, mintExtensions: [[14, 64]] });
   await assert.rejects(quoteBuy(cfg(hook.rpc), { mint: hook.mint.toBase58(), solIn: 1_000_000_000n }), refusal("unsupported_token_program"));
   assert.equal(await isMeteoraPool(hook.rpc, hook.mint.toBase58()), false);
+});
+
+test("transfer fee is the mint's current-epoch fee, older before the switch epoch and newer from it", async () => {
+  const older = { epoch: 0, bps: 200 }, newer = { epoch: 10, bps: 800 };
+  const solIn = 1_000_000_000n;
+  // The pool config still says 500; the mint decides.
+  const before = await world({ tokenProgram: spl.TOKEN_2022_PROGRAM_ID, transferFeeBps: 500, mintExtensions: [transferFeeExt(older, newer)], epoch: 9 });
+  const b = await quoteBuy(cfg(before.rpc), { mint: before.mint.toBase58(), solIn });
+  assert.equal(b.transferFeeBps, 200);
+  assert.equal(b.tokensOut, expectedBuyTokens(solIn, 200n));
+  assert.equal((await quoteSell(cfg(before.rpc), { mint: before.mint.toBase58(), tokensIn: SELL })).solOut, expectedSellSol(SELL, 200n));
+  const after = await world({ tokenProgram: spl.TOKEN_2022_PROGRAM_ID, transferFeeBps: 500, mintExtensions: [transferFeeExt(older, newer)], epoch: 10 });
+  const a = await quoteBuy(cfg(after.rpc), { mint: after.mint.toBase58(), solIn });
+  assert.equal(a.transferFeeBps, 800);
+  assert.equal(a.tokensOut, expectedBuyTokens(solIn, 800n));
+  assert.equal((await quoteSell(cfg(after.rpc), { mint: after.mint.toBase58(), tokensIn: SELL })).solOut, expectedSellSol(SELL, 800n));
+});
+
+// ---- pool discovery hardening -------------------------------------------------
+
+test("discovery filters on dataSize, the VirtualPool discriminator and the mint", async () => {
+  const w = await world();
+  await quoteBuy(cfg(w.rpc), { mint: w.mint.toBase58(), solIn: 1_000_000_000n });
+  const f = w.rpc.calls.filters[0];
+  assert.ok(f.some((x) => x.dataSize === PROGRAM.coder.accounts.size("virtualPool")));
+  const d0 = f.find((x) => x.memcmp?.offset === 0);
+  const bs58 = require("bs58");
+  assert.deepEqual([...(bs58.decode ?? bs58.default.decode)(d0.memcmp.bytes)], PROGRAM.idl.accounts.find((a) => a.name === "virtualPool").discriminator);
+  assert.ok(f.some((x) => x.memcmp?.offset === VIRTUAL_POOL_BASE_MINT_OFFSET && x.memcmp.bytes === w.mint.toBase58()));
+});
+
+test("results that are not a pool owned by DBC for this mint are ignored, even from a RPC that ignores filters", async () => {
+  const w = await world();
+  const m = w.mint.toBase58();
+  const realPool = w.accounts.get(w.pool.toBase58());
+  const other = await world();
+  const foreignOwner = info(realPool.data, rnd()); // right bytes, wrong owner
+  const wrongMint = other.accounts.get(other.pool.toBase58()); // a pool, but for another mint
+  const junk = info(Buffer.alloc(424, 7), PROGRAM.programId); // DBC-owned, wrong discriminator
+  const rpc = fakeRpc(w.accounts, { leak: [[rnd().toBase58(), foreignOwner], [rnd().toBase58(), wrongMint], [rnd().toBase58(), junk]] });
+  const q = await quoteBuy(cfg(rpc, { poolCacheTtlMs: 0 }), { mint: m, solIn: 1_000_000_000n });
+  assert.equal(q.pool, w.pool.toBase58());
+});
+
+test("a mint with only a blocking decoy account has no pool, and nothing is cached", async () => {
+  const w = await world();
+  w.accounts.delete(w.pool.toBase58());
+  const decoy = Buffer.alloc(424, 1);
+  w.mint.toBuffer().copy(decoy, VIRTUAL_POOL_BASE_MINT_OFFSET);
+  const rpc = fakeRpc(w.accounts, { leak: [[rnd().toBase58(), info(decoy, PROGRAM.programId)]] });
+  await assert.rejects(quoteBuy(cfg(rpc), { mint: w.mint.toBase58(), solIn: 1_000_000_000n }), refusal("not_found"));
+  await assert.rejects(quoteBuy(cfg(rpc), { mint: w.mint.toBase58(), solIn: 1_000_000_000n }), refusal("not_found"));
+  assert.equal(rpc.calls.gpa, 2, "a miss is looked up again");
+});
+
+test("several valid pools: the lowest address wins, and it is logged", async () => {
+  const w = await world();
+  const second = rnd();
+  w.accounts.set(second.toBase58(), info(w.accounts.get(w.pool.toBase58()).data, PROGRAM.programId));
+  const lowest = [w.pool.toBase58(), second.toBase58()].sort()[0];
+  const warns = [];
+  const orig = console.warn;
+  console.warn = (...a) => warns.push(a.join(" "));
+  try {
+    const q = await quoteBuy(cfg(w.rpc), { mint: w.mint.toBase58(), solIn: 1_000_000_000n });
+    assert.equal(q.pool, lowest);
+  } finally { console.warn = orig; }
+  assert.equal(warns.length, 1);
+  assert.ok(warns[0].includes(lowest));
+});
+
+test("the pool cache expires after its TTL (default 10 minutes)", async () => {
+  const w = await world();
+  const m = w.mint.toBase58();
+  let t = 1_000_000;
+  const c = cfg(w.rpc, { now: () => t });
+  await quoteBuy(c, { mint: m, solIn: 1_000_000_000n });
+  t += 9 * 60_000;
+  await quoteBuy(c, { mint: m, solIn: 1_000_000_000n });
+  assert.equal(w.rpc.calls.gpa, 1);
+  t += 2 * 60_000;
+  await quoteBuy(c, { mint: m, solIn: 1_000_000_000n });
+  assert.equal(w.rpc.calls.gpa, 2);
+  // A custom TTL.
+  const w2 = await world();
+  const c2 = cfg(w2.rpc, { now: () => t, poolCacheTtlMs: 1000 });
+  await quoteBuy(c2, { mint: w2.mint.toBase58(), solIn: 1_000_000_000n });
+  t += 1001;
+  await quoteBuy(c2, { mint: w2.mint.toBase58(), solIn: 1_000_000_000n });
+  assert.equal(w2.rpc.calls.gpa, 2);
 });
 
 // ---- isMeteoraPool ---------------------------------------------------------------

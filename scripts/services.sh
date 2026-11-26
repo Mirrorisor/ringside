@@ -126,10 +126,17 @@ RELAYER_KP="$HOME/.config/solana/relayer.json"
 
 [ -f "$RELAYER_KP" ] || solana-keygen new --no-bip39-passphrase --silent -o "$RELAYER_KP"
 REL=$(solana address -k "$RELAYER_KP")
-if [ "$(solana balance "$REL" --url "$RPC" --lamports | awk '{print $1}')" -lt 300000000 ]; then
+# The RPC URL may carry the Helius key, so it goes to the Solana CLI in a private config file
+# (-C/--config, json_rpc_url) instead of --url, which would show the key in `ps`.
+SOLANA_CFG=$(mktemp)
+trap 'rm -f "$SOLANA_CFG"' EXIT
+chmod 600 "$SOLANA_CFG"
+printf 'json_rpc_url: "%s"\nkeypair_path: "%s"\n' "$RPC" "$WALLET" > "$SOLANA_CFG"
+if [ "$(solana -C "$SOLANA_CFG" balance "$REL" --lamports | awk '{print $1}')" -lt 300000000 ]; then
   echo "▸ Funding the relayer with 0.5 SOL from your wallet"
-  solana transfer --url "$RPC" --allow-unfunded-recipient "$REL" 0.5 >/dev/null
+  solana -C "$SOLANA_CFG" transfer --allow-unfunded-recipient "$REL" 0.5 >/dev/null
 fi
+rm -f "$SOLANA_CFG"
 
 cd client
 npm install --silent
