@@ -60,6 +60,7 @@ export function decodeRawEvents(idl: Idl, logs: string[], coders: PerpsCoders = 
 const USDC = 1_000_000;
 /**
  * Turns a confirmed transaction's logs into copyable PerpEvents. A failed transaction yields none.
+ * `PositionChanged` carries no previous size, so `prevSizeUsd` is left unset and the copy engine tracks it.
  * For an open, sizeUsd is the event's `size_usd` (for an increase, the position's total after the fill) and
  * leverage is that size over the collateral after the fee. For a close sizeUsd is 0 and leverage 1.
  */

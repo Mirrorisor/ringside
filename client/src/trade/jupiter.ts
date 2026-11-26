@@ -733,6 +733,23 @@ export async function checkMeteoraSwap(ixs: CheckIx[], o: { user: Address; mint:
   }
 }
 
+/**
+ * The platform fee, in bps, that the decoded swap instruction(s) actually carry (routeV2 `platform_fee_bps`, u16 LE at
+ * data[26..28]). Null when no swap instruction in the transaction has a layout that carries it (older route layouts).
+ * Reported fees must come from here, not from what we asked the API for.
+ */
+export function decodedPlatformFeeBps(ixs: CheckIx[]): number | null {
+  let out: number | null = null;
+  for (const ix of ixs) {
+    if (ix.program !== TX_PROGRAMS.jupiterSwap) continue;
+    const rule = FEE_SLOT.find((r) => r.disc === hex(ix.data.subarray(0, 8)));
+    if (!rule || rule.feeBpsAt === undefined || ix.data.length < rule.feeBpsAt + 2) continue;
+    const b = ix.data[rule.feeBpsAt] | (ix.data[rule.feeBpsAt + 1] << 8);
+    out = Math.max(out ?? 0, b);
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // Swap V2 types
 // ---------------------------------------------------------------------------

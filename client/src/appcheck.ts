@@ -174,6 +174,12 @@ export interface BuiltView {
   feeLamports: number | null;
   /** Sells only: SOL proceeds from the build response, never the leader's cost basis. */
   proceedsLamports: bigint | null;
+  /** Perps: the build is a Ringside perp order. expectedOut is then the position notional in USDC base units and minOut is not used. */
+  perp: boolean;
+  /** Perps: collateral the order escrows, USDC base units. */
+  collateralUsdc: bigint | null;
+  /** Perps: the program's trade fee on fill, USDC base units. */
+  feeUsdc: bigint | null;
   unknown: string[];
 }
 
@@ -189,17 +195,22 @@ const first = (d: Record<string, unknown>, keys: string[]) => { for (const k of 
 export function describeBuilt(side: string, built: Record<string, unknown>, slippageBps?: number): BuiltView {
   const sell = side === "sell";
   const venue = typeof built.venue === "string" ? built.venue : null;
+  const perp = venue === "ringside-perps";
   const feeRaw = first(built, ["feeLamports", "ringsideFeeLamports", "fee"]);
   const proceeds = sell ? first(built, ["proceedsLamports", "solOut", "lamports"]) : null;
   const expectedOut = sell ? proceeds : first(built, ["expectedOut", "tokensOut", "outAmount", "tokens"]);
-  let minOut = first(built, ["minOut", "minOutAmount", "otherAmountThreshold", "minTokensOut", "minLamportsOut"]);
-  if (minOut === null && expectedOut !== null && Number.isInteger(slippageBps) && slippageBps! >= 0 && slippageBps! <= 10_000) {
+  let minOut = perp ? null : first(built, ["minOut", "minOutAmount", "otherAmountThreshold", "minTokensOut", "minLamportsOut"]);
+  if (!perp && minOut === null && expectedOut !== null && Number.isInteger(slippageBps) && slippageBps! >= 0 && slippageBps! <= 10_000) {
     minOut = (expectedOut * BigInt(10_000 - slippageBps!)) / 10_000n;
   }
   const unknown: string[] = [];
   if (!venue) unknown.push("venue");
   if (feeRaw === null) unknown.push("Ringside fee");
   if (expectedOut === null) unknown.push(sell ? "sale proceeds" : "expected output");
-  if (minOut === null) unknown.push("minimum after slippage");
-  return { venue, expectedOut, minOut, feeLamports: feeRaw === null ? null : Number(feeRaw), proceedsLamports: proceeds, unknown };
+  const collateralUsdc = perp ? big(built.collateralUsdc) : null, feeUsdc = perp ? big(built.feeUsdc) : null;
+  if (perp) {
+    if (collateralUsdc === null) unknown.push("collateral");
+    if (feeUsdc === null) unknown.push("trade fee");
+  } else if (minOut === null) unknown.push("minimum after slippage");
+  return { venue, expectedOut, minOut, feeLamports: feeRaw === null ? null : Number(feeRaw), proceedsLamports: proceeds, perp, collateralUsdc, feeUsdc, unknown };
 }

@@ -98,12 +98,47 @@ export function checkIncreaseCaps(
  * Returns the largest new order size (USDC base units) that passes for `collateral` added to a position
  * of `existingCollateral`/`existingSize`, or 0n.
  */
-export function maxSizeForCollateral(tier: number, collateral: bigint, existingCollateral = 0n, existingSize = 0n): bigint {
+export function maxSizeForCollateral(tier: number, collateral: bigint, existingCollateral = 0n, existingSize = 0n, fundingOwed = 0n): bigint {
   const { maxLeverage, feeBps } = tierParams(tier);
+  // The program realises funding into the existing collateral first (lib.rs:402-406); a negative result fails the fill.
+  if (existingSize > 0n) {
+    existingCollateral -= fundingOwed;
+    if (existingCollateral < 0n) return 0n;
+  }
   const ok = (s: bigint) => (existingCollateral + collateral - mulBps(s, feeBps)) * maxLeverage >= existingSize + s;
   // Closed form for the continuous case, then walk down; the floor() in mul_bps lets the true maximum sit up to maxLeverage above it.
   const num = (existingCollateral + collateral) * maxLeverage * BPS - existingSize * BPS;
   let s = num > 0n ? num / (BPS + maxLeverage * feeBps) + maxLeverage + 1n : 0n;
   while (s > 0n && !ok(s)) s--;
   return s;
+}
+
+/** lib.rs:24-26 */
+export const FUNDING_SCALE = 1_000_000_000_000n, FUNDING_BASE_PER_HOUR = 500_000_000n, FUNDING_MAX_PER_HOUR = 5_000_000_000n;
+
+/**
+ * `accrue_funding` (lib.rs:812-823): the market's funding index as the program will have it when it fills an order at
+ * `nowSec`. The stored index lags by the time since the last accrual. Integer maths with truncation toward zero, as in Rust.
+ */
+export function projectedFundingIndex(
+  v: VaultRisk, m: MarketOi & { fundingIndex: bigint | number | BN; lastFundingTs: bigint | number | BN }, solReserve: bigint, nowSec: number,
+): bigint {
+  const index = big(m.fundingIndex);
+  const dt = BigInt(nowSec) - big(m.lastFundingTs);
+  if (dt <= 0n) return index;
+  const long = big(m.oiLong), short = big(m.oiShort);
+  let cap = oiCap(v, solReserve, m.oiCapOverride ?? 0n, nowSec) ?? 0n;
+  const maxOi = long > short ? long : short;
+  if (maxOi > cap) cap = maxOi;
+  if (cap < 1n) cap = 1n;
+  let rate = (FUNDING_BASE_PER_HOUR * (long - short)) / cap;
+  if (rate > FUNDING_MAX_PER_HOUR) rate = FUNDING_MAX_PER_HOUR;
+  if (rate < -FUNDING_MAX_PER_HOUR) rate = -FUNDING_MAX_PER_HOUR;
+  return index + (rate * dt) / 3_600n;
+}
+
+/** `funding_owed`, lib.rs:807-810: what a position owes (positive) or is owed (negative), USDC base units. */
+export function fundingOwed(side: number, sizeUsd: bigint, fundingSnapshot: bigint, index: bigint): bigint {
+  const owed = (sizeUsd * (index - fundingSnapshot)) / FUNDING_SCALE;
+  return side === SIDE_LONG ? owed : -owed;
 }

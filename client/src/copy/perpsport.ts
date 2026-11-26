@@ -4,6 +4,7 @@ import { address } from "@solana/kit";
 import { decodeCurve, LAUNCH_PROGRAM } from "../graduation.js";
 import { decodeMarket, decodePosition, decodeVault, perpsCoders } from "../perps/accounts.js";
 import type { Idl } from "../perps/anchor.js";
+import { BAND_BPS, BPS } from "../perps/math.js";
 import { curvePda, marketPda, orderPda, positionPda, vaultPda } from "../perps/pda.js";
 import type { PerpsPort } from "./build.js";
 
@@ -28,8 +29,13 @@ export function rpcPerpsPort(connection: Connection, idl: Idl): PerpsPort {
       if (!m) return null;
       if (!v || !c) throw new Error("vault or curve account missing");
       const curve = decodeCurve(address(keys[2].toBase58()), c.data);
+      const mk = decodeMarket(coders, m.data);
+      const spot = curve.virtualTokens > 0n ? (curve.virtualSol << 64n) / curve.virtualTokens : undefined;
+      // Approximation of mark_price's clamp (lib.rs:785): the spot is outside the +/-15% band around the stored anchor.
+      const anchor = BigInt(mk.bandAnchorQ64.toString());
+      const markClamped = spot !== undefined && anchor > 0n && (spot < (anchor * (BPS - BAND_BPS)) / BPS || spot > (anchor * (BPS + BAND_BPS)) / BPS);
       return {
-        vault: decodeVault(coders, v.data), market: decodeMarket(coders, m.data),
+        vault: decodeVault(coders, v.data), market: mk, curveComplete: curve.complete, markClamped,
         positions: { 0: p0 ? decodePosition(coders, p0.data) : null, 1: p1 ? decodePosition(coders, p1.data) : null },
         orders: { 0: !!o0, 1: !!o1 },
         solReserve: curve.virtualSol, graduated: curve.migrated,

@@ -56,6 +56,8 @@ export interface PerpEvent {
   sizeUsd: number; leverage: number;
   signature: string; slot: number; timestamp: number; // unix seconds
   action: "open" | "close";
+  /** The leader's position size on this side before the event (USD), when the source knows it. Otherwise the engine tracks it. */
+  prevSizeUsd?: number;
 }
 
 /** Reports whether a leader sold a mint after a source trade. The default is backed by CopyStore. */

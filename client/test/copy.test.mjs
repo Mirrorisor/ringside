@@ -786,3 +786,24 @@ test("build: a graduated-coin copy goes through /swap/v2/build with our platform
   await assert.rejects(t.p(), (e) => e instanceof BuildError && e.code === "build_failed");
   assert.equal(t.r.store.get(t.i.id).status, "pending");
 });
+
+test("L5: the price-drift check uses the mint's real decimals; a failed lookup refuses the build", async () => {
+  const r = rig();
+  const i = await one(r);
+  // 100_000_000 raw is 100 tokens at 6 decimals (the leader's price) but 0.1 tokens at 9: a 1000x worse price.
+  await assert.rejects(buildIntent(deps(r, { pump: pumpFake("curve", 100_000_000n), tokenDecimals: async () => 9 }), i.id, ALICE), (e) => e.code === "price_moved");
+  await buildIntent(deps(r, { pump: pumpFake("curve", 100_000_000_000n), tokenDecimals: async () => 9 }), i.id, ALICE); // 100 tokens at 9 decimals
+  const r2 = rig();
+  const j = await one(r2);
+  await assert.rejects(buildIntent(deps(r2, { tokenDecimals: async () => { throw new Error("rpc"); } }), j.id, ALICE), (e) => e.code === "build_failed");
+});
+
+test("L5: cachedMintDecimals reads byte 44 of a token-program mint, caches, and refuses non-mints", async () => {
+  const { cachedMintDecimals } = await import("../dist/copy/build.js");
+  const TOKEN = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+  const data = new Uint8Array(82); data[44] = 9;
+  let n = 0;
+  const f = cachedMintDecimals(async (m) => { n++; return m === "mint" ? { owner: TOKEN, data } : m === "wrong" ? { owner: "11111111111111111111111111111111", data } : null; });
+  assert.equal(await f("mint"), 9); assert.equal(await f("mint"), 9); assert.equal(n, 1);
+  await assert.rejects(f("wrong")); await assert.rejects(f("missing"));
+});

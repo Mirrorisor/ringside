@@ -9,9 +9,10 @@ import { Connection, Keypair, PublicKey, SystemProgram, VersionedTransaction } f
 import { TOKEN_PROGRAM_ID, getAssociatedTokenAddressSync } from "@solana/spl-token";
 import {
   BPS, GROSS_CAP_MULT, acceptablePrice, buildOrderInstruction, caps, checkIncreaseCaps, curvePda, decodeMarket, decodePerpEvents, decodePosition,
-  decodeVault, marketPda, maxSizeForCollateral, oiCap, orderPda, perpsCoders, positionPda, tierParams, vaultPda, vaultUsdcPda,
+  decodeVault, fundingOwed, marketPda, projectedFundingIndex, maxSizeForCollateral, oiCap, orderPda, perpsCoders, positionPda, tierParams, vaultPda, vaultUsdcPda,
 } from "../dist/perps/index.js";
-import { buildIntent, BuildError } from "../dist/copy/build.js";
+import { buildIntent, BuildError, cachedGenesisHash, cachedMintDecimals } from "../dist/copy/build.js";
+import { describeBuilt } from "../dist/appcheck.js";
 import { createCopyEngine } from "../dist/copy/engine.js";
 import { CopyStore } from "../dist/copy/store.js";
 import { decodePerpEvents as copyDecode } from "../dist/copy/perps.js";
@@ -238,11 +239,12 @@ function rig({ maxLeverage = 5, tier = 2, solReserve = 300_000_000_000n, market 
   const calls = [];
   const deps = (o = {}) => ({
     store, pump: {}, jupiter: {}, chain, now: () => T0,
-    perps: { idl, port: { state: async (...a) => { calls.push(a); return state; } }, rpcUrl: "https://api.devnet.solana.com", enabled: true, solPriceUsd: async () => 100, ...o },
+    perps: { idl, port: { state: async (...a) => { calls.push(a); return state; } }, rpcUrl: "https://api.devnet.solana.com", genesisHash: async () => DEVNET_GENESIS, enabled: true, solPriceUsd: async () => 100, ...o },
   });
   const open = async (ev = {}) => (await engine.onLeaderPerp({ leader: LEADER, market: "m", mint: MINT.toBase58(), side: "long", sizeUsd: 500, leverage: 50, signature: SIG(1), slot: 5, timestamp: Math.floor(T0 / 1000), action: "open", ...ev }))[0];
   return { store, engine, deps, open, state, calls };
 }
+const DEVNET_GENESIS = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG";
 const refused = (code) => (e) => e instanceof BuildError && e.code === code;
 const orderArgs = (built) => {
   const t = VersionedTransaction.deserialize(Buffer.from(built.transaction, "base64"));
@@ -310,11 +312,11 @@ test("copy perps build: unsigned, sponsor pays, short side, slippage bound, clos
   const r2 = rig({ tier: 1 });
   assert.equal((await r2.open({ action: "close", signature: SIG(2) })).status, "skipped", "engine skips a close without a copy position");
   const r3 = rig({ tier: 1 });
-  const open = await r3.open();
+  const open = await r3.open({ side: "short" });
   r3.store.markBuilt(open.id, { venue: "ringside-perps" });
   r3.store.markSent(open.id, SIG(70));
   r3.store.confirmSent(open.id, 0n);
-  const cl = await r3.open({ action: "close", signature: SIG(3) });
+  const cl = await r3.open({ action: "close", side: "short", signature: SIG(3) });
   assert.equal(cl.status, "pending");
   await assert.rejects(buildIntent(r3.deps(), cl.id, FOLLOWER), refused("build_failed"), "no position on chain");
   r3.state.positions[1] = { sizeUsd: bn(30_000_000), collateral: bn(10_000_000) };
@@ -322,9 +324,137 @@ test("copy perps build: unsigned, sponsor pays, short side, slippage bound, clos
   const a2 = orderArgs(await buildIntent(r3.deps(), cl.id, FOLLOWER));
   assert.equal(a2.kind, 1); assert.equal(a2.side, 1); assert.equal(a2.size, 0n);
   assert.equal(a2.price, 1_010_000n, "close short: capped at reference + slippage");
-  r3.state.positions[0] = r3.state.positions[1];
-  const cl2 = await r3.open({ action: "close", signature: SIG(4) });
-  await assert.rejects(buildIntent(r3.deps(), cl2.id, FOLLOWER), refused("build_failed"), "both sides open is ambiguous");
+  // M1: with both sides open on chain, only the leader's side is closed (it used to refuse as ambiguous or close the wrong one).
+  r3.state.positions[0] = { sizeUsd: bn(50_000_000), collateral: bn(10_000_000) };
+  r3.state.referencePriceQ64 = undefined;
+  const cl2 = await r3.open({ action: "close", side: "short", signature: SIG(4) });
+  assert.equal(orderArgs(await buildIntent(r3.deps(), cl2.id, FOLLOWER)).side, 1, "closes the short, leaves the long");
+  // The leader closing the long, which the follower never copied, is skipped by the engine ...
+  assert.equal((await r3.open({ action: "close", side: "long", signature: SIG(5) })).skipReason, "no_copy_position");
+  // ... and a close intent for an uncopied side is refused at build even if one exists (store row forged / stale).
+  const forged = { ...r3.store.get(cl2.id), id: "forged-1", sourceSignature: SIG(6), perpSide: "long", status: "pending", expiresAt: T0 + 60_000 };
+  r3.store.insert(forged);
+  await assert.rejects(buildIntent(r3.deps(), "forged-1", FOLLOWER), refused("perp_not_copied"));
+  assert.equal(r3.store.get("forged-1").status, "pending");
+  // Another leader's copied position on that side does not count either.
+  r3.store.insert({ ...forged, id: "forged-2", sourceSignature: SIG(7), perpSide: "short", leader: k(9).toBase58() });
+  await assert.rejects(buildIntent(r3.deps(), "forged-2", FOLLOWER), refused("perp_not_copied"));
+  // Confirming the close clears the record.
+  r3.store.markBuilt(cl2.id, { venue: "ringside-perps" }); r3.store.markSent(cl2.id, SIG(71)); r3.store.confirmSent(cl2.id, 0n);
+  assert.equal(r3.store.copiedPerp(FOLLOWER, LEADER, MINT.toBase58(), "short"), false);
+});
+
+test("M1 sponsor L1: the follower is the instruction payer, the sponsor only the fee payer", opts, async () => {
+  const r = rig({ tier: 1 });
+  const i = await r.open();
+  const built = await buildIntent({ ...r.deps(), sponsor: RELAYER.toBase58() }, i.id, FOLLOWER);
+  const a = orderArgs(built);
+  const keys = a.tx.message.staticAccountKeys;
+  assert.equal(keys[0].toBase58(), RELAYER.toBase58());
+  const ixKeys = a.ix.accountKeyIndexes.map((x) => keys[x].toBase58());
+  assert.ok(!ixKeys.includes(RELAYER.toBase58()), "the fee payer is in no instruction account (sponsor.ts refuses it)");
+  const def = idl.instructions.find((x) => x.name === "request_order");
+  const pi = def.accounts.findIndex((x) => x.name === "payer");
+  assert.equal(ixKeys[pi], FOLLOWER, "payer is the owner");
+  assert.equal(a.tx.message.header.numRequiredSignatures, 2, "sponsor + follower");
+});
+
+test("M2: ratio mode sizes from the leader's change, not the total", opts, async () => {
+  const mk = () => { const r = rig({ tier: 2 }); return r; };
+  const ratioRig = () => {
+    const store = new CopyStore(":memory:");
+    const settings = { follower: FOLLOWER, leader: LEADER, enabled: true, mode: "ratio", fixedLamports: 0, ratioBps: 10_000, maxPerTradeLamports: 100 * SOL, dailyCapLamports: 100 * SOL, slippageBps: 100, copySells: true, copyPerps: true, maxLeverage: 5, skipFlags: [], minTokenAgeSec: 0 };
+    const engine = createCopyEngine({ social: { copySettingsForLeader: async () => [settings], notify: async () => {} }, flags: { tokenFacts: async () => ({ flags: [], ageSec: 99 }) }, store, tiers: { tierOf: async () => 2 }, perpsEnabled: true, now: () => T0, solPriceUsd: async () => 100 });
+    const ev = (o) => engine.onLeaderPerp({ leader: LEADER, market: "m", mint: MINT.toBase58(), side: "long", sizeUsd: 100, leverage: 2, signature: SIG(1), slot: 5, timestamp: Math.floor(T0 / 1000), action: "open", ...o }).then((x) => x[0]);
+    return { store, ev };
+  };
+  void mk;
+  const { store, ev } = ratioRig();
+  // First event ever seen: the previous size is unknown, so skip rather than copy the whole position.
+  assert.equal((await ev({ signature: SIG(10), sizeUsd: 100 })).skipReason, "perp_size_unknown");
+  // Leader goes 100 -> 150: copy 50 USD = 0.5 SOL, not 150 USD.
+  const inc = await ev({ signature: SIG(11), sizeUsd: 150 });
+  assert.equal(inc.status, "pending");
+  assert.equal(inc.lamports, 0.5 * SOL);
+  // Replay of the same event gives the same intent (idempotent), no double count.
+  assert.equal((await ev({ signature: SIG(11), sizeUsd: 150 })).id, inc.id);
+  assert.equal((await ev({ signature: SIG(12), sizeUsd: 400 })).lamports, 2.5 * SOL);
+  // After a close the next open starts from zero.
+  await ev({ signature: SIG(13), action: "close", sizeUsd: 0 });
+  assert.equal((await ev({ signature: SIG(14), sizeUsd: 200 })).lamports, 2 * SOL);
+  // A size that did not grow means our record is stale: skip.
+  assert.equal((await ev({ signature: SIG(15), sizeUsd: 150 })).skipReason, "perp_size_unknown");
+  // The event's own previous size wins when the source has it.
+  const { ev: ev2 } = ratioRig();
+  assert.equal((await ev2({ signature: SIG(20), sizeUsd: 300, prevSizeUsd: 100 })).lamports, 2 * SOL);
+  void store;
+});
+
+test("M3: the mainnet check uses the genesis hash, cached, failing closed", opts, async () => {
+  const r = rig({ tier: 2 });
+  const i = await r.open();
+  const MAINNET = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
+  await assert.rejects(buildIntent(r.deps({ genesisHash: async () => MAINNET }), i.id, FOLLOWER), refused("perps_build_unsupported"), "mainnet behind an innocent URL");
+  await assert.rejects(buildIntent(r.deps({ genesisHash: async () => { throw new Error("rpc down"); } }), i.id, FOLLOWER), refused("perps_build_unsupported"), "error fails closed");
+  await assert.rejects(buildIntent(r.deps({ genesisHash: undefined }), i.id, FOLLOWER), refused("perps_build_unsupported"), "missing check fails closed");
+  assert.equal(r.calls.length, 0, "no chain reads before the cluster is verified");
+  let n = 0;
+  const g = cachedGenesisHash(async () => { n++; if (n === 1) throw new Error("once"); return DEVNET_GENESIS; });
+  await assert.rejects(g());
+  assert.equal(await g(), DEVNET_GENESIS); assert.equal(await g(), DEVNET_GENESIS);
+  assert.equal(n, 2, "success cached, failure not");
+  assert.ok(await buildIntent(r.deps(), i.id, FOLLOWER));
+});
+
+test("L2: orders the program would reject at fill are refused with a code", opts, async () => {
+  // Tier 0 curve sold out.
+  let r = rig({ tier: 0 }); r.state.curveComplete = true;
+  let i = await r.open({ leverage: 2 });
+  await assert.rejects(buildIntent(r.deps(), i.id, FOLLOWER), refused("perp_curve_complete"));
+  r.state.market.tier = 1; // tier >= 1 trades on after completion
+  assert.ok(await buildIntent(r.deps(), i.id, FOLLOWER));
+  // Clamped mark.
+  r = rig({ tier: 2 }); r.state.markClamped = true;
+  i = await r.open();
+  await assert.rejects(buildIntent(r.deps(), i.id, FOLLOWER), refused("perp_mark_clamped"));
+  // Funding owed on the existing position: existing 100 size long, collateral 5, funding index moved so it owes.
+  const pos = (col, size, side, snap) => ({ side, sizeUsd: bn(size), collateral: bn(col), fundingSnapshot: bn(snap) });
+  r = rig({ tier: 2, market: { fundingIndex: bn(60_000_000_000), lastFundingTs: bn(1_050) }, positions: { 0: pos(1_000_000, 100_000_000, 0, 0) } });
+  r.state.market.oiLong = bn(100_000_000);
+  i = await r.open();
+  // owed = 100e6 * 6e10 / 1e12 = 6e6 > 1e6 collateral
+  await assert.rejects(buildIntent(r.deps(), i.id, FOLLOWER), refused("perp_funding"));
+  // Funding that is owed but affordable shrinks the size the leverage check allows.
+  const big = { solReserve: 3_000_000_000_000n };
+  const base = rig({ tier: 2, ...big, positions: { 0: pos(20_000_000, 250_000_000, 0, 0) } });
+  const sizeNoFunding = orderArgs(await buildIntent(base.deps(), (await base.open()).id, FOLLOWER)).size;
+  const owing = rig({ tier: 2, ...big, market: { fundingIndex: bn(4_000_000_000), lastFundingTs: bn(1_050) }, positions: { 0: pos(20_000_000, 250_000_000, 0, 0) } });
+  const sizeFunding = orderArgs(await buildIntent(owing.deps(), (await owing.open()).id, FOLLOWER)).size;
+  assert.ok(sizeFunding < sizeNoFunding, `${sizeFunding} < ${sizeNoFunding}`);
+  const { maxLeverage, feeBps } = tierParams(2);
+  const col = 20_000_000n - 1_000_000n + 10_000_000n; // existing minus funding owed (250e6*4e9/1e12) plus new
+  assert.ok((col - (sizeFunding * feeBps) / BPS) * maxLeverage >= 250_000_000n + sizeFunding, "passes the program's check after funding");
+  // Accrual since the last funding timestamp is projected like accrue_funding: cap $450, skew 100/450, 1100 s.
+  const vr = { solUsdE6: 150_000_000n, solUsdTs: 1_000n, tier0CapBps: 100, skewCapBps: 2500 };
+  assert.equal(projectedFundingIndex(vr, { oiLong: 100_000_000n, oiShort: 0n, oiCapOverride: 0n, fundingIndex: 7n, lastFundingTs: 0n }, 300_000_000_000n, 1_100), 7n + (111_111_111n * 1_100n) / 3_600n);
+  assert.equal(fundingOwed(0, 100_000_000n, 0n, 60_000_000_000n), 6_000_000n);
+  assert.equal(fundingOwed(1, 100_000_000n, 0n, 60_000_000_000n), -6_000_000n);
+});
+
+test("L6: perps report the trade fee and collateral in their own fields, not minOut", opts, async () => {
+  for (const [tier, bps] of [[0, 30n], [1, 15n], [2, 8n]]) {
+    const r = rig({ tier });
+    const i = await r.open();
+    const b = await buildIntent(r.deps(), i.id, FOLLOWER);
+    const a = orderArgs(b);
+    assert.equal(b.minOut, undefined, "no minOut for perps");
+    assert.equal(b.collateralUsdc, a.collateral.toString());
+    assert.equal(b.feeUsdc, ((a.size * bps) / 10_000n).toString());
+    const v = describeBuilt(i.side, JSON.parse(JSON.stringify(b)));
+    assert.equal(v.perp, true); assert.equal(v.minOut, null);
+    assert.equal(v.feeUsdc, BigInt(b.feeUsdc)); assert.equal(v.collateralUsdc, a.collateral);
+    assert.ok(!v.unknown.includes("minimum after slippage"));
+  }
 });
 
 test("copy perps build: cap breach is perp_cap and leaves the intent pending", opts, async () => {

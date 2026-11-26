@@ -8,13 +8,13 @@
  * this entry point cannot run. Import `createCopyServer` from the backend
  * process and pass its own SocialPort and indexer store.
  */
-import { Connection } from "@solana/web3.js";
+import { Connection, PublicKey } from "@solana/web3.js";
 import { createSolanaRpc, fetchAddressesForLookupTables } from "@solana/kit";
 import { SqliteStore } from "../indexer/store.js";
 import { readFileSync } from "node:fs";
 import { hmacSessionAuth } from "../session.js";
 import { Jupiter, parseFeeAccounts } from "../trade/jupiter.js";
-import { type BuildDeps, meteoraPort, pumpPort } from "./build.js";
+import { type BuildDeps, cachedGenesisHash, cachedMintDecimals, meteoraPort, pumpPort } from "./build.js";
 import { confirmPending, rpcTxPort } from "./confirm.js";
 import { createCopyEngine } from "./engine.js";
 import { perpsGateFromEnv } from "./perps.js";
@@ -36,6 +36,7 @@ export function startCopyService(social: SocialPort, indexer: SqliteStore, env: 
     // Lookup tables come from our RPC, never from the Jupiter response.
     resolveLookupTables: (t) => fetchAddressesForLookupTables(t, rpc, { commitment: "confirmed" }),
   });
+  const mintConn = new Connection(rpcUrl, "confirmed");
   const build: BuildDeps = {
     store,
     pump: pumpPort({ rpc: new Connection(rpcUrl, "confirmed"), feeWallet: need("COPY_FEE_WALLET") }),
@@ -43,6 +44,11 @@ export function startCopyService(social: SocialPort, indexer: SqliteStore, env: 
     jupiter: { build: (r) => jup.buildSwap(r) },
     chain: { latestBlockhash: async () => (await rpc.getLatestBlockhash().send()).value },
     sponsor: env.SPONSOR_ADDRESS,
+    // Real decimals from the mint account (cached), so 9-decimal coins are not compared at 6.
+    tokenDecimals: cachedMintDecimals(async (m) => {
+      const a = await mintConn.getAccountInfo(new PublicKey(m));
+      return a ? { owner: a.owner.toBase58(), data: a.data } : null;
+    }),
     // Perps: off unless RINGSIDE_COPY_PERPS=1; needs RINGSIDE_PERPS_IDL (path to target/idl/ringside_perps.json).
     perps: perpsGateFromEnv(env) && env.RINGSIDE_PERPS_IDL ? perpsDeps(env.RINGSIDE_PERPS_IDL, rpcUrl) : undefined,
   };
@@ -65,5 +71,6 @@ export function startCopyService(social: SocialPort, indexer: SqliteStore, env: 
 
 function perpsDeps(idlPath: string, rpcUrl: string): NonNullable<BuildDeps["perps"]> {
   const idl = JSON.parse(readFileSync(idlPath, "utf8"));
-  return { idl, port: rpcPerpsPort(new Connection(rpcUrl, "confirmed"), idl), rpcUrl, enabled: true };
+  const conn = new Connection(rpcUrl, "confirmed");
+  return { idl, port: rpcPerpsPort(conn, idl), rpcUrl, enabled: true, genesisHash: cachedGenesisHash(() => conn.getGenesisHash()) };
 }

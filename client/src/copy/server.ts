@@ -46,7 +46,7 @@ export interface CopyServerOptions {
 
 const STATUS_OF: Record<string, number> = {
   bad_request: 400, unauthorized: 401, not_found: 404, method_not_allowed: 405, conflict: 409, payload_too_large: 413, rate_limited: 429,
-  intent_expired: 410, price_moved: 422, leader_exited: 422, perps_build_unsupported: 501, perp_cap: 422, venue_unavailable: 422, build_failed: 502, internal_error: 500,
+  intent_expired: 410, price_moved: 422, leader_exited: 422, perps_build_unsupported: 501, perp_cap: 422, perp_not_copied: 422, perp_funding: 422, perp_curve_complete: 422, perp_mark_clamped: 422, venue_unavailable: 422, build_failed: 502, internal_error: 500,
 };
 class ApiError extends Error { constructor(readonly code: string) { super(code); } }
 

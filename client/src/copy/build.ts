@@ -10,8 +10,8 @@
  * Jupiter's /swap/v2/build platform fee (paid to our own fee token account).
  *
  * Perps: built with the shared client in ../perps (the same order builder the
- * app uses), behind RINGSIDE_COPY_PERPS=1 and on devnet only (an RPC URL
- * containing "mainnet" is refused). Collateral is USDC: the intent's SOL
+ * app uses), behind RINGSIDE_COPY_PERPS=1 and on devnet only (the cluster's
+ * genesis hash must be devnet's, and an RPC URL containing "mainnet" is refused). Collateral is USDC: the intent's SOL
  * amount is converted at an injected SOL/USD price, then the market's OI,
  * account and skew caps are re-checked against live accounts (`perp_cap`).
  * Perps are not sent to a venue: the transaction is one `request_order`
@@ -27,13 +27,13 @@ import { buildBuy, buildSell, PumpTradeError, type BuiltTrade, type BuyQuote, ty
 import { PublicKey } from "@solana/web3.js";
 import type { Idl } from "../perps/anchor.js";
 import type { MarketAcc, PositionAcc, VaultAcc } from "../perps/accounts.js";
-import { checkIncreaseCaps, clampTier, maxSizeForCollateral } from "../perps/math.js";
+import { checkIncreaseCaps, clampTier, fundingOwed, maxSizeForCollateral, mulBps, projectedFundingIndex, tierParams } from "../perps/math.js";
 import { buildOrderInstruction } from "../perps/order.js";
 import { cappedLeverage, perpsGateFromEnv } from "./perps.js";
 import type { CopyIntent, LeaderExitPort } from "./ports.js";
 import type { CopyStore } from "./store.js";
 
-export type BuildErrorCode = "not_found" | "not_pending" | "expired" | "perps_build_unsupported" | "perp_cap" | "venue_unavailable" | "build_failed" | "price_moved" | "leader_exited";
+export type BuildErrorCode = "not_found" | "not_pending" | "expired" | "perps_build_unsupported" | "perp_cap" | "perp_not_copied" | "perp_funding" | "perp_curve_complete" | "perp_mark_clamped" | "venue_unavailable" | "build_failed" | "price_moved" | "leader_exited";
 export class BuildError extends Error {
   constructor(readonly code: BuildErrorCode, message: string) { super(message); this.name = "BuildError"; }
 }
@@ -46,9 +46,13 @@ export interface BuiltIntent {
   lamports: number;
   /** What the quote expects to receive, as a decimal string: base-unit tokens for a buy, lamports for a sell. */
   expectedOut: string;
-  /** The least the transaction accepts after slippage, same units as expectedOut. */
-  minOut: string;
+  /** The least the transaction accepts after slippage, same units as expectedOut. Not set for perps (the price bound is inside the order). */
+  minOut?: string;
   slippageBps: number;
+  /** Perps only: collateral escrowed by the order, USDC base units (6 dp). */
+  collateralUsdc?: string;
+  /** Perps only: the program's trade fee (tier bps of the order's notional), USDC base units. Charged on fill, not part of feeLamports. */
+  feeUsdc?: string;
 }
 
 /** Pump.fun layer as a port. Resolves null when the coin has no Pump curve or pool. Fakeable in tests. */
@@ -73,6 +77,38 @@ export const DEFAULT_BUILT_TTL_MS = 90_000;
 export const DEFAULT_MAX_PRICE_DRIFT_BPS = 1000;
 /** Pump.fun tokens always have 6 decimals; override for other mints. */
 export const DEFAULT_TOKEN_DECIMALS = 6;
+/** Devnet's genesis hash. */
+export const DEVNET_GENESIS_HASH = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG";
+
+/** Caches a successful genesis-hash lookup (it never changes); failures are not cached and propagate. */
+export function cachedGenesisHash(fetchHash: () => Promise<string>): () => Promise<string> {
+  let hit: string | undefined;
+  let inflight: Promise<string> | undefined;
+  return async () => {
+    if (hit !== undefined) return hit;
+    inflight ??= fetchHash().then((h) => { hit = h; return h; }).finally(() => { inflight = undefined; });
+    return inflight;
+  };
+}
+
+const TOKEN_PROGRAMS = new Set(["TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"]);
+/**
+ * Decimals of an SPL mint from its account (owner must be a token program; decimals sit at byte 44 of the 82-byte mint).
+ * Cached per mint. Throws on an account that is not a mint, so a caller never guesses.
+ */
+export function cachedMintDecimals(read: (mint: string) => Promise<{ owner: string; data: Uint8Array } | null>): (mint: string) => Promise<number> {
+  const cache = new Map<string, number>();
+  return async (mint) => {
+    const hit = cache.get(mint);
+    if (hit !== undefined) return hit;
+    const acc = await read(mint);
+    if (!acc || !TOKEN_PROGRAMS.has(acc.owner) || acc.data.length < 82) throw new Error("not a token mint");
+    const d = acc.data[44];
+    if (!Number.isInteger(d) || d > 18) throw new Error("bad decimals");
+    cache.set(mint, d);
+    return d;
+  };
+}
 
 /** Live perps accounts for one follower and market. Backed by RPC in production (perpsport.ts); fakeable in tests. */
 export interface PerpsState {
@@ -84,6 +120,10 @@ export interface PerpsState {
   solReserve: bigint;
   /** True once the market prices from the Raydium pool; copy builds do not support that yet. */
   graduated: boolean;
+  /** The curve is sold out (`curve.complete`). On a tier 0 market the program refuses to increase (lib.rs:400). */
+  curveComplete?: boolean;
+  /** The banded mark differs from the TWAP right now; the program refuses to increase while clamped (lib.rs:400). */
+  markClamped?: boolean;
   /** Q64 price for the slippage bound, if known. Without it the order carries no price bound. */
   referencePriceQ64?: bigint;
   nowSec: number;
@@ -98,6 +138,11 @@ export interface PerpsBuildDeps {
   port: PerpsPort;
   /** The RPC URL in use; one containing "mainnet" is refused. */
   rpcUrl: string;
+  /**
+   * The cluster's genesis hash (getGenesisHash). Required: perps build only when it is devnet's. Wrap with
+   * `cachedGenesisHash`. An error or a missing function refuses the build (fail closed).
+   */
+  genesisHash?: () => Promise<string>;
   /** Defaults to RINGSIDE_COPY_PERPS=1, read at build time. */
   enabled?: boolean;
   /** SOL price in USD. Defaults to the vault's own on-chain price. */
@@ -121,7 +166,7 @@ export interface BuildDeps {
   maxPriceDriftBps?: number;
   /** Reports leader sells after the source trade. Defaults to the store's record of leader sells. */
   exits?: LeaderExitPort;
-  /** Decimals of a mint, to compare the quote with the leader's UI-unit price. Default 6. */
+  /** Decimals of a mint, to compare the quote with the leader's UI-unit price. Default 6 when not provided; an error refuses the build. */
   tokenDecimals?: (mint: string) => Promise<number> | number;
 }
 
@@ -237,7 +282,9 @@ export async function buildIntent(deps: BuildDeps, intentId: string, follower: s
     throw new BuildError("build_failed", "Could not build the transaction.");
   }
   if (i.side === "buy" && i.leaderPrice && i.leaderPrice > 0) {
-    const dec = Number((await deps.tokenDecimals?.(i.mint)) ?? DEFAULT_TOKEN_DECIMALS);
+    let dec: number;
+    try { dec = Number((await deps.tokenDecimals?.(i.mint)) ?? DEFAULT_TOKEN_DECIMALS); } catch { throw new BuildError("build_failed", "Could not read the token's decimals."); }
+    if (!Number.isInteger(dec) || dec < 0 || dec > 18) throw new BuildError("build_failed", "Could not read the token's decimals.");
     const quoted = built.lamports / 1e9 / (Number(built.tokens) / 10 ** dec);
     const maxDrift = deps.maxPriceDriftBps ?? envBps("COPY_MAX_PRICE_DRIFT_BPS", DEFAULT_MAX_PRICE_DRIFT_BPS);
     // Worse for a buy means a higher price (fewer tokens for the same SOL). A zero or unreadable quote is refused too.
@@ -273,13 +320,17 @@ async function viaJupiter(deps: BuildDeps, i: { side: string; slippageBps: numbe
 
 // ---- perps ----------------------------------------------------------------------------------
 
-type PerpIntent = Pick<CopyIntent, "id" | "mint" | "side" | "lamports" | "leverage"> & { slippageBps: number };
+type PerpIntent = Pick<CopyIntent, "id" | "leader" | "mint" | "side" | "lamports" | "leverage"> & { slippageBps: number; perpSide?: "long" | "short" };
 
 async function buildPerp(deps: BuildDeps, i: PerpIntent, follower: string): Promise<BuiltIntent> {
   const pd = deps.perps;
   if (!pd) throw new BuildError("perps_build_unsupported", "Perp copy transactions are not configured.");
   if (!(pd.enabled ?? perpsGateFromEnv())) throw new BuildError("perps_build_unsupported", "Perp copying is switched off (RINGSIDE_COPY_PERPS).");
   if (/mainnet/i.test(pd.rpcUrl)) throw new BuildError("perps_build_unsupported", "Perp copying is devnet-only.");
+  // The URL says little; the cluster's genesis hash is what it is. Fail closed.
+  let genesis: string | undefined;
+  try { genesis = pd.genesisHash ? await pd.genesisHash() : undefined; } catch { genesis = undefined; }
+  if (genesis !== DEVNET_GENESIS_HASH) throw new BuildError("perps_build_unsupported", "Perp copying is devnet-only (the cluster could not be verified as devnet).");
 
   let state: PerpsState | null;
   try { state = await pd.port.state(i.mint, follower); } catch { throw new BuildError("build_failed", "Could not read the perp market."); }
@@ -289,31 +340,40 @@ async function buildPerp(deps: BuildDeps, i: PerpIntent, follower: string): Prom
   if (vault.paused) throw new BuildError("venue_unavailable", "Perps are paused.");
 
   const owner = new PublicKey(follower), mint = new PublicKey(i.mint);
-  const payer = deps.sponsor ? new PublicKey(deps.sponsor) : owner;
-  const base = { idl: pd.idl, trader: owner, payer, mint, usdcMint: vault.usdcMint };
+  // The follower is the instruction's payer (rent for the order and position, refunded to them) and a signer. The sponsor is only
+  // the transaction's fee payer: sponsor.ts refuses a fee payer that appears in any instruction's accounts.
+  const feePayer = deps.sponsor ? new PublicKey(deps.sponsor) : owner;
+  const base = { idl: pd.idl, trader: owner, payer: owner, mint, usdcMint: vault.usdcMint };
   const bound = state.referencePriceQ64 !== undefined ? { referencePriceQ64: state.referencePriceQ64, slippageBps: i.slippageBps } : {};
+  const feeBps = tierParams(clampTier(market.tier)).feeBps;
   const finish = async (ixs: ReturnType<typeof buildOrderInstruction>[], sizeUsd: bigint, collateral: bigint, lamports: number): Promise<BuiltIntent> => {
     let transaction: string;
-    try { transaction = compileUnsigned(payer.toBase58(), ixs.map(toKitInstruction), await deps.chain.latestBlockhash()); }
+    try { transaction = compileUnsigned(feePayer.toBase58(), ixs.map(toKitInstruction), await deps.chain.latestBlockhash()); }
     catch { throw new BuildError("build_failed", "Could not build the transaction."); }
     const builtAt = (deps.now ?? Date.now)();
     if (!deps.store.markBuilt(i.id, { venue: "ringside-perps", lamports }, builtAt + (deps.builtTtlMs ?? DEFAULT_BUILT_TTL_MS))) throw new BuildError("not_pending", "Intent is not pending.");
-    // expectedOut is the notional in USDC base units; there is no price floor to report, the bound is inside the order.
-    return { transaction, feeLamports: 0, venue: "ringside-perps", lamports, expectedOut: sizeUsd.toString(), minOut: collateral.toString(), slippageBps: i.slippageBps };
+    // expectedOut is the notional in USDC base units. There is no price floor to report (the bound is inside the order), so no minOut.
+    // The trade fee is the program's, in USDC, taken from the position's collateral on fill: not a transfer to the fee wallet.
+    return { transaction, feeLamports: 0, venue: "ringside-perps", lamports, expectedOut: sizeUsd.toString(), slippageBps: i.slippageBps, collateralUsdc: collateral.toString(), feeUsdc: mulBps(sizeUsd, feeBps).toString() };
   };
 
   if (i.side === "close") {
-    const open = ([0, 1] as const).filter((s) => state!.positions[s] && BigInt(state!.positions[s]!.sizeUsd.toString()) > 0n);
-    if (open.length === 0) throw new BuildError("build_failed", "No open position to close.");
-    if (open.length > 1) throw new BuildError("build_failed", "Both sides are open; close them from the app.");
-    if (state.orders[open[0]]) throw new BuildError("build_failed", "An order on this side is already waiting for a keeper.");
-    const pos = state.positions[open[0]]!;
-    return finish([buildOrderInstruction({ ...base, ...bound, action: "close", side: open[0] })], BigInt(pos.sizeUsd.toString()), 0n, i.lamports ?? 0);
+    // Close only the side the leader closed, and only a position that came from copying this leader.
+    if (i.perpSide !== "long" && i.perpSide !== "short") throw new BuildError("perp_not_copied", "This close does not say which side to close.");
+    if (!deps.store.copiedPerp(follower, i.leader, i.mint, i.perpSide)) throw new BuildError("perp_not_copied", "You have no copied position on that side of this market.");
+    const cside = i.perpSide === "long" ? 0 : 1;
+    const pos = state.positions[cside];
+    if (!pos || BigInt(pos.sizeUsd.toString()) <= 0n) throw new BuildError("build_failed", "No open position to close.");
+    if (state.orders[cside]) throw new BuildError("build_failed", "An order on this side is already waiting for a keeper.");
+    return finish([buildOrderInstruction({ ...base, ...bound, action: "close", side: cside })], BigInt(pos.sizeUsd.toString()), 0n, i.lamports ?? 0);
   }
   if (i.side !== "long" && i.side !== "short") throw new BuildError("build_failed", "Unsupported side.");
   const side = i.side === "long" ? 0 : 1;
   if (market.reduceOnly) throw new BuildError("venue_unavailable", "The market is reduce-only.");
   if (state.orders[side]) throw new BuildError("build_failed", "An order on this side is already waiting for a keeper.");
+  // The program refuses an increase at fill on a sold-out tier 0 curve or while the mark is clamped (lib.rs:400): refuse now, not after escrow.
+  if (clampTier(market.tier) === 0 && state.curveComplete) throw new BuildError("perp_curve_complete", "This tier 0 market's curve is sold out; it cannot take new positions.");
+  if (state.markClamped) throw new BuildError("perp_mark_clamped", "The market's price is moving too fast right now (mark is clamped); try again shortly.");
 
   // Collateral: the intent's SOL amount in USD (6 dp).
   let px: number | undefined;
@@ -331,9 +391,16 @@ async function buildPerp(deps: BuildDeps, i: PerpIntent, follower: string): Prom
   const exSize = existing ? BigInt(existing.sizeUsd.toString()) : 0n, exCol = existing ? BigInt(existing.collateral.toString()) : 0n;
   let size = (collateral * BigInt(Math.floor(lev * 100))) / 100n;
   // The program checks leverage after the fee, so at the tier maximum the size must shrink a little.
-  const fit = maxSizeForCollateral(tier, collateral, exCol, exSize);
+  // Funding owed on the existing position is taken out of its collateral before the leverage check (lib.rs:402-406).
+  let owed = 0n;
+  if (existing && exSize > 0n) {
+    const idx = projectedFundingIndex(vault, { ...market, oiLong: BigInt(market.oiLong.toString()), oiShort: BigInt(market.oiShort.toString()), fundingIndex: BigInt(market.fundingIndex?.toString() ?? "0"), lastFundingTs: BigInt(market.lastFundingTs?.toString() ?? "0") }, state.solReserve, state.nowSec);
+    owed = fundingOwed(existing.side, exSize, BigInt(existing.fundingSnapshot?.toString() ?? "0"), idx);
+    if (exCol - owed < 0n) throw new BuildError("perp_funding", "Funding owed on your existing position exceeds its collateral.");
+  }
+  const fit = maxSizeForCollateral(tier, collateral, exCol, exSize, owed);
   if (size > fit) size = fit;
-  if (size <= 0n) throw new BuildError("build_failed", "Copy size is too small.");
+  if (size <= 0n) throw owed > 0n ? new BuildError("perp_funding", "Not enough collateral once funding owed is paid.") : new BuildError("build_failed", "Copy size is too small.");
 
   const breach = checkIncreaseCaps(vault, market, state.solReserve, side, size, exSize, state.nowSec);
   if (breach) throw new BuildError("perp_cap", `The market cannot take this copy (${breach}).`);
