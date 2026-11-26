@@ -8,6 +8,8 @@ import {
   createCloseAccountInstruction, createSyncNativeInstruction, createTransferInstruction, getAssociatedTokenAddressSync,
 } from "@solana/spl-token";
 import { TransactionInstruction } from "@solana/web3.js";
+import { ed25519 } from "@noble/curves/ed25519.js";
+import { mountSocial } from "./social/screens";
 import launchIdl from "../../target/idl/ringside_launch.json";
 import perpsIdl from "../../target/idl/ringside_perps.json";
 
@@ -789,3 +791,30 @@ $("backup").addEventListener("click", backupTradingKey);
 if (MAINNET) { ($("faucet") as HTMLElement).hidden = true; log("Mainnet: connect your wallet to launch or trade. Back up the trading key before depositing."); }
 $("connect").addEventListener("click", () => void connectWallet().catch((e) => log(`Wallet: ${(e as Error).message}`)));
 loop();
+
+// ---------------------------------------------------------------------------
+// Social layer: feed, leaderboard, profiles, copy trading. Signs with the connected
+// wallet when there is one, else the local devnet key (never on mainnet).
+// ---------------------------------------------------------------------------
+const social = mountSocial($("social"), $("tabs"), {
+  mainnet: MAINNET,
+  explorer: (sig) => `https://explorer.solana.com/tx/${encodeURIComponent(sig)}${NET.cluster}`,
+  signer: {
+    address: () => wallet.publicKey.toBase58(),
+    async signMessage(msg) {
+      if (external) {
+        const f = external.wallet.features["solana:signMessage"];
+        if (!f) throw new Error(`${external.name} cannot sign messages. Try another wallet.`);
+        const [{ signature }] = await f.signMessage({ account: external.account, message: msg });
+        return signature as Uint8Array;
+      }
+      if (MAINNET) throw new Error("Connect a wallet first.");
+      return ed25519.sign(msg, localWallet.secretKey.slice(0, 32));
+    },
+    async signTransaction(bytes) {
+      const tx = VersionedTransaction.deserialize(bytes);
+      return (await signerWallet.signTransaction(tx)).serialize();
+    },
+  },
+}, (name) => { ($("trade") as HTMLElement).hidden = name !== "trade"; });
+void social;
