@@ -27,29 +27,48 @@ const zero = (): Record<Quote, number> => ({ SOL: 0, USDC: 0 });
 
 interface Realisation { key: string; quote: Quote; pnl: number; timestamp: number }
 
+/** Mutable average-cost state of one (mint, quote) position. */
+export interface PositionState { tokenAmount: number; costBasis: number }
+
+/**
+ * Applies one trade to a position (average cost) and returns the realised
+ * PnL of a sell, or null when nothing is realised (buys, invalid amounts and
+ * sells with no indexed cost basis). Shared by `replay` and the store's
+ * incremental leaderboard aggregates so both agree exactly.
+ */
+export function applyTrade(p: PositionState, t: Pick<Trade, "side" | "tokenAmount" | "quoteAmount">): number | null {
+  if (!(t.tokenAmount > 0) || !(t.quoteAmount >= 0)) return null;
+  if (t.side === "buy") {
+    p.tokenAmount += t.tokenAmount;
+    p.costBasis += t.quoteAmount;
+    return null;
+  }
+  const sold = Math.min(t.tokenAmount, p.tokenAmount);
+  if (!(sold > 0)) return null;
+  const avg = p.costBasis / p.tokenAmount;
+  const pnl = t.quoteAmount * (sold / t.tokenAmount) - avg * sold;
+  p.tokenAmount -= sold;
+  p.costBasis -= avg * sold;
+  if (p.tokenAmount <= EPS) [p.tokenAmount, p.costBasis] = [0, 0];
+  return pnl;
+}
+
+/** Trade order used everywhere: timestamp, slot, then signature (binary, like SQLite). */
+export function compareTrades(a: Pick<Trade, "timestamp" | "slot" | "signature">, b: Pick<Trade, "timestamp" | "slot" | "signature">): number {
+  return a.timestamp - b.timestamp || a.slot - b.slot || (a.signature < b.signature ? -1 : a.signature > b.signature ? 1 : 0);
+}
+
 /** Replays trades (any order) into open positions and per-sell realisations. */
 export function replay(trades: Trade[]): { positions: Map<string, OpenPosition>; realisations: Realisation[] } {
-  const sorted = [...trades].sort((a, b) => a.timestamp - b.timestamp || a.slot - b.slot || a.signature.localeCompare(b.signature));
+  const sorted = [...trades].sort(compareTrades);
   const positions = new Map<string, OpenPosition>();
   const realisations: Realisation[] = [];
   for (const t of sorted) {
     if (!(t.tokenAmount > 0) || !(t.quoteAmount >= 0)) continue;
     const key = `${t.mint}:${t.quote}`;
     const p = positions.get(key) ?? { mint: t.mint, quote: t.quote, tokenAmount: 0, avgCost: 0, costBasis: 0 };
-    if (t.side === "buy") {
-      p.tokenAmount += t.tokenAmount;
-      p.costBasis += t.quoteAmount;
-    } else {
-      const sold = Math.min(t.tokenAmount, p.tokenAmount);
-      if (sold > 0) {
-        const avg = p.costBasis / p.tokenAmount;
-        const proceeds = t.quoteAmount * (sold / t.tokenAmount);
-        realisations.push({ key, quote: t.quote, pnl: proceeds - avg * sold, timestamp: t.timestamp });
-        p.tokenAmount -= sold;
-        p.costBasis -= avg * sold;
-        if (p.tokenAmount <= EPS) [p.tokenAmount, p.costBasis] = [0, 0];
-      }
-    }
+    const pnl = applyTrade(p, t);
+    if (pnl !== null) realisations.push({ key, quote: t.quote, pnl, timestamp: t.timestamp });
     p.avgCost = p.tokenAmount > 0 ? p.costBasis / p.tokenAmount : 0;
     positions.set(key, p);
   }
@@ -79,6 +98,13 @@ export function windowStats(trades: Trade[], realisations: Realisation[], since:
   };
 }
 
+/** Largest timestamp, by loop (a spread into Math.max overflows the stack on large arrays). */
+function maxTimestamp(trades: Trade[]): number | null {
+  let m: number | null = null;
+  for (const t of trades) if (m === null || t.timestamp > m) m = t.timestamp;
+  return m;
+}
+
 export function walletStats(wallet: string, trades: Trade[], nowSec: number): WalletStats {
   const { positions, realisations } = replay(trades);
   const windows = {} as Record<Window, WindowStats>;
@@ -87,7 +113,7 @@ export function walletStats(wallet: string, trades: Trade[], nowSec: number): Wa
     wallet,
     openPositions: [...positions.values()].filter((p) => p.tokenAmount > EPS),
     windows,
-    lastTradeAt: trades.length ? Math.max(...trades.map((t) => t.timestamp)) : null,
+    lastTradeAt: maxTimestamp(trades),
   };
 }
 

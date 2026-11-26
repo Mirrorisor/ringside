@@ -35,6 +35,10 @@ export interface HeliusSwapEvent {
   innerSwaps?: { programInfo?: { source?: string; account?: string; programName?: string; instructionName?: string } }[];
 }
 
+export interface HeliusTokenBalanceChange { userAccount?: string; tokenAccount?: string; mint?: string; rawTokenAmount?: HeliusRawTokenAmount }
+/** One entry per account key of the transaction, in message order (signers first). */
+export interface HeliusAccountData { account?: string; nativeBalanceChange?: number; tokenBalanceChanges?: HeliusTokenBalanceChange[] }
+
 export interface HeliusInstruction { programId?: string; accounts?: string[]; data?: string; innerInstructions?: HeliusInstruction[] }
 
 export interface HeliusEnhancedTransaction {
@@ -48,6 +52,7 @@ export interface HeliusEnhancedTransaction {
   description?: string;
   nativeTransfers?: HeliusNativeTransfer[];
   tokenTransfers?: HeliusTokenTransfer[];
+  accountData?: HeliusAccountData[];
   instructions?: HeliusInstruction[];
   events?: { swap?: HeliusSwapEvent | null; [k: string]: unknown };
   transactionError?: unknown;

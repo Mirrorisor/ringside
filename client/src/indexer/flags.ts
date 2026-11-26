@@ -28,7 +28,9 @@ const buys = (trades: Trade[]) => trades.filter((t) => t.side === "buy");
  */
 export function snipers(trades: Trade[], startSlot?: number, creator?: string, maxSlots = SNIPER_MAX_SLOTS): Sniper[] {
   if (trades.length === 0) return [];
-  const start = startSlot ?? Math.min(...trades.map((t) => t.slot));
+  // A loop, not Math.min(...spread): spreading 100k+ elements overflows the stack.
+  let start = startSlot ?? Infinity;
+  if (startSlot === undefined) for (const t of trades) if (t.slot < start) start = t.slot;
   const out = new Map<string, Sniper>();
   for (const t of buys(trades)) {
     const d = t.slot - start;
