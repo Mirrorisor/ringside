@@ -81,7 +81,7 @@ async function sweep() {
     const market = pda([Buffer.from("market"), ring.toBuffer()], PERPS);
     const curve = pda([Buffer.from("curve"), ring.toBuffer()], LAUNCH);
     await trySend("perps creator fees on $RING", new TransactionInstruction({ programId: PERPS, data: disc("claim_creator_fees"),
-      keys: [{ pubkey: treasury.publicKey, isSigner: true, isWritable: false }, w(VAULT), w(VAULT_USDC), w(market), w(usdc), r(TOKEN_PROGRAM_ID)] }));
+      keys: [{ pubkey: treasury.publicKey, isSigner: true, isWritable: false }, w(VAULT), w(VAULT_USDC), w(market), w(usdc), r(TOKEN_PROGRAM_ID), r(curve)] }));
     const before = await conn.getBalance(treasury.publicKey);
     const cix = new TransactionInstruction({ programId: LAUNCH, data: disc("claim_creator_fees"), keys: [w(treasury.publicKey, true), w(curve)] });
     if (await trySend("curve creator fees on $RING", cix)) {

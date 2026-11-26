@@ -658,6 +658,12 @@ pub mod ringside_perps {
     }
 
     pub fn claim_creator_fees(ctx: Context<ClaimCreator>) -> Result<()> {
+        // Same rule as the launch program's claim: locked until the curve completes
+        // or CREATOR_FEE_LOCK_SECONDS after launch.
+        let now = Clock::get()?.unix_timestamp;
+        let curve = &ctx.accounts.curve;
+        let unlock = curve.created_ts.checked_add(ringside_launch::CREATOR_FEE_LOCK_SECONDS).ok_or(ProgramError::ArithmeticOverflow)?;
+        require!(curve.complete || now >= unlock, PerpsError::CreatorFeesLocked);
         let amount = ctx.accounts.market.creator_fees;
         require!(amount > 0, PerpsError::ZeroAmount);
         ctx.accounts.market.creator_fees = 0;
@@ -1408,6 +1414,9 @@ pub struct ClaimCreator<'info> {
     #[account(mut, token::mint = vault.usdc_mint, token::authority = creator)]
     pub creator_usdc: Box<Account<'info, TokenAccount>>,
     pub token_program: Program<'info, Token>,
+    /// The market's launch curve; read for the creator-fee lock. Appended last.
+    #[account(address = market.curve, seeds = [ringside_launch::SEED_CURVE, curve.mint.as_ref()], bump = curve.bump, seeds::program = ringside_launch::ID)]
+    pub curve: Box<Account<'info, Curve>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1556,6 +1565,8 @@ pub enum PerpsError {
     MarketLimit,
     #[msg("Market can't be retired: it has open interest, its curve sold out, or it traded in the last 7 days")]
     NotRetirable,
+    #[msg("Creator fees are locked until the curve completes or 7 days after launch")]
+    CreatorFeesLocked,
 }
 
 #[cfg(test)]

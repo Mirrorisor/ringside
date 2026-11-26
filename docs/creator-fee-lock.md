@@ -31,11 +31,20 @@ for the launch claim, so a locked claim logs a failure rather than aborting.
 ## Audit notes
 - `complete` is set when the curve sells out, before `migrate`, so claims are
   allowed between sell-out and migration. Intended ("coin graduates").
-- Perps `claim_creator_fees` is a separate instruction and is NOT changed here. It pays
-  the creator's 10% share of perp trading fees at any time, including launch day, so
-  "no early payout" holds for curve fees only. It is not a bypass (wash-trading perps
-  costs the full fee to earn back 10%). Founder decision: leave it, or apply the same
-  rule in perps using the launch `Curve` it already reads.
+- Perps `claim_creator_fees` (the creator's 10% share of perp trading fees, paid in USDC)
+  now follows the same rule: `curve.complete` OR `now >= curve.created_ts +
+  ringside_launch::CREATOR_FEE_LOCK_SECONDS`, else `PerpsError::CreatorFeesLocked`
+  (appended last in the enum: index 25, code 6025, so no existing code shifts). The launch
+  constant is reused, not duplicated. `ClaimCreator` gains a read-only `curve` account as
+  its LAST field, constrained to `address = market.curve` plus the launch PDA seeds, so
+  raw-instruction callers only append one key (`client/scripts/treasury.ts` does). A
+  different token's curve is rejected by the address constraint. No stored account
+  changes (Market, Vault unchanged). Locked fees stay in `market.creator_fees` and are
+  claimable later. `target/idl/ringside_perps.json` must be regenerated with a full
+  `anchor build` on a machine that can fetch the nightly toolchain (it is not
+  hand-edited). Tests: `perps_creator_fees_locked_then_claimable_after_seven_days`,
+  `perps_creator_fees_claimable_right_after_graduation`,
+  `perps_claim_rejects_another_tokens_curve` in `tests/tests/flow.rs`.
 - Buying out your own curve unlocks fees early; that is the graduation case. Cost from
   zero at 100 bps total fees: about 88 SOL on mainnet (30 virtual SOL), about 1.5 SOL
   on devnet, and the tokens can only be sold into the new pool.

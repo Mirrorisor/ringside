@@ -942,3 +942,309 @@ async fn creator_fees_claimable_right_after_graduation() {
     let after = l.env.ctx.banks_client.get_balance(creator.pubkey()).await.unwrap();
     assert_eq!(after - before, owed);
 }
+
+// --- Perps creator fee lock -----------------------------------------------------
+
+struct PerpsFx {
+    vault: Pubkey,
+    vault_usdc: Pubkey,
+    market: Pubkey,
+    creator_usdc: Pubkey,
+}
+
+/// On top of `launch_only`: USDC mint, perps vault with LP liquidity, a market for
+/// the launched token, and one filled $8 long so the market has accrued creator fees.
+async fn perps_with_accrued_fees(l: &mut Launched) -> PerpsFx {
+    let authority = l.env.authority.insecure_clone();
+    let (keeper, lp, sponsor) = (Keypair::new(), Keypair::new(), Keypair::new());
+    for k in [keeper.pubkey(), lp.pubkey(), sponsor.pubkey()] {
+        l.env.fund(k, 10 * SOL).await;
+    }
+    let usdc = l.env.usdc_mint.insecure_clone();
+    let rent = l.env.ctx.banks_client.get_rent().await.unwrap();
+    let payer = l.env.ctx.payer.pubkey();
+    l.env
+        .send(
+            &[
+                system_instruction::create_account(&payer, &usdc.pubkey(), rent.minimum_balance(82), 82, &spl_token::ID),
+                spl_token::instruction::initialize_mint(&spl_token::ID, &usdc.pubkey(), &authority.pubkey(), None, 6).unwrap(),
+            ],
+            &[&usdc],
+        )
+        .await
+        .unwrap();
+    let (vault, _) = Pubkey::find_program_address(&[perps::SEED_VAULT], &perps::ID);
+    let (vault_usdc, _) = Pubkey::find_program_address(&[perps::SEED_VAULT_USDC], &perps::ID);
+    l.env
+        .send(
+            &[
+                Instruction {
+                    program_id: perps::ID,
+                    accounts: perps::accounts::InitializeVault {
+                        authority: authority.pubkey(),
+                        vault,
+                        usdc_mint: usdc.pubkey(),
+                        vault_usdc,
+                        token_program: spl_token::ID,
+                        system_program: system_program::ID,
+                    }
+                    .to_account_metas(None),
+                    data: perps::instruction::InitializeVault { price_authority: authority.pubkey() }.data(),
+                },
+                Instruction {
+                    program_id: perps::ID,
+                    accounts: perps::accounts::SetSolPrice { price_authority: authority.pubkey(), vault }.to_account_metas(None),
+                    data: perps::instruction::SetSolPrice { price_e6: 150 * USDC }.data(),
+                },
+            ],
+            &[&authority],
+        )
+        .await
+        .unwrap();
+    let lp_usdc = l.env.usdc_account(&lp.pubkey(), 10_000 * USDC).await;
+    let (lp_acc, _) = Pubkey::find_program_address(&[perps::SEED_LP, lp.pubkey().as_ref()], &perps::ID);
+    l.env
+        .send(
+            &[Instruction {
+                program_id: perps::ID,
+                accounts: perps::accounts::Liquidity {
+                    owner: lp.pubkey(),
+                    vault,
+                    vault_usdc,
+                    lp: lp_acc,
+                    owner_usdc: lp_usdc,
+                    token_program: spl_token::ID,
+                    system_program: system_program::ID,
+                }
+                .to_account_metas(None),
+                data: perps::instruction::DepositLiquidity { amount: 10_000 * USDC }.data(),
+            }],
+            &[&lp],
+        )
+        .await
+        .unwrap();
+    let curve = l.curve;
+    let (market, _) = Pubkey::find_program_address(&[perps::SEED_MARKET, l.mint.as_ref()], &perps::ID);
+    let (registry, _) = Pubkey::find_program_address(&[perps::SEED_REGISTRY], &perps::ID);
+    l.env
+        .send(
+            &[Instruction {
+                program_id: perps::ID,
+                accounts: perps::accounts::CreateMarket { payer: keeper.pubkey(), curve, market, registry, system_program: system_program::ID }
+                    .to_account_metas(None),
+                data: perps::instruction::CreateMarket {}.data(),
+            }],
+            &[&keeper],
+        )
+        .await
+        .unwrap();
+
+    // Trader opens a $8 long (inside the 20% per-account cap); the keeper fills it.
+    let trader = l.trader.insecure_clone();
+    let trader_usdc = l.env.usdc_account(&trader.pubkey(), 100 * USDC).await;
+    let keeper_usdc = l.env.usdc_account(&keeper.pubkey(), 0).await;
+    let (position, _) = Pubkey::find_program_address(
+        &[perps::SEED_POSITION, trader.pubkey().as_ref(), market.as_ref(), &[perps::SIDE_LONG]],
+        &perps::ID,
+    );
+    let (order, _) = Pubkey::find_program_address(
+        &[perps::SEED_ORDER, trader.pubkey().as_ref(), market.as_ref(), &[perps::SIDE_LONG]],
+        &perps::ID,
+    );
+    l.env
+        .send(
+            &[Instruction {
+                program_id: perps::ID,
+                accounts: perps::accounts::RequestOrder {
+                    owner: trader.pubkey(),
+                    payer: sponsor.pubkey(),
+                    vault,
+                    vault_usdc,
+                    market,
+                    position,
+                    order,
+                    owner_usdc: trader_usdc,
+                    token_program: spl_token::ID,
+                    system_program: system_program::ID,
+                }
+                .to_account_metas(None),
+                data: perps::instruction::RequestOrder {
+                    args: perps::OrderArgs { side: perps::SIDE_LONG, kind: perps::ORDER_INCREASE, collateral: 4_300_000, size_usd: 8 * USDC, acceptable_price_q64: 0 },
+                }
+                .data(),
+            }],
+            &[&trader, &sponsor],
+        )
+        .await
+        .unwrap();
+    l.env.warp(5).await;
+    l.env
+        .send(
+            &[Instruction {
+                program_id: perps::ID,
+                accounts: perps::accounts::ExecuteOrder {
+                    keeper: keeper.pubkey(),
+                    vault,
+                    vault_usdc,
+                    market,
+                    curve,
+                    rent_payer: sponsor.pubkey(),
+                    order,
+                    position,
+                    owner_usdc: trader_usdc,
+                    keeper_usdc,
+                    token_program: spl_token::ID,
+                }
+                .to_account_metas(None),
+                data: perps::instruction::ExecuteOrder {}.data(),
+            }],
+            &[&keeper],
+        )
+        .await
+        .unwrap();
+    let creator = l.creator.pubkey();
+    let creator_usdc = l.env.usdc_account(&creator, 0).await;
+    let m: perps::Market = l.env.get(market).await;
+    assert_eq!(m.creator_fees, 2_400, "creator gets 10% of the 24_000 fee on an $8 open at 0.30%");
+    PerpsFx { vault, vault_usdc, market, creator_usdc }
+}
+
+fn perps_claim_ix(creator: Pubkey, fx: &PerpsFx, curve: Pubkey) -> Instruction {
+    Instruction {
+        program_id: perps::ID,
+        accounts: perps::accounts::ClaimCreator {
+            creator,
+            vault: fx.vault,
+            vault_usdc: fx.vault_usdc,
+            market: fx.market,
+            creator_usdc: fx.creator_usdc,
+            token_program: spl_token::ID,
+            curve,
+        }
+        .to_account_metas(None),
+        data: perps::instruction::ClaimCreatorFees {}.data(),
+    }
+}
+
+#[tokio::test]
+async fn perps_creator_fees_locked_then_claimable_after_seven_days() {
+    let mut l = launch_only().await;
+    let (creator, curve) = (l.creator.insecure_clone(), l.curve);
+    let buy = (l.buy_ix)(5 * SOL);
+    let trader = l.trader.insecure_clone();
+    l.env.send(&[buy], &[&trader]).await.unwrap();
+    let fx = perps_with_accrued_fees(&mut l).await;
+    let c: launch::Curve = l.env.get(curve).await;
+    assert!(!c.complete);
+    let owed = l.env.get::<perps::Market>(fx.market).await.creator_fees;
+    assert!(owed > 0);
+    let locked = perps::PerpsError::CreatorFeesLocked as u32 + 6000;
+    let lock = launch::CREATOR_FEE_LOCK_SECONDS;
+
+    // (a) Right after launch: refused, nothing changes.
+    let vault_before: perps::Vault = l.env.get(fx.vault).await;
+    let e = l.env.send(&[perps_claim_ix(creator.pubkey(), &fx, curve)], &[&creator]).await.unwrap_err();
+    assert_eq!(custom_error(e), locked);
+    assert_eq!(l.env.get::<perps::Market>(fx.market).await.creator_fees, owed, "market.creator_fees unchanged");
+    assert_eq!(l.env.get::<perps::Vault>(fx.vault).await.reserved, vault_before.reserved);
+    assert_eq!(l.env.token_balance(fx.creator_usdc).await, 0);
+
+    // One second short of the unlock time: still refused.
+    l.env.warp(1).await;
+    let clock: solana_sdk::clock::Clock = l.env.ctx.banks_client.get_sysvar().await.unwrap();
+    l.env.advance_clock(c.created_ts + lock - 1 - clock.unix_timestamp).await;
+    let e = l.env.send(&[perps_claim_ix(creator.pubkey(), &fx, curve)], &[&creator]).await.unwrap_err();
+    assert_eq!(custom_error(e), locked);
+
+    // (b) At 7 days: pays exactly what is owed; vault.reserved drops by it.
+    l.env.warp(1).await;
+    let clock: solana_sdk::clock::Clock = l.env.ctx.banks_client.get_sysvar().await.unwrap();
+    l.env.advance_clock(c.created_ts + lock - clock.unix_timestamp).await;
+    let vault_usdc_before = l.env.token_balance(fx.vault_usdc).await;
+    l.env.send(&[perps_claim_ix(creator.pubkey(), &fx, curve)], &[&creator]).await.unwrap();
+    assert_eq!(l.env.token_balance(fx.creator_usdc).await, owed);
+    assert_eq!(vault_usdc_before - l.env.token_balance(fx.vault_usdc).await, owed);
+    assert_eq!(l.env.get::<perps::Vault>(fx.vault).await.reserved, vault_before.reserved - owed);
+    assert_eq!(l.env.get::<perps::Market>(fx.market).await.creator_fees, 0);
+}
+
+#[tokio::test]
+async fn perps_creator_fees_claimable_right_after_graduation() {
+    let mut l = launch_only().await;
+    let (creator, curve) = (l.creator.insecure_clone(), l.curve);
+    let buy = (l.buy_ix)(5 * SOL);
+    let trader = l.trader.insecure_clone();
+    l.env.send(&[buy], &[&trader]).await.unwrap();
+    let fx = perps_with_accrued_fees(&mut l).await;
+    let owed = l.env.get::<perps::Market>(fx.market).await.creator_fees;
+    let locked = perps::PerpsError::CreatorFeesLocked as u32 + 6000;
+    let e = l.env.send(&[perps_claim_ix(creator.pubkey(), &fx, curve)], &[&creator]).await.unwrap_err();
+    assert_eq!(custom_error(e), locked, "locked before the curve completes");
+
+    // (c) Sell the curve out: it completes well inside the 7 days.
+    let big = (l.buy_ix)(250 * SOL);
+    l.env.send(&[big], &[&trader]).await.unwrap();
+    let c: launch::Curve = l.env.get(curve).await;
+    assert!(c.complete);
+    let clock: solana_sdk::clock::Clock = l.env.ctx.banks_client.get_sysvar().await.unwrap();
+    assert!(clock.unix_timestamp < c.created_ts + launch::CREATOR_FEE_LOCK_SECONDS);
+    l.env.send(&[perps_claim_ix(creator.pubkey(), &fx, curve)], &[&creator]).await.unwrap();
+    assert_eq!(l.env.token_balance(fx.creator_usdc).await, owed);
+    assert_eq!(l.env.get::<perps::Market>(fx.market).await.creator_fees, 0);
+}
+
+#[tokio::test]
+async fn perps_claim_rejects_another_tokens_curve() {
+    let mut l = launch_only().await;
+    let (creator, curve) = (l.creator.insecure_clone(), l.curve);
+    let fx = perps_with_accrued_fees(&mut l).await;
+
+    // A second token whose curve is complete, so the lock would not apply to it.
+    let (global, _) = Pubkey::find_program_address(&[launch::SEED_GLOBAL], &launch::ID);
+    let mint2 = Keypair::new();
+    let m2 = mint2.pubkey();
+    let (curve2, _) = Pubkey::find_program_address(&[launch::SEED_CURVE, m2.as_ref()], &launch::ID);
+    let (dev_lock2, _) = Pubkey::find_program_address(&[launch::SEED_DEV_LOCK, m2.as_ref()], &launch::ID);
+    let curve_vault2 = get_associated_token_address(&curve2, &m2);
+    let (fee_recipient, insurance) = (l.env.fee_recipient, l.env.insurance);
+    l.env
+        .send(
+            &[Instruction {
+                program_id: launch::ID,
+                accounts: launch::accounts::CreateToken {
+                    creator: creator.pubkey(),
+                    global,
+                    mint: m2,
+                    curve: curve2,
+                    curve_token_vault: curve_vault2,
+                    dev_lock_vault: dev_lock2,
+                    fee_recipient,
+                    insurance_recipient: insurance,
+                    metadata: launch::metaplex::metadata_address(&m2),
+                    token_metadata_program: launch::metaplex::PROGRAM,
+                    token_program: spl_token::ID,
+                    associated_token_program: spl_associated_token_account::ID,
+                    system_program: system_program::ID,
+                }
+                .to_account_metas(None),
+                data: launch::instruction::CreateToken {
+                    args: launch::CreateTokenArgs { name: "Other".into(), symbol: "OTH".into(), uri: "https://example.com/o.json".into(), dev_buy_lamports: 0 },
+                }
+                .data(),
+            }],
+            &[&creator, &mint2],
+        )
+        .await
+        .unwrap();
+    // Age the clock past 7 days so the OTHER curve would satisfy the time rule too; only the
+    // address constraint can reject it.
+    l.env.advance_clock(launch::CREATOR_FEE_LOCK_SECONDS + 10).await;
+    l.env.warp(1).await;
+
+    let owed = l.env.get::<perps::Market>(fx.market).await.creator_fees;
+    let e = l.env.send(&[perps_claim_ix(creator.pubkey(), &fx, curve2)], &[&creator]).await.unwrap_err();
+    assert_eq!(custom_error(e), anchor_lang::error::ErrorCode::ConstraintAddress as u32);
+    assert_eq!(l.env.get::<perps::Market>(fx.market).await.creator_fees, owed);
+    // The right curve works at that point.
+    l.env.send(&[perps_claim_ix(creator.pubkey(), &fx, curve)], &[&creator]).await.unwrap();
+}
