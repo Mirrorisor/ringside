@@ -9,7 +9,7 @@
  * a fee-wallet outflow cap and a mint match.
  */
 import type { Address } from "@solana/kit";
-import { associatedTokenAddress, checkTransaction, instructionsOf, TX_PROGRAMS, DEFAULT_TX_POLICY, type TxCheck } from "./trade/jupiter.js";
+import { associatedTokenAddress, checkPlatformFee, checkTransaction, instructionsOf, TX_PROGRAMS, DEFAULT_TX_POLICY, type TxCheck } from "./trade/jupiter.js";
 
 export const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P" as Address;
 export const PUMPSWAP_PROGRAM = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA" as Address;
@@ -82,6 +82,13 @@ export interface BuiltCheckOpts {
   feeWallet?: string | null;
   /** Displayed fee; the user's transfer to the fee wallet may not exceed it. */
   feeLamports: number | null;
+  /**
+   * Our Jupiter /build fee token accounts (VITE_JUPITER_FEE_ACCOUNTS). When set, a Jupiter swap's platform fee
+   * slot must be empty or one of these; any other account is refused (`fee_account_mismatch`), and so is a swap
+   * layout we cannot read (`fee_account_unverified`). The fee itself is paid inside the swap in the input or
+   * output token, not as a SOL transfer, so it needs no allowance in the outflow cap.
+   */
+  feeAccounts?: string[] | null;
 }
 
 export interface BuiltCheck {
@@ -112,6 +119,7 @@ export async function checkBuiltTransaction(wire: string, o: BuiltCheckOpts): Pr
   if (used.has(PUMP_PROGRAM) || used.has(PUMPSWAP_PROGRAM)) venues.push("pumpfun");
   if (used.has(METEORA_DBC_PROGRAM)) venues.push("meteora");
   if (!venues.includes(o.venue)) throw new AppCheckError("venue_mismatch", `Refusing to sign: the transaction does not use ${o.venue === "jupiter" ? "Jupiter" : o.venue === "meteora" ? "Meteora" : "Pump.fun"}, which this copy claims.`);
+  if (o.venue === "jupiter" && o.feeAccounts) checkPlatformFee(ixs, { ours: o.feeAccounts as Address[] });
   if (venues.length > 1) throw new AppCheckError("venue_mismatch", "Refusing to sign: the transaction mixes venues.");
 
   // Mint: the intent's mint (or the user's token account for it) must be named by the transaction.

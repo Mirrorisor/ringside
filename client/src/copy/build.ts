@@ -7,7 +7,7 @@
  * Spot venue: the Pump.fun layer while the coin is still on its bonding
  * curve, otherwise Jupiter (graduated coins, non-Pump coins). Our fee is
  * whatever those layers include: Pump.fun's SOL transfer to the fee wallet,
- * Jupiter's referral fee.
+ * Jupiter's /swap/v2/build platform fee (paid to our own fee token account).
  *
  * Perps: built with the shared client in ../perps (the same order builder the
  * app uses), behind RINGSIDE_COPY_PERPS=1 and on devnet only (an RPC URL
@@ -21,7 +21,7 @@ import {
   appendTransactionMessageInstructions, compileTransaction, createTransactionMessage, getBase64EncodedWireTransaction,
   pipe, setTransactionMessageFeePayer, AccountRole, setTransactionMessageLifetimeUsingBlockhash, address, type Address, type Instruction,
 } from "@solana/kit";
-import { checkTransaction, type OrderRequest, type SwapOrder, WSOL_MINT } from "../trade/jupiter.js";
+import { type BuildSwapFn, WSOL_MINT } from "../trade/jupiter.js";
 import * as meteora from "../trade/meteora.js";
 import { buildBuy, buildSell, PumpTradeError, type BuiltTrade, type BuyQuote, type PumpTradeConfig, type SellQuote } from "../trade/pumpfun.js";
 import { PublicKey } from "@solana/web3.js";
@@ -61,9 +61,9 @@ export interface MeteoraPort {
   buy(p: { mint: string; user: string; solIn: bigint; slippageBps: number }): Promise<meteora.BuiltTrade<meteora.BuyQuote> | null>;
   sell(p: { mint: string; user: string; tokensIn: bigint; slippageBps: number }): Promise<meteora.BuiltTrade<meteora.SellQuote> | null>;
 }
-/** Jupiter as a port: an order with an unsigned transaction for the taker. */
+/** Jupiter as a port: `buildSwap` (GET /swap/v2/build compiled to an unsigned, already-checked transaction). */
 export interface JupiterPort {
-  order(req: OrderRequest): Promise<SwapOrder>;
+  build: BuildSwapFn;
 }
 export interface ChainPort {
   latestBlockhash(): Promise<{ blockhash: string; lastValidBlockHeight: bigint }>;
@@ -255,22 +255,19 @@ export async function buildIntent(deps: BuildDeps, intentId: string, follower: s
 }
 
 async function viaJupiter(deps: BuildDeps, i: { side: string; slippageBps: number }, follower: string, payer: string, inputMint: string, outputMint: string, amount: bigint) {
-  const order = await deps.jupiter.order({
+  // buildSwap has already compiled the transaction with our fee payer and run checkTransaction and checkPlatformFee on it.
+  const built = await deps.jupiter.build({
     inputMint, outputMint, amount, taker: follower, slippageBps: i.slippageBps,
     payer: payer !== follower ? payer : undefined,
   });
-  if (!order.transaction) throw new BuildError("venue_unavailable", "No route.");
-  if (order.inputMint !== inputMint || order.outputMint !== outputMint || order.inAmount !== amount.toString()) throw new BuildError("build_failed", "Order mismatch.");
-  // Refuse anything that is not a plain swap for this follower before they are asked to sign.
-  await checkTransaction(order.transaction, { user: follower as Address, feePayers: [payer as Address] });
+  if (!built.transaction) throw new BuildError("venue_unavailable", "No route.");
+  if (built.inputMint !== inputMint || built.outputMint !== outputMint || built.inAmount !== amount.toString()) throw new BuildError("build_failed", "Swap mismatch.");
   const buy = i.side === "buy";
-  const out = BigInt(order.outAmount);
-  const sol = buy ? amount : out;
-  const feeLamports = order.feeBps && (buy || outputMint === WSOL_MINT) ? Number((sol * BigInt(order.feeBps)) / 10_000n) : 0;
+  const sol = buy ? amount : BigInt(built.outAmount);
   return {
-    transaction: order.transaction, feeLamports, venue: "jupiter" as const,
-    lamports: Number(sol), tokens: (buy ? out : amount).toString(),
-    expectedOut: order.outAmount, minOut: order.otherAmountThreshold, slippageBps: order.slippageBps,
+    transaction: built.transaction, feeLamports: built.feeLamports, venue: "jupiter" as const,
+    lamports: Number(sol), tokens: (buy ? built.outAmount : amount.toString()),
+    expectedOut: built.outAmount, minOut: built.otherAmountThreshold, slippageBps: built.slippageBps,
   };
 }
 

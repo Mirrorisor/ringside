@@ -175,6 +175,7 @@ Run: **not yet runnable on its own.** `main.ts` exports `startCopyService(social
 | `COPY_TRUST_PROXY` | off | no | `1` keys clients by the last `X-Forwarded-For` entry |
 | `SPONSOR_ADDRESS` | unset | no | Gas sponsor address, used as fee payer when set |
 | `JUPITER_API_KEY` | none | needed for Jupiter routes | See the Jupiter layer |
+| `JUPITER_FEE_ACCOUNTS` | none | no (no fee without it) | Our fee token accounts by mint, JSON `{"<mint>":"<account>"}` or `mint:account,...`; at least wSOL and USDC. A swap whose pair has none is built with no platform fee |
 | `RINGSIDE_COPY_PERPS` | off | no | `1` turns on perp copying (devnet only, see above) |
 | `RINGSIDE_PERPS_IDL` | none | with perps | Path to `target/idl/ringside_perps.json` |
 | `COPY_MIN_LEADER_LAMPORTS` | `50000000` | no | Smallest leader buy that is copied (0.05 SOL) |
@@ -185,14 +186,15 @@ Run: **not yet runnable on its own.** `main.ts` exports `startCopyService(social
 
 Libraries, not processes: each builds quotes and unsigned instructions for the user to sign and hands them to the gas sponsor or the user's wallet. None signs with a server key. Run their tests with `cd client && npm test` (`jupiter.test.mjs`, `pumpfun.test.mjs`, `meteora.test.mjs`).
 
-- **Jupiter** (`jupiter.ts`): Swap V2 order and execute, Trigger V2 (price and DCA orders), Tokens V2 and Price V3 against `https://api.jup.ag`. Every returned transaction is decoded and refused unless the fee payer, programs, transfers and fees are expected (`checkTransaction`). A referral fee of 50 to 255 bps is added when an account is configured.
+- **Jupiter** (`jupiter.ts`): Swap V2 `/build` (copy trading) and `/order` plus execute, Trigger V2 (price and DCA orders), Tokens V2 and Price V3 against `https://api.jup.ag`. Every returned transaction is decoded and refused unless the fee payer, programs, transfers and fees are expected (`checkTransaction`). Copy trading uses `buildSwap` (`GET /swap/v2/build`): Jupiter takes no fee there, ours is `platformFeeBps` (default 50, allowed 0 to 255) paid to a token account we own for a mint of the pair, chosen from `feeAccounts` (output mint first); no Referral Program account is needed. `buildSwap` compiles the returned instructions into an unsigned v0 transaction with our fee payer and blockhash, resolves lookup tables through our own RPC, and refuses it unless it passes `checkTransaction` and the platform fee goes only to our configured account (`checkPlatformFee`). `/order` with a referral fee (50 to 255 bps, Jupiter keeps 20%, no RFQ) is still supported but unused for copy trading.
 - **Pump.fun** (`pumpfun.ts`): buys and sells on a live bonding curve, or on the coin's PumpSwap pool once it has graduated, with a 50 bps SOL fee to Ringside by default and 100 bps default slippage. SOL-quoted coins only.
 - **Meteora** (`meteora.ts`): buys and sells on a Dynamic Bonding Curve (Bags, Believe, Jupiter Studio launches) using the SDK's offline quote, with the same fee model. Graduated pools, non-SOL quotes and transfer-hook mints are refused.
 
 | Variable | Default | Required | Purpose |
 | --- | --- | --- | --- |
 | `JUPITER_API_KEY` | none | yes, for any Jupiter call (or pass `apiKey`) | Sent as `x-api-key`; without one calls fail with `no_api_key` |
-| `JUPITER_REFERRAL_ACCOUNT` | none | no | Referral account for fees (or pass `referralAccount`; `null` turns fees off) |
+| `JUPITER_FEE_ACCOUNTS` | none | no | `buildSwap` fee accounts by mint, JSON or `mint:account,...` (or pass `feeAccounts`); none for the pair means no fee |
+| `JUPITER_REFERRAL_ACCOUNT` | none | no | `/order` only (`getOrder`), not used for copy trading: referral account (or pass `referralAccount`; `null` turns fees off) |
 
 Pump.fun and Meteora read no environment variables: the RPC, fee wallet, `feeBps` and slippage are passed in by the caller (the copy service passes `COPY_RPC_URL` and `COPY_FEE_WALLET`).
 

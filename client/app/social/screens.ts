@@ -2,7 +2,7 @@ import { ApiError, copy, indexer, social, sponsorSend, streamNotifications } fro
 import { b64, getToken, signIn, signedIn, unb64, type Signer } from "./auth";
 import { ago, avatar, clear, fmt, h, shortAddr, sol, signed } from "./dom";
 import { AppCheckError, checkBuiltTransaction, describeBuilt, type BuiltView } from "../../src/appcheck";
-import { FEE_WALLET, SPONSOR, SPONSOR_ADDRESS } from "./config";
+import { FEE_WALLET, JUPITER_FEE_ACCOUNTS, SPONSOR, SPONSOR_ADDRESS } from "./config";
 import type { CopyIntent, CopySettings, LeaderRow, RiskFlag, TokenFlags, Trade, Window } from "./types";
 
 export interface Env { signer: Signer; mainnet: boolean; explorer: (sig: string) => string }
@@ -356,7 +356,7 @@ export function mountSocial(root: HTMLElement, tabs: HTMLElement, env: Env, onTa
         const claimedFee = view.feeLamports;
         let checked;
         try {
-          checked = await checkBuiltTransaction(built.transaction, { user: env.signer.address(), sponsor: await expectedSponsor(), mint: i.mint, venue: i.venue, feeWallet: FEE_WALLET || null, feeLamports: claimedFee });
+          checked = await checkBuiltTransaction(built.transaction, { user: env.signer.address(), sponsor: await expectedSponsor(), mint: i.mint, venue: i.venue, feeWallet: FEE_WALLET || null, feeLamports: claimedFee, feeAccounts: JUPITER_FEE_ACCOUNTS.length ? JUPITER_FEE_ACCOUNTS : null });
         } catch (e) {
           show(null); out.className = "err";
           out.textContent = e instanceof AppCheckError ? e.message : `Refusing to sign: this transaction failed the safety check (${errMsg(e)}).`;

@@ -117,3 +117,38 @@ test("describeBuilt: reads the build response, derives the minimum, reports what
   const bare = describeBuilt("buy", { transaction: "x" }, undefined);
   assert.deepEqual(bare.unknown.sort(), ["Ringside fee", "expected output", "minimum after slippage", "venue"]);
 });
+
+// ---- Jupiter /swap/v2/build transactions -----------------------------------------------------
+
+/** sharedAccountsRoute-shaped swap: user at 2, the user's token account at 6, `feeSlot` at 9 (null = None = the program id). */
+const buildSwapIx = (user, ata, feeSlot, filler) => {
+  const a = Array.from({ length: 13 }, () => ({ address: filler, role: RW }));
+  a[2] = { address: user, role: RS };
+  a[6] = { address: ata, role: RW };
+  a[9] = feeSlot === null ? { address: TX_PROGRAMS.jupiterSwap, role: RO } : { address: feeSlot, role: RW };
+  return { programAddress: TX_PROGRAMS.jupiterSwap, accounts: a, data: Uint8Array.from([193, 32, 155, 51, 65, 214, 156, 129, 0, 0, 0, 0]) };
+};
+
+test("a Jupiter /build swap with the platform fee to our fee token account is accepted: no SOL transfer, no outflow", async () => {
+  const [c, fee, filler] = [await ctx(), (await generateKeyPairSigner()).address, (await generateKeyPairSigner()).address];
+  const w = wire(c.sponsor, [buildSwapIx(c.user, c.ata, fee, filler)]);
+  const opts = { user: c.user, sponsor: c.sponsor, mint: MINT, venue: "jupiter", feeWallet: c.feeWallet, feeLamports: 500_000, feeAccounts: [fee] };
+  const r = await checkBuiltTransaction(w, opts);
+  assert.deepEqual(r.venues, ["jupiter"]);
+  assert.equal(r.feeLamportsInTx, 0n); // the fee is taken inside the swap, in the input or output token
+  // no fee at all (empty slot) is fine too
+  await checkBuiltTransaction(wire(c.sponsor, [buildSwapIx(c.user, c.ata, null, filler)]), opts);
+});
+
+test("a Jupiter /build swap that pays the fee to anyone else, or that we cannot read, is refused", async () => {
+  const [c, fee, filler] = [await ctx(), (await generateKeyPairSigner()).address, (await generateKeyPairSigner()).address];
+  const opts = { user: c.user, sponsor: c.sponsor, mint: MINT, venue: "jupiter", feeWallet: c.feeWallet, feeLamports: 500_000, feeAccounts: [fee] };
+  await assert.rejects(checkBuiltTransaction(wire(c.sponsor, [buildSwapIx(c.user, c.ata, c.attacker, filler)]), opts), { code: "fee_account_mismatch" });
+  // an unknown swap layout cannot be verified
+  const odd = { ...buildSwapIx(c.user, c.ata, fee, filler), data: Uint8Array.from([1, 2, 3, 4, 5, 6, 7, 8]) };
+  await assert.rejects(checkBuiltTransaction(wire(c.sponsor, [odd]), opts), { code: "fee_account_unverified" });
+  // the SOL rules still apply: a stranger transfer next to a good swap is refused
+  await assert.rejects(checkBuiltTransaction(wire(c.sponsor, [buildSwapIx(c.user, c.ata, fee, filler), transfer(c.user, c.attacker, 5_000_000_000)]), opts), { code: "user_transfer" });
+  // without configured fee accounts the app does not judge the fee slot (older config)
+  await checkBuiltTransaction(wire(c.sponsor, [buildSwapIx(c.user, c.ata, c.attacker, filler)]), { ...opts, feeAccounts: null });
+});

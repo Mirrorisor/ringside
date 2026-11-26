@@ -7,6 +7,7 @@ import { confirmIntent, confirmPending } from "../dist/copy/confirm.js";
 import { buildIntent, compileUnsigned, BuildError } from "../dist/copy/build.js";
 import { createCopyServer, parseTrade } from "../dist/copy/server.js";
 import { cappedLeverage, tierMaxLeverage, TIER_MAX_LEVERAGE } from "../dist/copy/perps.js";
+import { Jupiter } from "../dist/trade/jupiter.js";
 import { createSessionToken, hmacSessionAuth } from "../dist/session.js";
 
 const LEADER = "22S3bVxfkoJB5L5EhFo1Hp3T9EtX1qLG4dP9UDcRQN6B";
@@ -172,9 +173,10 @@ const pumpFake = (venue = "curve", tokensOut = 100_000_000n) => ({
 });
 const jupFake = (follower) => ({
   calls: [],
-  async order(req) {
+  async build(req) {
     this.calls.push(req);
-    return { inputMint: req.inputMint, outputMint: req.outputMint, inAmount: String(req.amount), outAmount: "100000000", feeBps: 50, slippageBps: 100, requestId: "r",
+    return { inputMint: req.inputMint, outputMint: req.outputMint, inAmount: String(req.amount), outAmount: "100000000", otherAmountThreshold: "99000000",
+      feeLamports: Math.floor(Number(req.amount) * 50 / 10_000), platformFee: { feeBps: 50, feeAccount: "x", feeMint: req.inputMint }, slippageBps: 100,
       transaction: compileUnsigned(req.payer ?? follower, [cuLimit], BLOCKHASH) };
   },
 });
@@ -208,12 +210,6 @@ test("build: graduated coins (AMM) and non-Pump coins go through Jupiter, with t
     assert.equal(b.feeLamports, Math.floor((0.1 * SOL * 50) / 10_000));
     assert.equal(r.store.get(i.id).tokens, "100000000");
   }
-  const r = rig();
-  const i = await one(r);
-  const SPONSOR = "6fD1gQhJXSmhFniSDmtrxK3Mrfqtyg1ox7tESzyvcq1r";
-  // the fake gives the sponsor as fee payer, but the follower is not a signer: checkTransaction must refuse
-  await assert.rejects(buildIntent({ store: r.store, pump: pumpFake("amm"), jupiter: jupFake(ALICE), chain, sponsor: SPONSOR }, i.id, ALICE), (e) => e instanceof BuildError && e.code === "build_failed");
-  assert.equal(r.store.get(i.id).status, "pending", "a refused build leaves the intent pending");
 });
 
 test("build: a perp intent without perps build deps says so with a code (see perps.test.mjs for the real build)", async () => {
@@ -685,16 +681,16 @@ test("build response carries expectedOut, minOut and slippageBps, consistent for
   check(b); assert.equal(b.expectedOut, "100000123"); assert.equal(b.expectedOut, r.store.get(i.id).tokens);
   // Jupiter buy: outAmount and otherAmountThreshold
   r = rig(); i = await one(r);
-  const jb = jupFake(ALICE); const orig = jb.order.bind(jb);
-  jb.order = async (q) => ({ ...(await orig(q)), otherAmountThreshold: "99000000" });
+  const jb = jupFake(ALICE); const orig = jb.build.bind(jb);
+  jb.build = async (q) => ({ ...(await orig(q)), otherAmountThreshold: "99000000" });
   b = await buildIntent(deps(r, { pump: pumpFake("amm"), jupiter: jb }), i.id, ALICE);
   check(b); assert.equal(b.venue, "jupiter"); assert.equal(b.expectedOut, "100000000"); assert.equal(b.minOut, "99000000");
   // sells: lamports out
   for (const venue of ["pumpfun", "jupiter"]) {
     r = rig(); await copyBuy(r, 1, 0.1 * SOL, 1000);
     const s = await one(r, trade({ signature: SIG(2), side: "sell", quoteAmount: 1 }));
-    const j = jupFake(ALICE); const o2 = j.order.bind(j);
-    j.order = async (q) => ({ ...(await o2(q)), otherAmountThreshold: "4900" });
+    const j = jupFake(ALICE); const o2 = j.build.bind(j);
+    j.build = async (q) => ({ ...(await o2(q)), otherAmountThreshold: "4900" });
     const sb = await buildIntent(deps(r, venue === "pumpfun" ? { jupiter: j } : { pump: pumpFake("amm"), jupiter: j }), s.id, ALICE);
     check(sb); assert.equal(sb.venue, venue);
     if (venue === "pumpfun") assert.equal(sb.expectedOut, String(sb.lamports)); else assert.equal(sb.minOut, "4900");
@@ -736,4 +732,54 @@ test("build: a coin on a Meteora launch curve goes through Meteora; no Meteora c
     assert.equal(b.venue, "pumpfun");
     assert.equal(met.calls.length, 0);
   }
+});
+
+// ---- copy build through Jupiter /swap/v2/build (real Jupiter client, fake fetch) ------------------
+
+test("build: a graduated-coin copy goes through /swap/v2/build with our platform fee, sponsor as fee payer", async () => {
+  const WSOL = "So11111111111111111111111111111111111111112";
+  const JUP = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
+  const SPONSOR = "6fD1gQhJXSmhFniSDmtrxK3Mrfqtyg1ox7tESzyvcq1r";
+  const FEE_ACC = MINT2; // any valid address stands in for our wSOL token account
+  const run = async (feeSlot) => {
+    const paths = [];
+    const fetchFake = async (url) => {
+      const u = new URL(url);
+      paths.push([u.pathname, Object.fromEntries(u.searchParams)]);
+      const q = Object.fromEntries(u.searchParams);
+      const accounts = Array.from({ length: 13 }, () => ({ pubkey: MINT, isWritable: true, isSigner: false }));
+      accounts[2] = { pubkey: ALICE, isWritable: false, isSigner: true };
+      accounts[9] = { pubkey: feeSlot(q), isWritable: true, isSigner: false };
+      const swap = { programId: JUP, accounts, data: Buffer.from([193, 32, 155, 51, 65, 214, 156, 129, 0]).toString("base64") };
+      return new Response(JSON.stringify({
+        inputMint: q.inputMint, outputMint: q.outputMint, inAmount: q.amount, outAmount: "123456789", otherAmountThreshold: "122000000", slippageBps: Number(q.slippageBps),
+        computeBudgetInstructions: [], setupInstructions: [], swapInstruction: swap, cleanupInstruction: null, otherInstructions: [], tipInstruction: null,
+        addressesByLookupTableAddress: {}, transactionVersion: 0,
+      }), { status: 200 });
+    };
+    const jup = new Jupiter({ apiKey: "k", fetch: fetchFake, feeAccounts: { [WSOL]: FEE_ACC }, latestBlockhash: async () => BLOCKHASH });
+    const r = rig();
+    const i = await one(r);
+    return { paths, r, i, p: () => buildIntent({ store: r.store, pump: { buy: async () => null, sell: async () => null }, jupiter: { build: (q) => jup.buildSwap(q) }, chain, sponsor: SPONSOR, now: () => r.clock.t }, i.id, ALICE) };
+  };
+  // good: the fee slot is our account
+  let t = await run((q) => q.feeAccount);
+  const b = await t.p();
+  assert.deepEqual(t.paths.map((x) => x[0]), ["/swap/v2/build"]);
+  assert.equal(t.paths[0][1].inputMint, WSOL);
+  assert.equal(t.paths[0][1].taker, ALICE);
+  assert.equal(t.paths[0][1].payer, SPONSOR);
+  assert.equal(t.paths[0][1].platformFeeBps, "50");
+  assert.equal(t.paths[0][1].feeAccount, FEE_ACC);
+  assert.equal(b.venue, "jupiter");
+  assert.equal(b.expectedOut, "123456789");
+  assert.equal(b.minOut, "122000000");
+  assert.equal(b.slippageBps, 100);
+  assert.equal(b.feeLamports, Math.floor((0.1 * SOL * 50) / 10_000));
+  assert.equal(t.r.store.get(t.i.id).tokens, "123456789");
+  assert.ok(Buffer.from(b.transaction, "base64").length > 64);
+  // bad: the API sends the fee to a different account: the intent is not built
+  t = await run(() => MINT);
+  await assert.rejects(t.p(), (e) => e instanceof BuildError && e.code === "build_failed");
+  assert.equal(t.r.store.get(t.i.id).status, "pending");
 });

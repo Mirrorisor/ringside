@@ -529,3 +529,174 @@ test("baseUrl is pinned to api.jup.ag unless opted out, and must be https", asyn
   await new Jupiter({ apiKey: KEY, fetch: f, baseUrl: "https://jup-proxy.example", allowCustomBaseUrl: true }).getPrices([SOL]);
   assert.equal(f.calls[0].url.origin, "https://jup-proxy.example");
 });
+
+// ---------------------------------------------------------------------------
+// /swap/v2/build with a platform fee
+// ---------------------------------------------------------------------------
+import { parseFeeAccounts, checkPlatformFee, instructionsOf } from "../dist/trade/jupiter.js";
+
+const DISC = { route: [229, 23, 203, 151, 122, 227, 173, 42], shared: [193, 32, 155, 51, 65, 214, 156, 129], ledger: [150, 86, 71, 116, 167, 93, 14, 104] };
+const FEE_SLOT = { route: 6, shared: 9, ledger: 6 };
+const b64 = (a) => Buffer.from(a).toString("base64");
+const BH = { blockhash: "EETubP5AKHgjPAhzPAFcb8BAY1hMH639CWCFTqi3hq1k", lastValidBlockHeight: 777n };
+const ixJson = (programId, accounts, data) => ({ programId, accounts, data: b64(data) });
+const acct = (pubkey, isWritable = true, isSigner = false) => ({ pubkey, isWritable, isSigner });
+
+/** A Jupiter swap instruction in the route / sharedAccountsRoute layout; `feeSlot` fills the platformFeeAccount position (null = the program id = None). */
+function swapJson(taker, filler, feeSlot, kind = "shared") {
+  const accounts = Array.from({ length: 13 }, (_, i) => acct(filler, true, false));
+  accounts[kind === "shared" ? 2 : 1] = acct(taker, false, true);
+  accounts[FEE_SLOT[kind]] = acct(feeSlot ?? PROGRAM, feeSlot !== null, false);
+  return ixJson(PROGRAM, accounts, [...DISC[kind], 0, 0, 0, 0]);
+}
+const priceIx = ixJson(TX_PROGRAMS.computeBudget, [], [3, 100, 0, 0, 0, 0, 0, 0, 0]);
+
+function buildBody(req, swap, extra = {}) {
+  return {
+    inputMint: req.inputMint, outputMint: req.outputMint, inAmount: req.amount, outAmount: "150000000", otherAmountThreshold: "149250000",
+    swapMode: "ExactIn", slippageBps: Number(req.slippageBps ?? 50), priceImpactPct: "0.001", routePlan: [],
+    computeBudgetInstructions: [priceIx], setupInstructions: [], swapInstruction: swap, cleanupInstruction: null, otherInstructions: [],
+    tipInstruction: null, addressesByLookupTableAddress: {}, transactionVersion: 0, ...extra,
+  };
+}
+
+async function buildSetup(feeAccounts, { respond, ...opts } = {}) {
+  const [taker, sponsor, feeSol, feeUsdc, attacker, filler] = await Promise.all(Array.from({ length: 6 }, () => generateKeyPairSigner()));
+  const accounts = feeAccounts === undefined ? { [SOL]: feeSol.address, [USDC]: feeUsdc.address } : feeAccounts(feeSol.address, feeUsdc.address);
+  const q = {};
+  const f = fakeFetch({
+    "GET /swap/v2/build": (u) => {
+      const req = Object.fromEntries(u.searchParams);
+      q.last = req;
+      const swap = swapJson(taker.address, filler.address, respond ? respond(req, { attacker: attacker.address, feeSol: feeSol.address, feeUsdc: feeUsdc.address }) : (req.feeAccount ?? null));
+      return [200, buildBody(req, swap)];
+    },
+  });
+  const jup = new Jupiter({ apiKey: KEY, fetch: f, feeAccounts: accounts, latestBlockhash: async () => BH, ...opts });
+  return { jup, f, q, taker: taker.address, sponsor: sponsor.address, feeSol: feeSol.address, feeUsdc: feeUsdc.address, attacker: attacker.address, filler: filler.address };
+}
+
+test("buildSwap: query, response mapping and an unsigned v0 transaction with our fee payer and blockhash", async () => {
+  const c = await buildSetup();
+  const out = await c.jup.buildSwap({ inputMint: SOL, outputMint: USDC, amount: 1_000_000_000n, taker: c.taker, payer: c.sponsor, slippageBps: 100 });
+  assert.equal(c.f.calls.length, 1);
+  assert.equal(c.f.calls[0].key, "GET /swap/v2/build");
+  assert.equal(c.f.calls[0].headers["x-api-key"], KEY);
+  assert.deepEqual(c.q.last, { inputMint: SOL, outputMint: USDC, amount: "1000000000", taker: c.taker, slippageBps: "100", payer: c.sponsor, platformFeeBps: "50", feeAccount: c.feeUsdc, transactionVersion: "0" });
+  assert.equal(out.outAmount, "150000000");
+  assert.equal(out.otherAmountThreshold, "149250000");
+  assert.equal(out.slippageBps, 100);
+  assert.deepEqual(out.platformFee, { feeBps: 50, feeAccount: c.feeUsdc, feeMint: USDC });
+  assert.equal(out.feeLamports, 5_000_000); // wSOL side 1 SOL x 50 bps
+  assert.equal(out.lastValidBlockHeight, 777n);
+  const ins = inspectTransaction(out.transaction);
+  assert.equal(ins.version, 0);
+  assert.equal(ins.feePayer, c.sponsor);
+  assert.ok(ins.requiredSigners.includes(c.taker));
+  assert.equal(signedBy(out.transaction, c.taker), false); // unsigned: signature slots are empty
+  const { ixs } = instructionsOf(out.transaction);
+  assert.equal(ixs.map((i) => i.program).join(), [TX_PROGRAMS.computeBudget, PROGRAM].join());
+  // the taker pays when there is no sponsor, and no payer param is sent
+  const o2 = await c.jup.buildSwap({ inputMint: SOL, outputMint: USDC, amount: "1000000000", taker: c.taker });
+  assert.equal(inspectTransaction(o2.transaction).feePayer, c.taker);
+  assert.equal(c.q.last.payer, undefined);
+});
+
+test("buildSwap: fee account selection prefers the output mint, falls back to the input mint, per-request override works", async () => {
+  let c = await buildSetup();
+  let o = await c.jup.buildSwap({ inputMint: USDC, outputMint: SOL, amount: 5_000_000, taker: c.taker });
+  assert.equal(o.platformFee.feeAccount, c.feeSol); // output wSOL first
+  assert.equal(o.feeLamports, Math.floor(150_000_000 * 50 / 10_000)); // wSOL side is the quoted output
+  c = await buildSetup((_s, u) => ({ [USDC]: u })); // only USDC configured
+  o = await c.jup.buildSwap({ inputMint: SOL, outputMint: "AbYGhAcF86iLQpQQynmZPZAyMejskVFowy2P2LBktuaH", amount: 1000, taker: c.taker });
+  assert.equal(o.platformFee, null); // pair has neither wSOL nor USDC configured
+  o = await c.jup.buildSwap({ inputMint: USDC, outputMint: "AbYGhAcF86iLQpQQynmZPZAyMejskVFowy2P2LBktuaH", amount: 1000, taker: c.taker, platformFeeBps: 100 });
+  assert.equal(o.platformFee.feeAccount, c.feeUsdc); // input-mint fallback
+  assert.equal(c.q.last.platformFeeBps, "100");
+  assert.equal(o.feeLamports, 0); // no wSOL in the pair
+});
+
+test("buildSwap: no fee account for either pair mint builds with no platform fee and feeLamports 0", async () => {
+  const c = await buildSetup(() => ({}));
+  const o = await c.jup.buildSwap({ inputMint: SOL, outputMint: USDC, amount: 1_000_000_000n, taker: c.taker });
+  assert.equal(o.platformFee, null);
+  assert.equal(o.feeLamports, 0);
+  assert.equal(c.q.last.platformFeeBps, undefined);
+  assert.equal(c.q.last.feeAccount, undefined);
+  // fee 0 bps is the same: nothing is sent
+  const d = await buildSetup();
+  const z = await d.jup.buildSwap({ inputMint: SOL, outputMint: USDC, amount: 1000, taker: d.taker, platformFeeBps: 0 });
+  assert.equal(z.platformFee, null);
+  assert.equal(d.q.last.feeAccount, undefined);
+});
+
+test("buildSwap: platform fee must be an integer 0 to 255; default is 50", async () => {
+  const c = await buildSetup();
+  for (const bad of [-1, 256, 50.5, NaN]) {
+    await assert.rejects(c.jup.buildSwap({ inputMint: SOL, outputMint: USDC, amount: 1000, taker: c.taker, platformFeeBps: bad }), { code: "platform_fee" });
+    assert.throws(() => new Jupiter({ apiKey: KEY, platformFeeBps: bad }), { code: "platform_fee" });
+  }
+  assert.equal(c.f.calls.length, 0);
+  await c.jup.buildSwap({ inputMint: SOL, outputMint: USDC, amount: 1000, taker: c.taker, platformFeeBps: 255 });
+  assert.equal(c.q.last.platformFeeBps, "255");
+  await c.jup.buildSwap({ inputMint: SOL, outputMint: USDC, amount: 1000, taker: c.taker });
+  assert.equal(c.q.last.platformFeeBps, "50");
+});
+
+test("buildSwap: refuses a response that routes the fee anywhere but our configured account", async () => {
+  const run = async (respond, opts = {}) => {
+    const c = await buildSetup(opts.accounts, { respond });
+    return { c, p: c.jup.buildSwap({ inputMint: SOL, outputMint: USDC, amount: 1000, taker: c.taker }) };
+  };
+  // fee slot holds the attacker's account instead of ours
+  let { p } = await run((_q, a) => a.attacker);
+  await assert.rejects(p, { code: "fee_account_mismatch" });
+  // fee slot holds our wSOL account while we asked for the USDC one
+  ({ p } = await run((_q, a) => a.feeSol));
+  await assert.rejects(p, { code: "fee_account_mismatch" });
+  // fee requested but the response drops the fee (slot empty)
+  ({ p } = await run(() => null));
+  await assert.rejects(p, { code: "fee_account_mismatch" });
+  // no fee requested (no account configured) but the response takes one anyway
+  ({ p } = await run((_q, a) => a.attacker, { accounts: () => ({}) }));
+  await assert.rejects(p, { code: "fee_account_mismatch" });
+  // an instruction layout we cannot read is refused, not trusted
+  const c = await buildSetup(undefined, {});
+  const bad = swapJson(c.taker, c.filler, c.feeUsdc, "ledger");
+  assert.throws(() => checkPlatformFee([{ program: PROGRAM, accounts: bad.accounts.map((a) => a.pubkey), data: Buffer.from(bad.data, "base64") }], { expected: c.feeUsdc }), { code: "fee_account_unverified" });
+  // both layouts we do read accept our account
+  for (const kind of ["route", "shared"]) {
+    const s = swapJson(c.taker, c.filler, c.feeUsdc, kind);
+    checkPlatformFee([{ program: PROGRAM, accounts: s.accounts.map((a) => a.pubkey), data: Buffer.from(s.data, "base64") }], { expected: c.feeUsdc });
+  }
+});
+
+test("buildSwap: other Jupiter responses are refused before anything reaches the user", async () => {
+  const mk = (patch) => async () => {
+    const [taker, filler, feeAcc, thief] = await Promise.all(Array.from({ length: 4 }, () => generateKeyPairSigner()));
+    const f = fakeFetch({ "GET /swap/v2/build": (u) => { const req = Object.fromEntries(u.searchParams); return [200, buildBody(req, swapJson(taker.address, filler.address, feeAcc.address), patch(req, { thief: thief.address, taker: taker.address })) ]; } });
+    const jup = new Jupiter({ apiKey: KEY, fetch: f, feeAccounts: { [USDC]: feeAcc.address }, latestBlockhash: async () => BH });
+    return jup.buildSwap({ inputMint: SOL, outputMint: USDC, amount: 1000, taker: taker.address });
+  };
+  await assert.rejects(mk(() => ({ outputMint: SOL }))(), { code: "order_mismatch" });
+  await assert.rejects(mk(() => ({ inAmount: "999" }))(), { code: "order_mismatch" });
+  await assert.rejects(mk(() => ({ transactionVersion: 1 }))(), { code: "bad_response" });
+  await assert.rejects(mk(() => ({ outAmount: "-5" }))(), { code: "bad_response" });
+  await assert.rejects(mk((_r, a) => ({ tipInstruction: ixJson(TX_PROGRAMS.system, [acct(a.taker, true, true), acct(a.thief)], Buffer.concat([Buffer.from([2, 0, 0, 0]), Buffer.alloc(8, 1)])) }))(), { code: "unexpected_tip" });
+  // a System transfer of the taker's SOL to a stranger, slipped into otherInstructions
+  const drain = (_r, a) => ({ otherInstructions: [ixJson(TX_PROGRAMS.system, [acct(a.taker, true, true), acct(a.thief)], Buffer.concat([Buffer.from([2, 0, 0, 0]), Buffer.from([0, 202, 154, 59, 0, 0, 0, 0])]))] });
+  await assert.rejects(mk(drain)(), { code: "user_transfer" });
+  // a program that is not allowlisted
+  await assert.rejects(mk((_r, a) => ({ otherInstructions: [ixJson(a.thief, [], [1])] }))(), { code: "program_not_allowed" });
+  // lookup tables with no port of ours: not taken on the response's word
+  await assert.rejects(mk(() => ({ addressesByLookupTableAddress: { [SOL]: [USDC] } }))(), { code: "no_lookup_tables" });
+});
+
+test("parseFeeAccounts reads JSON or mint:account lists and validates addresses", () => {
+  const A = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+  assert.deepEqual(parseFeeAccounts(undefined), {});
+  assert.deepEqual(parseFeeAccounts(""), {});
+  assert.deepEqual(parseFeeAccounts(JSON.stringify({ [SOL]: A })), { [SOL]: A });
+  assert.deepEqual(parseFeeAccounts(`${SOL}:${A}, ${USDC}:${A}`), { [SOL]: A, [USDC]: A });
+  for (const bad of ["{nope", "[]", `${SOL}`, `${SOL}:x`, `${SOL}:${A}:extra`]) assert.throws(() => parseFeeAccounts(bad), (e) => e instanceof JupiterError && ["fee_accounts", "bad_address"].includes(e.code));
+});

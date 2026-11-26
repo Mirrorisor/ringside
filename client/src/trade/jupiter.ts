@@ -31,7 +31,29 @@
  * the docs leave open is marked ASSUMPTION.
  *
  * ---------------------------------------------------------------------------
- * Referral fees: setup notes
+ * Spot swaps: /swap/v2/build with a platform fee (used for copy trading)
+ * ---------------------------------------------------------------------------
+ * `buildSwap` calls GET /swap/v2/build (checked 2026-11-26 against
+ * developers.jup.ag/docs/swap/build and the API reference). Jupiter takes no
+ * swap fee there. Our fee is `platformFeeBps` (we default to 50, allow 0-255)
+ * plus `feeAccount`: any initialised token account we own for a mint of the
+ * pair, no Referral Program account needed. We pick the account from
+ * `feeAccounts` (mint -> our token account, env JUPITER_FEE_ACCOUNTS); with no
+ * match for either pair mint we build with no fee. The response is
+ * instructions, not a transaction: we compile an unsigned v0 transaction with
+ * our own fee payer and blockhash, resolve lookup tables through our own port
+ * (never the response's `addressesByLookupTableAddress`, which the API could
+ * lie about), check it, and refuse anything that routes the fee anywhere but
+ * our configured account (`checkPlatformFee`).
+ * ASSUMPTION: the docs do not say which mint a /build platform fee is taken in
+ * for ExactIn. The docs for the older Metis API say input or output for
+ * ExactIn and that the feeAccount mint must be one of the pair, so we choose
+ * the mint by the account we pass (output mint preferred, then input).
+ * ASSUMPTION: outAmount / otherAmountThreshold are quote values as the API
+ * returns them; we do not adjust them for the fee.
+ *
+ * ---------------------------------------------------------------------------
+ * Referral fees (/order only, no longer used for copy trading): setup notes
  * ---------------------------------------------------------------------------
  * - Range is 50 to 255 bps. Jupiter keeps 20% of the referral fee (and charges
  *   no separate platform fee when a referral is active), so 50 bps nets us 40
@@ -57,7 +79,16 @@
  *   `referralAccount` to the constructor.
  */
 import {
+  AccountRole,
+  appendTransactionMessageInstructions,
+  compileTransaction,
+  compressTransactionMessageUsingAddressLookupTables,
+  createTransactionMessage,
   decompileTransactionMessage,
+  pipe,
+  setTransactionMessageFeePayer,
+  setTransactionMessageLifetimeUsingBlockhash,
+  type Instruction,
   getAddressEncoder,
   getBase58Decoder,
   getBase64EncodedWireTransaction,
@@ -97,6 +128,42 @@ export function netReferralBps(feeBps: number): number {
 }
 
 // ---------------------------------------------------------------------------
+// Platform fee (/swap/v2/build)
+// ---------------------------------------------------------------------------
+
+export const PLATFORM_FEE_MAX_BPS = 255;
+export const DEFAULT_PLATFORM_FEE_BPS = 50;
+export const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" as Address;
+
+export function assertPlatformFee(feeBps: number): void {
+  if (!Number.isInteger(feeBps) || feeBps < 0 || feeBps > PLATFORM_FEE_MAX_BPS) {
+    throw new JupiterError(0, "platform_fee", `Platform fee must be an integer from 0 to ${PLATFORM_FEE_MAX_BPS} bps, got ${feeBps}.`);
+  }
+}
+
+/** Parses env JUPITER_FEE_ACCOUNTS: a JSON object `{"<mint>":"<token account>"}` or `mint:account,mint:account`. Empty or unset gives {}. */
+export function parseFeeAccounts(raw: string | undefined | null): Record<string, string> {
+  const text = (raw ?? "").trim();
+  if (!text) return {};
+  let entries: [string, unknown][];
+  if (text.startsWith("{")) {
+    let o: unknown;
+    try { o = JSON.parse(text); } catch { throw new JupiterError(0, "fee_accounts", "JUPITER_FEE_ACCOUNTS is not valid JSON."); }
+    if (!o || typeof o !== "object" || Array.isArray(o)) throw new JupiterError(0, "fee_accounts", "JUPITER_FEE_ACCOUNTS must be an object.");
+    entries = Object.entries(o);
+  } else {
+    entries = text.split(",").map((p) => p.trim()).filter(Boolean).map((p) => {
+      const [m, a, ...rest] = p.split(":");
+      if (!m || !a || rest.length) throw new JupiterError(0, "fee_accounts", `JUPITER_FEE_ACCOUNTS entry "${p}" is not mint:account.`);
+      return [m.trim(), a.trim()] as [string, unknown];
+    });
+  }
+  const out: Record<string, string> = {};
+  for (const [m, a] of entries) out[addr(m, "fee account mint")] = addr(a, "fee account");
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // Errors and HTTP
 // ---------------------------------------------------------------------------
 
@@ -119,6 +186,12 @@ export interface JupiterOptions {
   /** Our referral account. Defaults to env JUPITER_REFERRAL_ACCOUNT. `null` turns fees off. */
   referralAccount?: string | null;
   referralFeeBps?: number;
+  /** Our fee token accounts for /build, by mint (env JUPITER_FEE_ACCOUNTS: JSON or `mint:account,...`). Needs an account for a mint of the pair, or no fee is taken. */
+  feeAccounts?: Record<string, string>;
+  /** Platform fee for /build in bps, 0 to 255. Default 50. Env-free: set it here. */
+  platformFeeBps?: number;
+  /** Our own recent blockhash for compiling /build instructions. Required by `buildSwap`. */
+  latestBlockhash?: () => Promise<{ blockhash: string; lastValidBlockHeight: bigint }>;
   /** Overrides for the checks run before the user signs (program allowlist, priority fee and rent caps, tip accounts). */
   txPolicy?: Partial<TxPolicy>;
   /**
@@ -500,6 +573,52 @@ export async function checkAndSign(
 }
 
 // ---------------------------------------------------------------------------
+// Platform fee check (/swap/v2/build)
+// ---------------------------------------------------------------------------
+
+/**
+ * Where the platform fee account sits in the Jupiter v6 swap instructions we
+ * can read, by 8-byte Anchor discriminator (sha256("global:<name>")[0..8]).
+ * ASSUMPTION: account order from the Jupiter v6 IDL (route: tokenProgram,
+ * userTransferAuthority, userSource, userDestination, destinationTokenAccount,
+ * destinationMint, platformFeeAccount, ...; sharedAccountsRoute: tokenProgram,
+ * programAuthority, userTransferAuthority, source, programSource,
+ * programDestination, destination, sourceMint, destinationMint,
+ * platformFeeAccount, ...). An absent optional account is the program id.
+ */
+const FEE_SLOT: { disc: string; slot: number }[] = [
+  { disc: "e517cb977ae3ad2a", slot: 6 }, // route
+  { disc: "d033ef977b2bed5c", slot: 6 }, // exactOutRoute
+  { disc: "c1209b3341d69c81", slot: 9 }, // sharedAccountsRoute
+  { disc: "b0d169a89a7d453e", slot: 9 }, // sharedAccountsExactOutRoute
+];
+const hex = (b: Uint8Array) => Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+
+/**
+ * Refuses a transaction whose Jupiter swap instruction sends the platform fee
+ * anywhere but `ours`. Never lets the API choose where fees go:
+ *   - `expected` set: the fee slot must be that account;
+ *   - `expected` null: the fee slot must be empty (the program id).
+ * `ours` (when given) lists every account the fee slot may hold at all, for
+ * the app-side check where only the configured set is known.
+ * Codes: fee_account_mismatch, fee_account_unverified (unknown swap layout).
+ */
+export function checkPlatformFee(ixs: CheckIx[], o: { expected?: Address | null; ours?: Address[] }): void {
+  const swaps = ixs.map((ix, i) => ({ ix, i })).filter(({ ix }) => ix.program === TX_PROGRAMS.jupiterSwap);
+  for (const { ix, i } of swaps) {
+    const rule = FEE_SLOT.find((r) => r.disc === hex(ix.data.subarray(0, 8)));
+    if (!rule) refuse("fee_account_unverified", i, "unknown Jupiter swap instruction layout: cannot verify where the platform fee goes.");
+    const got = ix.accounts[rule!.slot];
+    const none = got === TX_PROGRAMS.jupiterSwap;
+    if (o.expected !== undefined) {
+      if (o.expected === null ? !none : got !== o.expected) refuse("fee_account_mismatch", i, `platform fee goes to ${none ? "nobody" : (got ?? "a lookup-table account")}, not ${o.expected ?? "nobody"}.`);
+    } else if (!none && (!got || !(o.ours ?? []).includes(got))) {
+      refuse("fee_account_mismatch", i, `platform fee goes to ${got ?? "a lookup-table account"}, which is not one of our fee accounts.`);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Swap V2 types
 // ---------------------------------------------------------------------------
 
@@ -578,6 +697,77 @@ export interface SwapOrder {
   error?: string;
 }
 
+/** One instruction as /swap/v2/build returns it. */
+export interface BuildInstruction {
+  programId: string;
+  accounts: { pubkey: string; isWritable: boolean; isSigner: boolean }[];
+  /** Base64. */
+  data: string;
+}
+
+/** GET /swap/v2/build response. */
+export interface BuildResponse {
+  inputMint: string;
+  outputMint: string;
+  inAmount: string;
+  outAmount: string;
+  otherAmountThreshold: string;
+  swapMode?: string;
+  slippageBps: number;
+  priceImpactPct?: string;
+  routePlan?: RoutePlanStep[];
+  computeBudgetInstructions?: BuildInstruction[];
+  setupInstructions?: BuildInstruction[];
+  swapInstruction: BuildInstruction;
+  cleanupInstruction?: BuildInstruction | null;
+  otherInstructions?: BuildInstruction[];
+  tipInstruction?: BuildInstruction | null;
+  addressesByLookupTableAddress?: Record<string, string[]> | null;
+  transactionVersion?: number;
+  computeUnitPrice?: string;
+  blockhashWithMetadata?: unknown;
+  error?: string;
+}
+
+export interface BuildSwapRequest {
+  inputMint: string;
+  outputMint: string;
+  /** Input amount in base units (ExactIn). */
+  amount: bigint | string | number;
+  /** The user whose tokens are swapped; a required signer. */
+  taker: string;
+  /** Fee payer (gas sponsor). Default: the taker. */
+  payer?: string;
+  slippageBps?: number;
+  /** Overrides the client's fee accounts / bps for this swap. */
+  feeAccounts?: Record<string, string>;
+  platformFeeBps?: number;
+}
+
+export interface BuiltSwap {
+  /** Base64 unsigned v0 transaction: our fee payer, our blockhash. */
+  transaction: string;
+  inputMint: string;
+  outputMint: string;
+  inAmount: string;
+  /** Quote output, from `outAmount`. */
+  outAmount: string;
+  /** Least the swap accepts, from `otherAmountThreshold`. */
+  otherAmountThreshold: string;
+  slippageBps: number;
+  priceImpactPct?: string;
+  /** Null when no fee account matched the pair: the swap is built with no platform fee. */
+  platformFee: { feeBps: number; feeAccount: string; feeMint: string } | null;
+  /** Fee in lamports when the pair includes wSOL (SOL side times bps), else 0. 0 with no platform fee. */
+  feeLamports: number;
+  lastValidBlockHeight: bigint;
+  taker: string;
+  payer: string;
+}
+
+/** What `JupiterPort` in copy/build.ts needs. */
+export type BuildSwapFn = (req: BuildSwapRequest) => Promise<BuiltSwap>;
+
 export interface ExecuteResult {
   status: "Success" | "Failed";
   signature?: string;
@@ -617,6 +807,7 @@ export class Jupiter {
     this.trigger = new JupiterTrigger(this.http, opts.txPolicy);
     const fee = opts.referralFeeBps;
     if (fee !== undefined) assertReferralFee(fee);
+    if (opts.platformFeeBps !== undefined) assertPlatformFee(opts.platformFeeBps);
   }
 
   private referral(req: OrderRequest): { referralAccount?: string; referralFee?: number } {
@@ -693,6 +884,102 @@ export class Jupiter {
     const lookups = tables.length && this.opts.resolveLookupTables ? await this.opts.resolveLookupTables(tables) : undefined;
     const { signedTransaction } = await checkAndSign(order.transaction, { user: o.taker, feePayers, policy: this.opts.txPolicy, lookups });
     return signedTransaction;
+  }
+
+  /** The fee account and mint for a pair: output mint first, then input. Null when we hold none for either. */
+  pickFeeAccount(inputMint: string, outputMint: string, feeAccounts?: Record<string, string>): { feeAccount: Address; feeMint: Address } | null {
+    const map = feeAccounts ?? this.opts.feeAccounts ?? parseFeeAccounts(process.env.JUPITER_FEE_ACCOUNTS);
+    for (const mint of [outputMint, inputMint]) {
+      const a = map[mint];
+      if (a) return { feeAccount: addr(a, `feeAccounts[${mint}]`), feeMint: addr(mint, "feeMint") };
+    }
+    return null;
+  }
+
+  /**
+   * GET /swap/v2/build, then compile an unsigned v0 transaction (our fee
+   * payer, our blockhash, lookup tables resolved through
+   * `opts.resolveLookupTables`) and refuse it unless it is safe for the taker to
+   * sign (`checkTransaction`) and sends the platform fee only to our configured
+   * account (`checkPlatformFee`). Nothing is signed.
+   */
+  async buildSwap(req: BuildSwapRequest): Promise<BuiltSwap> {
+    const inputMint = addr(req.inputMint, "inputMint");
+    const outputMint = addr(req.outputMint, "outputMint");
+    if (inputMint === outputMint) throw new JupiterError(0, "same_mint", "inputMint and outputMint must differ.");
+    const taker = addr(req.taker, "taker");
+    const payer = req.payer === undefined ? taker : addr(req.payer, "payer");
+    const amount = units(req.amount, "amount");
+    const bps = req.platformFeeBps ?? this.opts.platformFeeBps ?? DEFAULT_PLATFORM_FEE_BPS;
+    assertPlatformFee(bps);
+    if (!this.opts.latestBlockhash) throw new JupiterError(0, "no_blockhash", "buildSwap needs the latestBlockhash option.");
+    const fee = bps > 0 ? this.pickFeeAccount(inputMint, outputMint, req.feeAccounts) : null;
+
+    const q: Query = {
+      inputMint, outputMint, amount, taker,
+      slippageBps: intIn(req.slippageBps, 0, 10_000, "slippageBps"),
+      payer: payer !== taker ? payer : undefined,
+      platformFeeBps: fee ? bps : undefined,
+      feeAccount: fee?.feeAccount,
+      transactionVersion: "0",
+    };
+    const r = await this.http.request<BuildResponse>("GET", "/swap/v2/build", { query: q });
+
+    // The response must be the swap we asked for.
+    if (!r || typeof r !== "object" || !r.swapInstruction) throw new JupiterError(0, "bad_response", "Build response has no swapInstruction.");
+    if (r.inputMint !== inputMint || r.outputMint !== outputMint) throw new JupiterError(0, "order_mismatch", "Build mints differ from the request.");
+    if (r.inAmount !== amount) throw new JupiterError(0, "order_mismatch", "Build inAmount differs from the request.");
+    if (r.transactionVersion !== undefined && r.transactionVersion !== 0) throw new JupiterError(0, "bad_response", "Build is not a v0 transaction.");
+    if (r.tipInstruction) throw new JupiterError(0, "unexpected_tip", "We asked for no tip but the build has a tip instruction.");
+    for (const k of ["outAmount", "otherAmountThreshold"] as const) {
+      if (typeof r[k] !== "string" || !/^[0-9]+$/.test(r[k])) throw new JupiterError(0, "bad_response", `Build ${k} is not a base-unit integer.`);
+    }
+
+    const toIx = (b: BuildInstruction): Instruction => {
+      if (!b || typeof b.data !== "string" || !Array.isArray(b.accounts)) throw new JupiterError(0, "bad_response", "Malformed instruction in the build response.");
+      return {
+        programAddress: addr(b.programId, "programId"),
+        accounts: b.accounts.map((a) => ({
+          address: addr(a.pubkey, "account"),
+          role: a.isSigner ? (a.isWritable ? AccountRole.WRITABLE_SIGNER : AccountRole.READONLY_SIGNER) : a.isWritable ? AccountRole.WRITABLE : AccountRole.READONLY,
+        })),
+        data: new Uint8Array(Buffer.from(b.data, "base64")),
+      };
+    };
+    const ixs = [
+      ...(r.computeBudgetInstructions ?? []), ...(r.setupInstructions ?? []), r.swapInstruction,
+      ...(r.cleanupInstruction ? [r.cleanupInstruction] : []), ...(r.otherInstructions ?? []),
+    ].map(toIx);
+
+    const life = await this.opts.latestBlockhash();
+    const base = pipe(
+      createTransactionMessage({ version: 0 }),
+      (m) => setTransactionMessageFeePayer(payer, m),
+      (m) => setTransactionMessageLifetimeUsingBlockhash({ blockhash: life.blockhash as never, lastValidBlockHeight: life.lastValidBlockHeight }, m),
+      (m) => appendTransactionMessageInstructions(ixs, m),
+    );
+    // Lookup tables: our port, by the addresses the instructions need. The response's own table contents are ignored.
+    let msg = base;
+    let lookups: Record<Address, Address[]> | undefined;
+    const wanted = Object.keys(r.addressesByLookupTableAddress ?? {}).map((t) => addr(t, "lookup table"));
+    if (wanted.length) {
+      if (!this.opts.resolveLookupTables) throw new JupiterError(0, "no_lookup_tables", "The build needs lookup tables; pass resolveLookupTables.");
+      lookups = await this.opts.resolveLookupTables(wanted);
+      msg = compressTransactionMessageUsingAddressLookupTables(base, lookups as never) as typeof base;
+    }
+    const transaction = getBase64EncodedWireTransaction(compileTransaction(msg));
+
+    await checkTransaction(transaction, { user: taker, feePayers: [payer], policy: this.opts.txPolicy, lookups });
+    checkPlatformFee(instructionsOf(transaction, lookups).ixs, { expected: fee ? fee.feeAccount : null });
+
+    const solSide = inputMint === WSOL_MINT ? BigInt(amount) : outputMint === WSOL_MINT ? BigInt(r.outAmount) : 0n;
+    return {
+      transaction, inputMint, outputMint, inAmount: r.inAmount, outAmount: r.outAmount, otherAmountThreshold: r.otherAmountThreshold,
+      slippageBps: r.slippageBps, priceImpactPct: r.priceImpactPct,
+      platformFee: fee ? { feeBps: bps, feeAccount: fee.feeAccount, feeMint: fee.feeMint } : null,
+      feeLamports: fee ? Number((solSide * BigInt(bps)) / 10_000n) : 0,
+      lastValidBlockHeight: life.lastValidBlockHeight, taker, payer,
+    };
   }
 
   /** POST /swap/v2/execute. Returns the result as is, including `status: "Failed"`. */

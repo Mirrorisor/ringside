@@ -1,18 +1,19 @@
 /**
  * Copy service entry point. Env: SESSION_SECRET, COPY_INGEST_SECRET,
  * COPY_PORT (8793), COPY_HOST (127.0.0.1), COPY_CORS_ORIGIN, COPY_DB (default ./copy.sqlite),
- * COPY_RPC_URL, COPY_FEE_WALLET, JUPITER_API_KEY, SPONSOR_ADDRESS (optional).
+ * COPY_RPC_URL, COPY_FEE_WALLET, JUPITER_API_KEY, JUPITER_FEE_ACCOUNTS (our fee token accounts by mint),
+ * SPONSOR_ADDRESS (optional).
  *
  * TODO(social): the SocialPort is the social backend's; until it is wired,
  * this entry point cannot run. Import `createCopyServer` from the backend
  * process and pass its own SocialPort and indexer store.
  */
 import { Connection } from "@solana/web3.js";
-import { createSolanaRpc } from "@solana/kit";
+import { createSolanaRpc, fetchAddressesForLookupTables } from "@solana/kit";
 import { SqliteStore } from "../indexer/store.js";
 import { readFileSync } from "node:fs";
 import { hmacSessionAuth } from "../session.js";
-import { Jupiter } from "../trade/jupiter.js";
+import { Jupiter, parseFeeAccounts } from "../trade/jupiter.js";
 import { type BuildDeps, meteoraPort, pumpPort } from "./build.js";
 import { confirmPending, rpcTxPort } from "./confirm.js";
 import { createCopyEngine } from "./engine.js";
@@ -29,12 +30,17 @@ export function startCopyService(social: SocialPort, indexer: SqliteStore, env: 
   const engine = createCopyEngine({ social, flags: indexerFlagsPort(indexer), store, log: console.error });
   const rpcUrl = need("COPY_RPC_URL");
   const rpc = createSolanaRpc(rpcUrl);
-  const jup = new Jupiter();
+  const jup = new Jupiter({
+    feeAccounts: parseFeeAccounts(env.JUPITER_FEE_ACCOUNTS),
+    latestBlockhash: async () => (await rpc.getLatestBlockhash().send()).value,
+    // Lookup tables come from our RPC, never from the Jupiter response.
+    resolveLookupTables: (t) => fetchAddressesForLookupTables(t, rpc, { commitment: "confirmed" }),
+  });
   const build: BuildDeps = {
     store,
     pump: pumpPort({ rpc: new Connection(rpcUrl, "confirmed"), feeWallet: need("COPY_FEE_WALLET") }),
     meteora: meteoraPort({ rpc: new Connection(rpcUrl, "confirmed") as never, feeWallet: need("COPY_FEE_WALLET") }),
-    jupiter: { order: (r) => jup.getOrder(r) },
+    jupiter: { build: (r) => jup.buildSwap(r) },
     chain: { latestBlockhash: async () => (await rpc.getLatestBlockhash().send()).value },
     sponsor: env.SPONSOR_ADDRESS,
     // Perps: off unless RINGSIDE_COPY_PERPS=1; needs RINGSIDE_PERPS_IDL (path to target/idl/ringside_perps.json).
