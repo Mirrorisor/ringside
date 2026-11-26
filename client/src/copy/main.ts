@@ -1,0 +1,45 @@
+/**
+ * Copy service entry point. Env: SESSION_SECRET, COPY_INGEST_SECRET,
+ * COPY_PORT (8793), COPY_CORS_ORIGIN, COPY_DB (default ./copy.sqlite),
+ * COPY_RPC_URL, COPY_FEE_WALLET, JUPITER_API_KEY, SPONSOR_ADDRESS (optional).
+ *
+ * TODO(social): the SocialPort is the social backend's; until it is wired,
+ * this entry point cannot run. Import `createCopyServer` from the backend
+ * process and pass its own SocialPort and indexer store.
+ */
+import { Connection } from "@solana/web3.js";
+import { createSolanaRpc } from "@solana/kit";
+import { SqliteStore } from "../indexer/store.js";
+import { hmacSessionAuth } from "../session.js";
+import { Jupiter } from "../trade/jupiter.js";
+import { type BuildDeps, pumpPort } from "./build.js";
+import { createCopyEngine } from "./engine.js";
+import { indexerFlagsPort } from "./flagsport.js";
+import type { SocialPort } from "./ports.js";
+import { createCopyServer } from "./server.js";
+import { CopyStore } from "./store.js";
+
+export function startCopyService(social: SocialPort, indexer: SqliteStore, env: NodeJS.ProcessEnv = process.env) {
+  const need = (k: string) => env[k] || (() => { throw new Error(`${k} is required`); })();
+  const store = new CopyStore(env.COPY_DB ?? "copy.sqlite");
+  const engine = createCopyEngine({ social, flags: indexerFlagsPort(indexer), store, log: console.error });
+  const rpcUrl = need("COPY_RPC_URL");
+  const rpc = createSolanaRpc(rpcUrl);
+  const jup = new Jupiter();
+  const build: BuildDeps = {
+    store,
+    pump: pumpPort({ rpc: new Connection(rpcUrl, "confirmed"), feeWallet: need("COPY_FEE_WALLET") }),
+    jupiter: { order: (r) => jup.getOrder(r) },
+    chain: { latestBlockhash: async () => (await rpc.getLatestBlockhash().send()).value },
+    sponsor: env.SPONSOR_ADDRESS,
+  };
+  const server = createCopyServer({
+    store, engine, build,
+    authenticate: hmacSessionAuth(need("SESSION_SECRET")),
+    ingestSecret: need("COPY_INGEST_SECRET"),
+    corsOrigin: env.COPY_CORS_ORIGIN,
+    trustProxy: env.COPY_TRUST_PROXY === "1",
+  });
+  server.listen(Number(env.COPY_PORT ?? 8793));
+  return { server, store, engine };
+}
