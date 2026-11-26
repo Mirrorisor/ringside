@@ -22,6 +22,7 @@ import {
   pipe, setTransactionMessageFeePayer, AccountRole, setTransactionMessageLifetimeUsingBlockhash, address, type Address, type Instruction,
 } from "@solana/kit";
 import { checkTransaction, type OrderRequest, type SwapOrder, WSOL_MINT } from "../trade/jupiter.js";
+import * as meteora from "../trade/meteora.js";
 import { buildBuy, buildSell, PumpTradeError, type BuiltTrade, type BuyQuote, type PumpTradeConfig, type SellQuote } from "../trade/pumpfun.js";
 import { PublicKey } from "@solana/web3.js";
 import type { Idl } from "../perps/anchor.js";
@@ -54,6 +55,11 @@ export interface BuiltIntent {
 export interface PumpPort {
   buy(p: { mint: string; user: string; solIn: bigint; slippageBps: number }): Promise<BuiltTrade<BuyQuote> | null>;
   sell(p: { mint: string; user: string; tokensIn: bigint; slippageBps: number }): Promise<BuiltTrade<SellQuote> | null>;
+}
+/** Meteora DBC curve as a port; null means no live curve for the mint (try Jupiter). */
+export interface MeteoraPort {
+  buy(p: { mint: string; user: string; solIn: bigint; slippageBps: number }): Promise<meteora.BuiltTrade<meteora.BuyQuote> | null>;
+  sell(p: { mint: string; user: string; tokensIn: bigint; slippageBps: number }): Promise<meteora.BuiltTrade<meteora.SellQuote> | null>;
 }
 /** Jupiter as a port: an order with an unsigned transaction for the taker. */
 export interface JupiterPort {
@@ -102,6 +108,8 @@ export interface BuildDeps {
   store: CopyStore;
   perps?: PerpsBuildDeps;
   pump: PumpPort;
+  /** Optional: coins on a Meteora launch curve (Bags, Believe, Jupiter Studio). */
+  meteora?: MeteoraPort;
   jupiter: JupiterPort;
   chain: ChainPort;
   /** Gas sponsor address: fee payer when set; the follower is still a required signer. */
@@ -115,6 +123,20 @@ export interface BuildDeps {
   exits?: LeaderExitPort;
   /** Decimals of a mint, to compare the quote with the leader's UI-unit price. Default 6. */
   tokenDecimals?: (mint: string) => Promise<number> | number;
+}
+
+/** Wraps the real Meteora layer; "not_found" and "graduated" mean: try Jupiter. */
+export function meteoraPort(cfg: meteora.MeteoraTradeConfig): MeteoraPort {
+  const soft = async <T>(f: () => Promise<T>): Promise<T | null> => {
+    try { return await f(); } catch (e) {
+      if (e instanceof meteora.MeteoraTradeError && (e.code === "not_found" || e.code === "graduated")) return null;
+      throw e;
+    }
+  };
+  return {
+    buy: (p) => soft(() => meteora.buildBuy(cfg, p)),
+    sell: (p) => soft(() => meteora.buildSell(cfg, p)),
+  };
 }
 
 /** Wraps the real Pump layer; "not_found" (no curve, no pool) means: try Jupiter. */
@@ -178,7 +200,16 @@ export async function buildIntent(deps: BuildDeps, intentId: string, follower: s
           // The curve buy asks for exactly tokensOut; slippage bounds the SOL cost (maxSolCost), not the tokens.
           expectedOut: pump.quote.tokensOut.toString(), minOut: pump.quote.tokensOut.toString(), slippageBps: pump.quote.slippageBps,
         };
-      } else built = await viaJupiter(deps, i, follower, payer, WSOL_MINT, i.mint, solIn);
+      } else {
+        const met = deps.meteora ? await deps.meteora.buy({ mint: i.mint, user: follower, solIn, slippageBps: i.slippageBps }) : null;
+        if (met) {
+          built = {
+            transaction: compileUnsigned(payer, met.instructions, await deps.chain.latestBlockhash()),
+            feeLamports: num(met.quote.feeLamports), venue: "meteora", lamports: num(met.quote.solIn), tokens: met.quote.tokensOut.toString(),
+            expectedOut: met.quote.tokensOut.toString(), minOut: met.quote.minTokensOut.toString(), slippageBps: met.quote.slippageBps,
+          };
+        } else built = await viaJupiter(deps, i, follower, payer, WSOL_MINT, i.mint, solIn);
+      }
     } else if (i.side === "sell") {
       const tokensIn = BigInt(i.tokens ?? "0");
       const pump = await deps.pump.sell({ mint: i.mint, user: follower, tokensIn, slippageBps: i.slippageBps });
@@ -188,10 +219,20 @@ export async function buildIntent(deps: BuildDeps, intentId: string, follower: s
           feeLamports: num(pump.quote.feeLamports), venue: "pumpfun", lamports: num(pump.quote.solOut), tokens: tokensIn.toString(),
           expectedOut: pump.quote.solOut.toString(), minOut: pump.quote.minSolOut.toString(), slippageBps: pump.quote.slippageBps,
         };
-      } else built = await viaJupiter(deps, i, follower, payer, i.mint, WSOL_MINT, tokensIn);
+      } else {
+        const met = deps.meteora ? await deps.meteora.sell({ mint: i.mint, user: follower, tokensIn, slippageBps: i.slippageBps }) : null;
+        if (met) {
+          built = {
+            transaction: compileUnsigned(payer, met.instructions, await deps.chain.latestBlockhash()),
+            feeLamports: num(met.quote.feeLamports), venue: "meteora", lamports: num(met.quote.solOut), tokens: tokensIn.toString(),
+            expectedOut: met.quote.solOut.toString(), minOut: met.quote.minSolOut.toString(), slippageBps: met.quote.slippageBps,
+          };
+        } else built = await viaJupiter(deps, i, follower, payer, i.mint, WSOL_MINT, tokensIn);
+      }
     } else throw new BuildError("build_failed", "Unsupported side.");
   } catch (e) {
     if (e instanceof BuildError) throw e;
+    if (e instanceof meteora.MeteoraTradeError && (e.code === "unsupported_quote" || e.code === "unsupported_token_program")) throw new BuildError("venue_unavailable", "This token cannot be traded right now.");
     if (e instanceof PumpTradeError && (e.code === "awaiting_migration" || e.code === "unsupported_quote")) throw new BuildError("venue_unavailable", "This token cannot be traded right now.");
     throw new BuildError("build_failed", "Could not build the transaction.");
   }

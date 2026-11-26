@@ -13,7 +13,7 @@ import { SqliteStore } from "../indexer/store.js";
 import { readFileSync } from "node:fs";
 import { hmacSessionAuth } from "../session.js";
 import { Jupiter } from "../trade/jupiter.js";
-import { type BuildDeps, pumpPort } from "./build.js";
+import { type BuildDeps, meteoraPort, pumpPort } from "./build.js";
 import { confirmPending, rpcTxPort } from "./confirm.js";
 import { createCopyEngine } from "./engine.js";
 import { perpsGateFromEnv } from "./perps.js";
@@ -33,6 +33,7 @@ export function startCopyService(social: SocialPort, indexer: SqliteStore, env: 
   const build: BuildDeps = {
     store,
     pump: pumpPort({ rpc: new Connection(rpcUrl, "confirmed"), feeWallet: need("COPY_FEE_WALLET") }),
+    meteora: meteoraPort({ rpc: new Connection(rpcUrl, "confirmed") as never, feeWallet: need("COPY_FEE_WALLET") }),
     jupiter: { order: (r) => jup.getOrder(r) },
     chain: { latestBlockhash: async () => (await rpc.getLatestBlockhash().send()).value },
     sponsor: env.SPONSOR_ADDRESS,

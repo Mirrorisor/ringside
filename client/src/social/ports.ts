@@ -11,7 +11,7 @@ export interface CopySettings {
 export interface CopyIntent {
   id: string; follower: string; leader: string; sourceSignature: string;
   kind: "spot" | "perp"; mint: string; side: "buy" | "sell" | "long" | "short" | "close";
-  venue: "jupiter" | "pumpfun" | "ringside-perps";
+  venue: "jupiter" | "pumpfun" | "meteora" | "ringside-perps";
   lamports?: number; tokens?: string; leverage?: number;
   createdAt: number; expiresAt: number;
   status: "pending" | "skipped" | "built" | "sent" | "expired"; skipReason?: string;

@@ -700,3 +700,40 @@ test("build response carries expectedOut, minOut and slippageBps, consistent for
     if (venue === "pumpfun") assert.equal(sb.expectedOut, String(sb.lamports)); else assert.equal(sb.minOut, "4900");
   }
 });
+
+test("build: a coin on a Meteora launch curve goes through Meteora; no Meteora curve falls through to Jupiter", async () => {
+  const meteoraFake = (live = true) => ({
+    calls: [],
+    async buy(p) { this.calls.push(["buy", p]); return live ? { instructions: [cuLimit], quote: { venue: "meteora-dbc", solIn: p.solIn, tokensOut: 100_000_000n, minTokensOut: 99_000_000n, slippageBps: 100, feeLamports: p.solIn / 200n } } : null; },
+    async sell(p) { this.calls.push(["sell", p]); return live ? { instructions: [cuLimit], quote: { venue: "meteora-dbc", tokensIn: p.tokensIn, solOut: 5n, minSolOut: 4n, slippageBps: 100, feeLamports: 1n } } : null; },
+  });
+  const none = { buy: async () => null, sell: async () => null };
+  {
+    const r = rig();
+    const i = await one(r);
+    const met = meteoraFake(true);
+    const jup = jupFake(ALICE);
+    const b = await buildIntent({ store: r.store, pump: none, meteora: met, jupiter: jup, chain, now: () => r.clock.t }, i.id, ALICE);
+    assert.equal(b.venue, "meteora");
+    assert.equal(b.feeLamports, (0.1 * SOL) / 200);
+    assert.equal(b.expectedOut, "100000000");
+    assert.equal(b.minOut, "99000000");
+    assert.equal(jup.calls.length, 0);
+  }
+  {
+    const r = rig();
+    const i = await one(r);
+    const jup = jupFake(ALICE);
+    const b = await buildIntent({ store: r.store, pump: none, meteora: meteoraFake(false), jupiter: jup, chain, now: () => r.clock.t }, i.id, ALICE);
+    assert.equal(b.venue, "jupiter");
+  }
+  {
+    // A coin still on the Pump curve never asks Meteora.
+    const r = rig();
+    const i = await one(r);
+    const met = meteoraFake(true);
+    const b = await buildIntent({ store: r.store, pump: pumpFake("curve"), meteora: met, jupiter: jupFake(ALICE), chain, now: () => r.clock.t }, i.id, ALICE);
+    assert.equal(b.venue, "pumpfun");
+    assert.equal(met.calls.length, 0);
+  }
+});

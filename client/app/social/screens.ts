@@ -273,7 +273,7 @@ export function mountSocial(root: HTMLElement, tabs: HTMLElement, env: Env, onTa
 
   // ---- Copy inbox -------------------------------------------------------------
   const SIDE_TEXT: Record<CopyIntent["side"], string> = { buy: "Buy", sell: "Sell", long: "Long", short: "Short", close: "Close" };
-  const VENUE_TEXT: Record<CopyIntent["venue"], string> = { jupiter: "Jupiter", pumpfun: "Pump.fun", "ringside-perps": "Ringside perps (devnet)" };
+  const VENUE_TEXT: Record<CopyIntent["venue"], string> = { jupiter: "Jupiter", pumpfun: "Pump.fun", meteora: "Meteora", "ringside-perps": "Ringside perps (devnet)" };
   const amountText = (i: CopyIntent) => [
     // For a sell, intent.lamports is the leader's trade size, not what you will receive; proceeds come from the build.
     i.lamports !== undefined && i.side !== "sell" ? sol(i.lamports) : null,
