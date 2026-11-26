@@ -131,7 +131,13 @@ REL=$(solana address -k "$RELAYER_KP")
 SOLANA_CFG=$(mktemp)
 trap 'rm -f "$SOLANA_CFG"' EXIT
 chmod 600 "$SOLANA_CFG"
-printf 'json_rpc_url: "%s"\nkeypair_path: "%s"\n' "$RPC" "$WALLET" > "$SOLANA_CFG"
+# Every field must be present: the CLI silently ignores an incomplete config file and
+# falls back to its defaults, which point at mainnet-beta.
+printf 'json_rpc_url: "%s"\nwebsocket_url: ""\nkeypair_path: "%s"\naddress_labels: {}\ncommitment: confirmed\n' "$RPC" "$WALLET" > "$SOLANA_CFG"
+if [ "$(solana -C "$SOLANA_CFG" config get json_rpc_url 2>/dev/null | sed -E 's/^RPC URL: //; s/ *$//')" != "$RPC" ]; then
+  echo "Not funding the relayer: the Solana CLI did not take the RPC from its config file."
+  exit 1
+fi
 if [ "$(solana -C "$SOLANA_CFG" balance "$REL" --lamports | awk '{print $1}')" -lt 300000000 ]; then
   echo "▸ Funding the relayer with 0.5 SOL from your wallet"
   solana -C "$SOLANA_CFG" transfer --allow-unfunded-recipient "$REL" 0.5 >/dev/null
