@@ -216,7 +216,7 @@ test("build: graduated coins (AMM) and non-Pump coins go through Jupiter, with t
   assert.equal(r.store.get(i.id).status, "pending", "a refused build leaves the intent pending");
 });
 
-test("build: a perp intent is not built (TODO) and says so with a code", async () => {
+test("build: a perp intent without perps build deps says so with a code (see perps.test.mjs for the real build)", async () => {
   const r = rig({ tiers: { tierOf: async () => 0 } });
   const [i] = await r.engine.onLeaderPerp(perp());
   await assert.rejects(buildIntent({ store: r.store, pump: pumpFake(), jupiter: jupFake(ALICE), chain }, i.id, ALICE), (e) => e.code === "perps_build_unsupported");

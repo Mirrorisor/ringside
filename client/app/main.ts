@@ -13,6 +13,10 @@ import { mountSocial } from "./social/screens";
 import { backendBase, devOverride } from "./social/config";
 import launchIdl from "../../target/idl/ringside_launch.json";
 import perpsIdl from "../../target/idl/ringside_perps.json";
+import {
+  GROSS_CAP_MULT, buildOrderInstruction, decodeMarket, decodePosition, decodeVault, marketPda, oiCap, orderPda as perpsOrderPda,
+  perpsCoders, positionPda as perpsPositionPda, tierParams, vaultPda, vaultUsdcPda,
+} from "../src/perps/index";
 
 // ---------------------------------------------------------------------------
 // Config. Devnet by default; ?network=mainnet (or VITE_NETWORK=mainnet at build
@@ -134,8 +138,9 @@ const perps = new Program(perpsIdl as Idl, provider) as any;
 const pda = (seeds: (Buffer | Uint8Array)[], program: PublicKey) => PublicKey.findProgramAddressSync(seeds, program)[0];
 const enc = (s: string) => Buffer.from(s);
 const GLOBAL = pda([enc("global")], launch.programId);
-const VAULT = pda([enc("vault")], perps.programId);
-const VAULT_USDC = pda([enc("vault_usdc")], perps.programId);
+const VAULT = vaultPda(perps.programId);
+const VAULT_USDC = vaultUsdcPda(perps.programId);
+const perpsCoder = perpsCoders(perpsIdl as Idl);
 
 // ---------------------------------------------------------------------------
 // State
@@ -248,28 +253,22 @@ function markQ(m: any, c: any, slot: bigint): { mark: bigint; anchor: bigint; cl
   const mark = clampBand(twap, anchor);
   return { mark, anchor, clamped: mark !== twap };
 }
-/** Mirrors tier_params and GROSS_CAP_MULT in programs/ringside_perps. */
-const TIER = [
-  { lev: 2, fee: 0.003 },
-  { lev: 5, fee: 0.0015 },
-  { lev: 10, fee: 0.0008 },
-];
-const GROSS_CAP_MULT = 2;
-const tierOf = () => TIER[Math.min(st.market?.tier ?? 0, 2)];
+/** Tier table and GROSS_CAP_MULT come from the shared perps module (mirrors tier_params in programs/ringside_perps). */
+const tierOf = () => { const p = tierParams(Math.min(st.market?.tier ?? 0, 2)); return { lev: Number(p.maxLeverage), fee: Number(p.feeBps) / 10000 }; };
 function caps() {
   const v = st.vault, c = st.curve;
   if (!v || !c) return null;
   const reserve = graduated() ? st.pool!.sol : big(c.virtualSol);
-  const cap = Number((reserve * big(v.solUsdE6)) / 1_000_000_000n * BigInt(v.tier0CapBps) / 10000n) / USDC;
+  const cap = Number(oiCap(v, reserve)!) / USDC;
   // Each side may reach GROSS_CAP_MULT x cap; the vault's net exposure stays within the skew limit.
-  return { cap, side: cap * GROSS_CAP_MULT, account: cap * 0.2, skew: (cap * v.skewCapBps) / 10000 };
+  return { cap, side: cap * Number(GROSS_CAP_MULT), account: cap * 0.2, skew: (cap * v.skewCapBps) / 10000 };
 }
 
 // ---------------------------------------------------------------------------
 // Chain reads
 // ---------------------------------------------------------------------------
-const positionPda = (market: PublicKey, side: number) => pda([enc("position"), trader.publicKey.toBuffer(), market.toBuffer(), Uint8Array.from([side])], perps.programId);
-const orderPda = (market: PublicKey, side: number) => pda([enc("order"), trader.publicKey.toBuffer(), market.toBuffer(), Uint8Array.from([side])], perps.programId);
+const positionPda = (market: PublicKey, side: number) => perpsPositionPda(perps.programId, trader.publicKey, market, side);
+const orderPda = (market: PublicKey, side: number) => perpsOrderPda(perps.programId, trader.publicKey, market, side);
 const tokenAmount = (data: Buffer | null | undefined) => (data && data.length >= 72 ? Number(data.readBigUInt64LE(64)) : 0);
 
 async function loadCurves() {
@@ -288,7 +287,7 @@ async function tick() {
   let curveKey: PublicKey | null = null, market: PublicKey | null = null;
   if (mint) {
     curveKey = pda([enc("curve"), mint.toBuffer()], launch.programId);
-    market = pda([enc("market"), mint.toBuffer()], perps.programId);
+    market = marketPda(perps.programId, mint);
     keys.push(curveKey, market, getAssociatedTokenAddressSync(mint, wallet.publicKey),
       positionPda(market, 0), positionPda(market, 1), orderPda(market, 0), orderPda(market, 1));
   }
@@ -297,7 +296,7 @@ async function tick() {
   const [vaultInfo, wInfo, tInfo, vuInfo] = infos;
   st.vaultUsdc = tokenAmount(vuInfo?.data) / USDC;
   if (vaultInfo) {
-    st.vault = perps.coder.accounts.decode("vault", vaultInfo.data);
+    st.vault = decodeVault(perpsCoder, vaultInfo.data);
     st.usdcMint = st.vault.usdcMint;
   }
   st.walletSol = (wInfo?.lamports ?? 0) / LAMPORTS_PER_SOL;
@@ -310,11 +309,11 @@ async function tick() {
   if (mint) {
     const [cI, mI, wtI, p0, p1, o0, o1] = infos.slice(i);
     st.curve = cI ? launch.coder.accounts.decode("curve", cI.data) : null;
-    st.market = mI ? perps.coder.accounts.decode("market", mI.data) : null;
+    st.market = mI ? decodeMarket(perpsCoder, mI.data) : null;
     st.walletTokens = tokenAmount(wtI?.data) / 1e6;
     st.positions = {
-      0: p0 ? perps.coder.accounts.decode("position", p0.data) : null,
-      1: p1 ? perps.coder.accounts.decode("position", p1.data) : null,
+      0: p0 ? decodePosition(perpsCoder, p0.data) : null,
+      1: p1 ? decodePosition(perpsCoder, p1.data) : null,
     };
     st.orders = { 0: !!o0, 1: !!o1 };
     st.pool = null;
@@ -601,7 +600,7 @@ async function launchToken(e: Event) {
       .signers([mint]).rpc();
     log(`Launched $${symbol}`, sig);
     const sig2 = await perps.methods.createMarket()
-      .accountsPartial({ payer: wallet.publicKey, curve, market: pda([enc("market"), mint.publicKey.toBuffer()], perps.programId), systemProgram: SystemProgram.programId })
+      .accountsPartial({ payer: wallet.publicKey, curve, market: marketPda(perps.programId, mint.publicKey), systemProgram: SystemProgram.programId })
       .rpc();
     log(`Opened the $${symbol} perp market`, sig2);
     st.selected = mint.publicKey;
@@ -697,17 +696,13 @@ async function sellAll() {
 /** Builds request_order signed by the trading account, sends it via the relayer, then waits for a keeper fill. */
 async function sponsoredOrder(side: number, kind: number, collateral: number, size: number) {
   const mint = st.selected!;
-  const market = pda([enc("market"), mint.toBuffer()], perps.programId);
   const info = await (await fetch(`${RELAYER}/v1/info`)).json();
   const relayer = new PublicKey(info.relayer);
-  const ix = await perps.methods
-    .requestOrder({ side, kind, collateral: new BN(Math.round(collateral * USDC)), sizeUsd: new BN(Math.round(size * USDC)), acceptablePriceQ64: new BN(0) })
-    .accountsPartial({
-      owner: trader.publicKey, payer: relayer, vault: VAULT, vaultUsdc: VAULT_USDC, market,
-      position: positionPda(market, side), order: orderPda(market, side),
-      ownerUsdc: getAssociatedTokenAddressSync(st.usdcMint!, trader.publicKey), tokenProgram: TOKEN_PROGRAM_ID, systemProgram: SystemProgram.programId,
-    })
-    .instruction();
+  const market = marketPda(perps.programId, mint);
+  const ix = buildOrderInstruction({
+    idl: perpsIdl as Idl, action: kind ? "close" : "open", trader: trader.publicKey, payer: relayer, mint, side: side as 0 | 1, usdcMint: st.usdcMint!,
+    collateral: BigInt(Math.round(collateral * USDC)), sizeUsd: BigInt(Math.round(size * USDC)), coders: perpsCoder,
+  });
   let body: any;
   for (let attempt = 0; ; attempt++) {
     const tx = new Transaction({ feePayer: relayer, recentBlockhash: (await connection.getLatestBlockhash()).blockhash }).add(ix);
