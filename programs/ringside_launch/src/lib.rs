@@ -25,6 +25,9 @@ pub const INITIAL_VIRTUAL_SOL: u64 = 500_000_000;
 pub const INITIAL_VIRTUAL_TOKENS: u64 = 1_073_000_000 * ONE_TOKEN;
 pub const MAX_DEV_BUY_TOKENS: u64 = 50_000_000 * ONE_TOKEN; // 5% of supply
 pub const DEV_LOCK_SECONDS: i64 = 7 * 24 * 60 * 60;
+/// Creator fees are claimable once the curve completes, or this long after launch,
+/// whichever comes first.
+pub const CREATOR_FEE_LOCK_SECONDS: i64 = 7 * 24 * 3600;
 pub const BPS: u64 = 10_000;
 
 /// Observations kept for TWAP reads. One is written at most every
@@ -359,6 +362,12 @@ pub mod ringside_launch {
 
     pub fn claim_creator_fees(ctx: Context<ClaimCreatorFees>) -> Result<()> {
         let curve = &mut ctx.accounts.curve;
+        let now = Clock::get()?.unix_timestamp;
+        let unlock_ts = curve
+            .created_ts
+            .checked_add(CREATOR_FEE_LOCK_SECONDS)
+            .ok_or(LaunchError::MathOverflow)?;
+        require!(curve.complete || now >= unlock_ts, LaunchError::CreatorFeesLocked);
         let amount = curve.creator_fees_owed;
         require!(amount > 0, LaunchError::ZeroAmount);
         curve.creator_fees_owed = 0;
@@ -1188,6 +1197,8 @@ pub enum LaunchError {
     NotEnoughToMigrate,
     #[msg("Pool creation did not produce LP tokens")]
     MigrationFailed,
+    #[msg("Creator fees are locked until the curve completes or 7 days after launch")]
+    CreatorFeesLocked,
 }
 
 #[cfg(test)]

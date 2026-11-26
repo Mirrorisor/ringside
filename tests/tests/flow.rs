@@ -769,3 +769,176 @@ async fn launch_trade_and_perps_end_to_end() {
     assert_eq!(g.authority, multisig.pubkey());
     let _ = (env.migration, dev_lock);
 }
+
+// --- Creator fee lock ---------------------------------------------------------
+
+struct Launched {
+    env: Env,
+    creator: Keypair,
+    trader: Keypair,
+    mint: Pubkey,
+    curve: Pubkey,
+    buy_ix: Box<dyn Fn(u64) -> Instruction>,
+}
+
+/// Initializes the launch program, creates a token with no dev buy and funds a trader.
+async fn launch_only() -> Launched {
+    let mut env = setup().await;
+    let authority = env.authority.insecure_clone();
+    let creator = Keypair::new();
+    let trader = Keypair::new();
+    env.fund(creator.pubkey(), 5 * SOL).await;
+    env.fund(trader.pubkey(), 300 * SOL).await;
+    let (global, _) = Pubkey::find_program_address(&[launch::SEED_GLOBAL], &launch::ID);
+    env.send(
+        &[Instruction {
+            program_id: launch::ID,
+            accounts: launch::accounts::InitializeGlobal { authority: authority.pubkey(), global, system_program: system_program::ID }
+                .to_account_metas(None),
+            data: launch::instruction::InitializeGlobal {
+                params: launch::GlobalParams {
+                    fee_recipient: env.fee_recipient,
+                    insurance_recipient: env.insurance,
+                    migration_authority: env.migration,
+                    launch_fee_lamports: SOL / 50,
+                    graduation_fee_lamports: 3 * SOL / 2,
+                    protocol_fee_bps: 50,
+                    creator_fee_bps: 30,
+                    insurance_fee_bps: 20,
+                },
+            }
+            .data(),
+        }],
+        &[&authority],
+    )
+    .await
+    .unwrap();
+    let mint = Keypair::new();
+    let mint_key = mint.pubkey();
+    let (curve, _) = Pubkey::find_program_address(&[launch::SEED_CURVE, mint_key.as_ref()], &launch::ID);
+    let (dev_lock, _) = Pubkey::find_program_address(&[launch::SEED_DEV_LOCK, mint_key.as_ref()], &launch::ID);
+    let curve_vault = get_associated_token_address(&curve, &mint_key);
+    let (fee_recipient, insurance) = (env.fee_recipient, env.insurance);
+    env.send(
+        &[Instruction {
+            program_id: launch::ID,
+            accounts: launch::accounts::CreateToken {
+                creator: creator.pubkey(),
+                global,
+                mint: mint_key,
+                curve,
+                curve_token_vault: curve_vault,
+                dev_lock_vault: dev_lock,
+                fee_recipient,
+                insurance_recipient: insurance,
+                metadata: launch::metaplex::metadata_address(&mint_key),
+                token_metadata_program: launch::metaplex::PROGRAM,
+                token_program: spl_token::ID,
+                associated_token_program: spl_associated_token_account::ID,
+                system_program: system_program::ID,
+            }
+            .to_account_metas(None),
+            data: launch::instruction::CreateToken {
+                args: launch::CreateTokenArgs {
+                    name: "Lock".into(),
+                    symbol: "LOCK".into(),
+                    uri: "https://example.com/lock.json".into(),
+                    dev_buy_lamports: 0,
+                },
+            }
+            .data(),
+        }],
+        &[&creator, &mint],
+    )
+    .await
+    .unwrap();
+    let trader_key = trader.pubkey();
+    let trader_tokens = get_associated_token_address(&trader_key, &mint_key);
+    let buy_ix = Box::new(move |sol_in: u64| Instruction {
+        program_id: launch::ID,
+        accounts: launch::accounts::Trade {
+            trader: trader_key,
+            global,
+            mint: mint_key,
+            curve,
+            curve_token_vault: curve_vault,
+            trader_token_account: trader_tokens,
+            fee_recipient,
+            insurance_recipient: insurance,
+            token_program: spl_token::ID,
+            associated_token_program: spl_associated_token_account::ID,
+            system_program: system_program::ID,
+        }
+        .to_account_metas(None),
+        data: launch::instruction::Buy { sol_in, min_tokens_out: 1 }.data(),
+    });
+    Launched { env, creator, trader, mint: mint_key, curve, buy_ix }
+}
+
+fn claim_ix(creator: Pubkey, curve: Pubkey) -> Instruction {
+    Instruction {
+        program_id: launch::ID,
+        accounts: launch::accounts::ClaimCreatorFees { creator, curve }.to_account_metas(None),
+        data: launch::instruction::ClaimCreatorFees {}.data(),
+    }
+}
+
+#[tokio::test]
+async fn creator_fees_locked_for_seven_days() {
+    let mut l = launch_only().await;
+    let (creator, curve) = (l.creator.insecure_clone(), l.curve);
+    let ix = (l.buy_ix)(5 * SOL);
+    let trader = l.trader.insecure_clone();
+    l.env.send(&[ix], &[&trader]).await.unwrap();
+    let c: launch::Curve = l.env.get(curve).await;
+    assert!(!c.complete && c.creator_fees_owed > 0);
+    let owed = c.creator_fees_owed;
+    let lock = launch::CREATOR_FEE_LOCK_SECONDS;
+    let locked: u32 = launch::LaunchError::CreatorFeesLocked.into();
+
+    // Right after launch: refused.
+    let e = l.env.send(&[claim_ix(creator.pubkey(), curve)], &[&creator]).await.unwrap_err();
+    assert_eq!(custom_error(e), locked);
+
+    // One second short of the unlock time: still refused. (Warp one slot first for a fresh blockhash.)
+    l.env.warp(1).await;
+    let clock: solana_sdk::clock::Clock = l.env.ctx.banks_client.get_sysvar().await.unwrap();
+    l.env.advance_clock(c.created_ts + lock - 1 - clock.unix_timestamp).await;
+    let e = l.env.send(&[claim_ix(creator.pubkey(), curve)], &[&creator]).await.unwrap_err();
+    assert_eq!(custom_error(e), locked);
+    assert_eq!(l.env.get::<launch::Curve>(curve).await.creator_fees_owed, owed, "nothing paid while locked");
+
+    // At the unlock time: succeeds and pays exactly what is owed.
+    l.env.warp(1).await;
+    let clock: solana_sdk::clock::Clock = l.env.ctx.banks_client.get_sysvar().await.unwrap();
+    l.env.advance_clock(c.created_ts + lock - clock.unix_timestamp).await;
+    let before = l.env.ctx.banks_client.get_balance(creator.pubkey()).await.unwrap();
+    let curve_before = l.env.ctx.banks_client.get_balance(curve).await.unwrap();
+    l.env.send(&[claim_ix(creator.pubkey(), curve)], &[&creator]).await.unwrap();
+    let after = l.env.ctx.banks_client.get_balance(creator.pubkey()).await.unwrap();
+    let curve_after = l.env.ctx.banks_client.get_balance(curve).await.unwrap();
+    assert_eq!(after - before, owed, "creator receives exactly creator_fees_owed (payer is separate, no tx fee on creator)");
+    assert_eq!(curve_before - curve_after, owed);
+    assert_eq!(l.env.get::<launch::Curve>(curve).await.creator_fees_owed, 0);
+    let _ = l.mint;
+}
+
+#[tokio::test]
+async fn creator_fees_claimable_right_after_graduation() {
+    let mut l = launch_only().await;
+    let (creator, curve) = (l.creator.insecure_clone(), l.curve);
+    let trader = l.trader.insecure_clone();
+    // Buy more than the curve holds: the last buy is capped and the curve completes.
+    let ix = (l.buy_ix)(250 * SOL);
+    l.env.send(&[ix], &[&trader]).await.unwrap();
+    let c: launch::Curve = l.env.get(curve).await;
+    assert!(c.complete, "curve sold out");
+    let clock: solana_sdk::clock::Clock = l.env.ctx.banks_client.get_sysvar().await.unwrap();
+    assert!(clock.unix_timestamp < c.created_ts + launch::CREATOR_FEE_LOCK_SECONDS, "still inside the 7 days");
+    let owed = c.creator_fees_owed;
+    assert!(owed > 0);
+    let before = l.env.ctx.banks_client.get_balance(creator.pubkey()).await.unwrap();
+    l.env.send(&[claim_ix(creator.pubkey(), curve)], &[&creator]).await.unwrap();
+    let after = l.env.ctx.banks_client.get_balance(creator.pubkey()).await.unwrap();
+    assert_eq!(after - before, owed);
+}
