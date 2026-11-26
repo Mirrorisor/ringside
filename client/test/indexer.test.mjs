@@ -463,11 +463,11 @@ test("L2: sponsored trades are attributed to the signing trader, not the fee pay
   const b = parseSwap(buyTx, { sponsors: SPONSORS });
   assert.deepEqual([b.wallet, b.side, b.tokenAmount, b.quote], [TRADER, "buy", 1_990_000, "SOL"]);
   close(b.quoteAmount, 1.0101, "curve + protocol fee + sponsor fee recovery; sponsor-paid rent excluded");
-  for (const opts of [{}, { sponsors: SPONSORS }]) {
-    const s = parseSwap(sellTx, opts);
-    assert.deepEqual([s.wallet, s.side, s.tokenAmount], [TRADER, "sell", 1_990_000], "signer ordering picks the trader over the curve");
-    close(s.quoteAmount, 1.1879);
-  }
+  const s = parseSwap(sellTx, { sponsors: SPONSORS });
+  assert.deepEqual([s.wallet, s.side, s.tokenAmount], [TRADER, "sell", 1_990_000], "signer ordering picks the trader over the curve");
+  close(s.quoteAmount, 1.1879);
+  // Not configured as ours, the gas-only fee payer is a third party: no guessing who traded.
+  assert.equal(parseSwap(sellTx), null);
   // Without account order the trader and the curve are indistinguishable: no trade rather than a wrong one.
   assert.equal(parseSwap({ ...sellTx, accountData: [] }, { sponsors: SPONSORS }), null);
   // An events.swap naming the sponsor is ignored.
@@ -601,4 +601,25 @@ test("parsed events: webhook ingest accepts both formats in one batch", async ()
     const body = await r.json();
     assert.deepEqual([body.received, body.skipped, body.duplicates, body.trades], [5, 1, 0, 4], JSON.stringify(body));
   } finally { s.stop(); }
+});
+
+test("live Helius swaps: net balances, not the summary; no guessing pool accounts; gas-only fee payers", async () => {
+  const { readFileSync } = await import("node:fs");
+  const { parseTransaction } = await import("../dist/indexer/helius.js");
+  const live = JSON.parse(readFileSync(new URL("./fixtures/helius/live-swaps.json", import.meta.url), "utf8")).txs;
+  const one = (k) => parseTransaction(live[k])?.trades ?? [];
+  // Multi-hop with a leftover intermediate token: ambiguous, so no trade (the summary named the intermediate token).
+  assert.equal(one("3DEmpZHu").length, 0);
+  // Token-for-token routed through SOL: the summary named a pool account; the fee payer traded, but not against SOL.
+  assert.equal(one("2ZeY43Nu").length, 0);
+  // Token-2022 transfer fee: the wallet got 4698.256547, not the 4945.533208 the summary says; wrapped SOL counted once.
+  const [fee] = one("5z576FzZ");
+  assert.equal(fee.wallet, "4owmCQuvYE3zK4Pco24cLXKK1Fn23Hva1g7gzTNgyRn6");
+  assert.equal(fee.side, "buy");
+  assert.ok(Math.abs(fee.tokenAmount - 4698.256547) < 1e-6);
+  assert.ok(Math.abs(fee.quoteAmount - 0.000141173) < 1e-12);
+  // A third-party bot paid gas and was the only signer: buyer vault and bonding curve can't be told apart, so no trade.
+  assert.equal(one("2ToZUsXk").length, 0);
+  // Labelled SWAP but just a token transfer with no SOL leg.
+  assert.equal(one("364Vt5MG").length, 0);
 });

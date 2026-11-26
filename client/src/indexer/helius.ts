@@ -190,23 +190,48 @@ function deltasFromSwapEvent(s: HeliusSwapEvent): Deltas {
 
 function deltasFromTransfers(tx: HeliusEnhancedTransaction, wallet: string): Deltas {
   const d: Deltas = new Map();
-  const ownTokenAccounts = new Set<string>();
+  // The wallet's own token accounts, from either side of its transfers. SOL
+  // moved into or out of them natively is rent or wrapping, not trading:
+  // wrapped SOL is counted once, as the token transfer that spends it (a
+  // wrap and the spend were both counted before, seen live).
+  const own = new Set<string>();
+  for (const t of tx.tokenTransfers ?? []) {
+    if (!t) continue;
+    if (t.toUserAccount === wallet && t.toTokenAccount) own.add(t.toTokenAccount);
+    if (t.fromUserAccount === wallet && t.fromTokenAccount) own.add(t.fromTokenAccount);
+  }
   for (const t of tx.tokenTransfers ?? []) {
     if (!t || !isAddress(t.mint)) continue;
     const amt = num(t.tokenAmount);
-    if (t.toUserAccount === wallet) {
-      add(d, t.mint, amt);
-      if (t.toTokenAccount) ownTokenAccounts.add(t.toTokenAccount);
-    }
+    if (t.toUserAccount === wallet) add(d, t.mint, amt);
     if (t.fromUserAccount === wallet) add(d, t.mint, -amt);
   }
   for (const n of tx.nativeTransfers ?? []) {
     if (!n) continue;
-    // Rent paid into the wallet's own new token account is not trade cost.
-    if (n.toUserAccount && ownTokenAccounts.has(n.toUserAccount)) continue;
+    if ((n.toUserAccount && own.has(n.toUserAccount)) || (n.fromUserAccount && own.has(n.fromUserAccount))) continue;
     const sol = num(n.amount) / LAMPORTS_PER_SOL;
     if (n.toUserAccount === wallet) add(d, SOL_MINT, sol);
     if (n.fromUserAccount === wallet) add(d, SOL_MINT, -sol);
+  }
+  return d;
+}
+
+/**
+ * What actually landed in the wallet. Token legs come from the wallet's net
+ * balance changes in `accountData` when present: they include Token-2022
+ * transfer fees and collapse multi-hop routes, where Helius's swap summary
+ * and gross transfers can name an intermediate token or an amount the wallet
+ * never received (seen live, 26 Nov 2026). SOL comes from transfers, which
+ * leaves out rent for the wallet's own new token accounts.
+ */
+function walletDeltas(tx: HeliusEnhancedTransaction, wallet: string): Deltas {
+  const d = deltasFromTransfers(tx, wallet);
+  const changes = (tx.accountData ?? []).flatMap((a) => (a && Array.isArray(a.tokenBalanceChanges) ? a.tokenBalanceChanges : []));
+  if (!changes.length) return d;
+  for (const m of [...d.keys()]) if (m !== SOL_MINT) d.delete(m);
+  for (const c of changes) {
+    if (!c || c.userAccount !== wallet || !isAddress(c.mint) || c.mint === SOL_MINT) continue;
+    add(d, c.mint, rawToUi(c.rawTokenAmount));
   }
   return d;
 }
@@ -262,9 +287,22 @@ export function pickTrader(tx: HeliusEnhancedTransaction, sponsors: ReadonlySet<
   for (const [w, d] of tokenDelta) {
     if (sponsors.has(w) || !(Math.abs(d) > DUST)) continue;
     if (signers ? !signers.has(w) : w !== feePayer && !spent.has(w)) continue;
-    if (tradeFromDeltas(deltasFromTransfers(tx, w), { ...base, wallet: w })) candidates.push(w);
+    if (tradeFromDeltas(walletDeltas(tx, w), { ...base, wallet: w })) candidates.push(w);
   }
   if (feePayer && candidates.includes(feePayer)) return feePayer;
+  // A fee payer whose own tokens moved is the trader, even when its trade is
+  // ambiguous (routed token-to-token, leftovers from a multi-hop): then there
+  // is no trade, rather than a guess, which named pool accounts on live
+  // routed swaps. Inference is only for fee payers that just paid gas: our
+  // sponsor, gasless apps such as FOMO, and trading bots.
+  if (!signers && feePayer && !sponsors.has(feePayer) && tokensMoved(tx, feePayer)) return undefined;
+  // A third-party gas payer (a trading bot, a gasless app): without a signer
+  // list the trading wallet may not have signed at all (a bot vault), and
+  // account order cannot tell it from the pool, because lookup-table accounts
+  // come last (a live Pump.fun buy put the bonding curve first). Our own
+  // sponsored trades are different: the user always signs, as a static
+  // signer listed right after the fee payer.
+  if (!signers && !(feePayer && sponsors.has(feePayer))) return undefined;
   if (candidates.length <= 1) return candidates[0];
   const order = new Map<string, number>();
   (tx.accountData ?? []).forEach((a, i) => { if (a && isAddress(a.account) && !order.has(a.account)) order.set(a.account, i); });
@@ -274,6 +312,17 @@ export function pickTrader(tx: HeliusEnhancedTransaction, sponsors: ReadonlySet<
     if (i !== undefined && (best === undefined || i < order.get(best)!)) best = c;
   }
   return best;
+}
+
+/** Did any non-quote token balance of `wallet` change in this transaction? */
+function tokensMoved(tx: HeliusEnhancedTransaction, wallet: string): boolean {
+  for (const t of tx.tokenTransfers ?? []) {
+    if (t && isAddress(t.mint) && t.mint !== SOL_MINT && t.mint !== USDC_MINT && (t.fromUserAccount === wallet || t.toUserAccount === wallet)) return true;
+  }
+  for (const a of tx.accountData ?? []) for (const c of (a && a.tokenBalanceChanges) || []) {
+    if (c && c.userAccount === wallet && c.mint !== SOL_MINT && c.mint !== USDC_MINT && num(c.rawTokenAmount?.tokenAmount) !== 0) return true;
+  }
+  return false;
 }
 
 /** Parses one swap into at most one trade (or null). Exposed for tests. */
@@ -287,15 +336,19 @@ function parseNormalizedSwap(tx: HeliusEnhancedTransaction, opts: ParseOptions):
   const base = { signature: tx.signature, slot: tx.slot!, timestamp: tx.timestamp!, source: typeof tx.source === "string" && tx.source ? tx.source.slice(0, 64) : "UNKNOWN" };
   const ev = tx.events?.swap;
   if (ev && typeof ev === "object") {
+    // The summary only picks the wallet, and only one that signed: the fee
+    // payer or a listed signer. It once named a pool account (seen live).
     const wallet = swapWallet(ev, sponsors);
-    if (wallet) {
-      const t = tradeFromDeltas(deltasFromSwapEvent(ev), { ...base, wallet });
+    const signed = wallet && (wallet === tx.feePayer || (Array.isArray(tx.signers) && tx.signers.includes(wallet)));
+    if (wallet && signed) {
+      const hasNet = (tx.accountData ?? []).length > 0;
+      const t = tradeFromDeltas(hasNet ? walletDeltas(tx, wallet) : deltasFromSwapEvent(ev), { ...base, wallet });
       if (t) return t;
     }
   }
   const wallet = pickTrader(tx, sponsors);
   if (!wallet) return null;
-  return tradeFromDeltas(deltasFromTransfers(tx, wallet), { ...base, wallet });
+  return tradeFromDeltas(walletDeltas(tx, wallet), { ...base, wallet });
 }
 
 /** Rejects anything without a valid signature, slot and timestamp. */
