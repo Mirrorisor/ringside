@@ -3,13 +3,29 @@
  * orders), Tokens V2 search and Price V3.
  *
  * Every endpoint lives under https://api.jup.ag and needs an `x-api-key`
- * header (env JUPITER_API_KEY, or the `apiKey` option). `fetch` is injectable
- * so tests never touch the network.
+ * header (env JUPITER_API_KEY, or the `apiKey` option). `baseUrl` is pinned to
+ * that host: another one needs `allowCustomBaseUrl: true` and must be https.
+ * `fetch` is injectable so tests never touch the network.
  *
- * Safety: we never sign a transaction Jupiter hands back without first
- * decoding it and checking that the fee payer is who we expect and that the
- * wallet we sign for is one of its required signers. Our signer only ever
- * adds its own signature.
+ * Safety. Treat every Jupiter response as untrusted (a compromised API, a
+ * proxy, a misconfigured baseUrl):
+ * - This module signs only as the user (taker / wallet). It never signs with a
+ *   server key. With a gas sponsor (`payer`), `signOrder` / `swap` return the
+ *   user-signed transaction; the caller sends it to the gas sponsor service
+ *   (sponsor.ts, `Sponsor.sponsor()`), which applies its own program, fee and
+ *   rent policy and simulates before it co-signs and sends.
+ * - Before the user signs, `checkTransaction` decodes the message and refuses
+ *   it (a JupiterError with a named code) unless: the fee payer is expected;
+ *   every top-level program is allowlisted (Jupiter Swap and Order Engine,
+ *   System, Token, Token-2022, ATA, ComputeBudget); no System transfer sends
+ *   the user's SOL anywhere but their own wallet / wSOL account (or allowed
+ *   tip accounts or deposit recipients); no Assign or AdvanceNonce; user-funded
+ *   CreateAccount and ATA rent stays under a cap; no Token transfer, Approve,
+ *   SetAuthority or CloseAccount moves the user's value to someone else; and
+ *   the priority fee plus tips is under a cap. See `checkTransaction`.
+ * - JupiterZ (RFQ) routes are accepted only from makers on `jupiterZMakers`.
+ * The swap and order-engine programs themselves are trusted to honour the
+ * route and slippage in their instruction data; we do not parse those.
  *
  * Shapes follow https://developers.jup.ag/docs (checked 2026-11-26). Anything
  * the docs leave open is marked ASSUMPTION.
@@ -41,9 +57,12 @@
  *   `referralAccount` to the constructor.
  */
 import {
+  decompileTransactionMessage,
+  getAddressEncoder,
   getBase58Decoder,
   getBase64EncodedWireTransaction,
   getCompiledTransactionMessageDecoder,
+  getProgramDerivedAddress,
   getTransactionDecoder,
   isAddress,
   type Address,
@@ -51,6 +70,7 @@ import {
   type Transaction,
   type TransactionPartialSigner,
 } from "@solana/kit";
+import { lookupTablesOf } from "../txpolicy.js";
 
 export const JUPITER_API = "https://api.jup.ag";
 
@@ -70,10 +90,10 @@ export function assertReferralFee(feeBps: number): void {
   }
 }
 
-/** What we keep of a referral fee after Jupiter's 20%: 50 bps → 40, 255 → 204. */
+/** What we keep of a referral fee after Jupiter's 20%, in whole bps (floored): 50 → 40, 51 → 40, 255 → 204. */
 export function netReferralBps(feeBps: number): number {
   assertReferralFee(feeBps);
-  return (feeBps * (10_000 - JUPITER_REFERRAL_SHARE_BPS)) / 10_000;
+  return Math.floor((feeBps * (10_000 - JUPITER_REFERRAL_SHARE_BPS)) / 10_000);
 }
 
 // ---------------------------------------------------------------------------
@@ -91,26 +111,58 @@ export class JupiterError extends Error {
 export interface JupiterOptions {
   /** Defaults to env JUPITER_API_KEY. Read when a request is made. */
   apiKey?: string;
+  /** Pinned to https://api.jup.ag. Anything else needs `allowCustomBaseUrl: true`, and must be https. */
   baseUrl?: string;
+  allowCustomBaseUrl?: boolean;
   fetch?: typeof fetch;
   timeoutMs?: number;
   /** Our referral account. Defaults to env JUPITER_REFERRAL_ACCOUNT. `null` turns fees off. */
   referralAccount?: string | null;
   referralFeeBps?: number;
+  /** Overrides for the checks run before the user signs (program allowlist, priority fee and rent caps, tip accounts). */
+  txPolicy?: Partial<TxPolicy>;
+  /**
+   * JupiterZ market makers we accept, by maker public key (the order's
+   * `maker`, which is also the RFQ fee payer). Jupiter publishes no list and
+   * the address varies per quote, so routes from any other maker are refused.
+   * Empty by default: JupiterZ routes are refused (or exclude them with
+   * `excludeRouters: ["jupiterz"]`).
+   */
+  jupiterZMakers?: string[];
+  /** Resolves address lookup tables so destinations loaded from them can be checked. Without it they count as strangers. */
+  resolveLookupTables?: (tables: Address[]) => Promise<Record<Address, Address[]>>;
+}
+
+/** Returns the base URL to use, or throws `custom_base_url` / `insecure_base_url`. */
+export function resolveBaseUrl(o: Pick<JupiterOptions, "baseUrl" | "allowCustomBaseUrl">): string {
+  if (o.baseUrl === undefined) return JUPITER_API;
+  let u: URL;
+  try {
+    u = new URL(o.baseUrl);
+  } catch {
+    throw new JupiterError(0, "insecure_base_url", "baseUrl is not a valid URL.");
+  }
+  if (u.protocol !== "https:" || u.username || u.password) throw new JupiterError(0, "insecure_base_url", "baseUrl must be a plain https URL.");
+  const normalized = u.toString().replace(/\/$/, "");
+  if (normalized === JUPITER_API) return JUPITER_API;
+  if (!o.allowCustomBaseUrl) throw new JupiterError(0, "custom_base_url", `baseUrl ${u.origin} is not ${JUPITER_API}; set allowCustomBaseUrl: true to use it.`);
+  return normalized;
 }
 
 type Query = Record<string, string | number | boolean | undefined>;
 
 class Http {
   private fetchImpl: typeof fetch;
+  private baseUrl: string;
   constructor(private opts: JupiterOptions) {
+    this.baseUrl = resolveBaseUrl(opts);
     this.fetchImpl = opts.fetch ?? ((...a: Parameters<typeof fetch>) => fetch(...a));
   }
 
   async request<T>(method: "GET" | "POST" | "PATCH", path: string, o: { query?: Query; body?: unknown; bearer?: string } = {}): Promise<T> {
     const apiKey = this.opts.apiKey ?? process.env.JUPITER_API_KEY;
     if (!apiKey) throw new JupiterError(0, "no_api_key", "Set JUPITER_API_KEY or pass apiKey.");
-    const url = new URL((this.opts.baseUrl ?? JUPITER_API).replace(/\/$/, "") + path);
+    const url = new URL(this.baseUrl + path);
     for (const [k, v] of Object.entries(o.query ?? {})) if (v !== undefined) url.searchParams.set(k, String(v));
     const headers: Record<string, string> = { "x-api-key": apiKey, accept: "application/json" };
     if (o.body !== undefined) headers["content-type"] = "application/json";
@@ -170,9 +222,6 @@ function usd(v: unknown, name: string): number {
   return v;
 }
 
-/** Address of `x`, whether it is a signer or a bare address. */
-const addressOf = (x: { address: Address } | Address): Address => (typeof x === "string" ? x : x.address);
-
 // ---------------------------------------------------------------------------
 // Transaction checks and signing
 // ---------------------------------------------------------------------------
@@ -197,33 +246,257 @@ export function inspectTransaction(wireBase64: string): TxInspection {
   }
 }
 
+// Programs a transaction we sign as the user may call at the top level.
+export const TX_PROGRAMS = {
+  /** Jupiter Swap (aggregator v6, Metis routes). */
+  jupiterSwap: "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4" as Address,
+  /** Jupiter Order Engine (JupiterZ RFQ settlement). Confirmed on developers.jup.ag (rfq/v1/settlement) and jupiterz.jup.ag FAQ. */
+  jupiterOrderEngine: "61DFfeTKM7trxYcPQCM78bJ794ddZprZpAwAnLiwTpYH" as Address,
+  system: "11111111111111111111111111111111" as Address,
+  token: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" as Address,
+  token2022: "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb" as Address,
+  ata: "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL" as Address,
+  computeBudget: "ComputeBudget111111111111111111111111111111" as Address,
+} as const;
+
+export const WSOL_MINT = "So11111111111111111111111111111111111111112" as Address;
+/** Rent-exempt minimum of a 165-byte SPL token account; charged per ATA the user funds. */
+export const TOKEN_ACCOUNT_RENT_LAMPORTS = 2_039_280n;
+
+export interface TxPolicy {
+  /** Top-level programs allowed. */
+  programs: Address[];
+  /** Cap on compute-budget priority fee plus any tips, in lamports. */
+  maxPriorityFeeLamports: bigint;
+  /** Cap on SOL the user may put into new accounts (CreateAccount lamports plus ATA rent). */
+  maxRentLamports: bigint;
+  /** Tip accounts (Jito etc.) a System transfer may pay; tips count toward `maxPriorityFeeLamports`. None by default. */
+  tipAccounts: Address[];
+}
+
+export const DEFAULT_TX_POLICY: TxPolicy = {
+  programs: Object.values(TX_PROGRAMS),
+  maxPriorityFeeLamports: 5_000_000n, // 0.005 SOL
+  maxRentLamports: 10_000_000n, // ~4 token accounts
+  tipAccounts: [],
+};
+
 /**
- * Check a transaction from Jupiter, then add our signatures.
- * - The fee payer must be one of `feePayers`.
- * - Every address in `mustSign` must be a required signer.
- * - Each signer in `signers` signs only if it is a required signer (match by
- *   key, not position: Jupiter's signer order varies between quotes).
+ * Value the transaction may move from the user to named recipients (a
+ * Trigger deposit into the user's vault): System and Token transfers to
+ * `recipients`, at most `maxAmount` in total.
+ */
+export interface Outflow {
+  recipients: Address[];
+  maxAmount: bigint;
+}
+
+export interface TxCheck {
+  inspection: TxInspection;
+  priorityFeeLamports: bigint;
+  rentLamports: bigint;
+  outflow: bigint;
+}
+
+type CheckIx = { program: Address; accounts: (Address | null)[]; data: Uint8Array };
+
+const refuse = (code: string, i: number | undefined, msg: string): never => {
+  throw new JupiterError(0, code, i === undefined ? msg : `Instruction ${i}: ${msg}`);
+};
+const rdU32 = (d: Uint8Array, o: number) => Buffer.from(d.buffer, d.byteOffset, d.byteLength).readUInt32LE(o);
+const rdU64 = (d: Uint8Array, o: number) => Buffer.from(d.buffer, d.byteOffset, d.byteLength).readBigUInt64LE(o);
+
+/** ATA of `owner` for `mint` under `tokenProgram`. */
+export async function associatedTokenAddress(owner: Address, mint: Address, tokenProgram: Address = TX_PROGRAMS.token): Promise<Address> {
+  const enc = getAddressEncoder();
+  const [pda] = await getProgramDerivedAddress({ programAddress: TX_PROGRAMS.ata, seeds: [enc.encode(owner), enc.encode(tokenProgram), enc.encode(mint)] });
+  return pda;
+}
+
+/** Top-level instructions with addresses; accounts loaded from an unresolved lookup table are `null`. */
+function instructionsOf(wireBase64: string, lookups?: Record<Address, Address[]>): { ixs: CheckIx[]; v1PriorityFee: bigint } {
+  const tx = getTransactionDecoder().decode(Buffer.from(wireBase64, "base64"));
+  const compiled = getCompiledTransactionMessageDecoder().decode(tx.messageBytes);
+  if (compiled.version === 1) {
+    const m = decompileTransactionMessage(compiled as never) as unknown as {
+      instructions: readonly { programAddress: Address; accounts?: readonly { address: Address }[]; data?: ArrayLike<number> }[];
+      config?: { priorityFeeLamports?: bigint };
+    };
+    return {
+      ixs: m.instructions.map((ix) => ({ program: ix.programAddress, accounts: (ix.accounts ?? []).map((a) => a.address), data: new Uint8Array(ix.data ?? []) })),
+      v1PriorityFee: BigInt(m.config?.priorityFeeLamports ?? 0n),
+    };
+  }
+  const c = compiled as unknown as {
+    staticAccounts: Address[];
+    instructions: { programAddressIndex: number; accountIndices?: number[]; data?: ArrayLike<number> }[];
+    addressTableLookups?: { lookupTableAddress: Address; writableIndexes: readonly number[]; readonlyIndexes: readonly number[] }[];
+  };
+  const pick = (kind: "writableIndexes" | "readonlyIndexes") =>
+    (c.addressTableLookups ?? []).flatMap((l) => l[kind].map((j) => lookups?.[l.lookupTableAddress]?.[j] ?? null));
+  const keys: (Address | null)[] = [...c.staticAccounts, ...pick("writableIndexes"), ...pick("readonlyIndexes")];
+  const ixs = c.instructions.map((ix, i) => {
+    // The runtime loads program ids from static keys only.
+    if (ix.programAddressIndex >= c.staticAccounts.length) refuse("program_not_allowed", i, "program id is not a static account.");
+    return { program: c.staticAccounts[ix.programAddressIndex], accounts: (ix.accountIndices ?? []).map((j) => keys[j] ?? null), data: new Uint8Array(ix.data ?? []) };
+  });
+  return { ixs, v1PriorityFee: 0n };
+}
+
+/**
+ * Decode a transaction from Jupiter and refuse it unless it is safe for
+ * `user` to sign. Every refusal is a JupiterError with one of these codes:
+ *   fee_payer, not_a_signer, malformed_tx,
+ *   program_not_allowed        top-level program not on `policy.programs`
+ *   system_instruction         System instruction other than CreateAccount / Transfer (or malformed)
+ *   system_assign              System Assign
+ *   system_nonce               System AdvanceNonceAccount (durable nonce)
+ *   user_transfer              System transfer of the user's SOL to anyone but the user / their wSOL ATA
+ *   foreign_transfer           System transfer by another signer to anyone but the user / their wSOL ATA
+ *   rent_too_high              user-funded CreateAccount lamports + ATA rent over `maxRentLamports`
+ *   token_transfer             top-level Token transfer under the user's authority
+ *   token_approve              Approve to a delegate other than the user
+ *   token_set_authority        SetAuthority to anyone but the user
+ *   token_close                CloseAccount paying anyone but the user
+ *   token_instruction          other Token instruction
+ *   ata_instruction            ATA instruction other than Create / CreateIdempotent
+ *   compute_budget_instruction unknown or duplicate ComputeBudget instruction
+ *   priority_fee_too_high      priority fee plus tips over `maxPriorityFeeLamports`
+ *   outflow_too_high           transfers to `outflow.recipients` over `outflow.maxAmount`
+ */
+export async function checkTransaction(
+  wireBase64: string,
+  o: { user: Address; feePayers: Address[]; policy?: Partial<TxPolicy>; lookups?: Record<Address, Address[]>; outflow?: Outflow },
+): Promise<TxCheck> {
+  const P: TxPolicy = { ...DEFAULT_TX_POLICY, ...(stripUndefined({ ...(o.policy ?? {}) } as Record<string, unknown>) as Partial<TxPolicy>) };
+  const ins = inspectTransaction(wireBase64);
+  if (!o.feePayers.includes(ins.feePayer)) refuse("fee_payer", undefined, `Unexpected fee payer ${ins.feePayer}; expected ${o.feePayers.join(" or ")}.`);
+  if (!ins.requiredSigners.includes(o.user)) refuse("not_a_signer", undefined, `${o.user} is not a required signer of this transaction.`);
+
+  let decoded: ReturnType<typeof instructionsOf>;
+  try {
+    decoded = instructionsOf(wireBase64, o.lookups);
+  } catch (e) {
+    if (e instanceof JupiterError) throw e;
+    throw new JupiterError(0, "malformed_tx", `Could not decode the instructions: ${(e as Error).message}`);
+  }
+  const { ixs } = decoded;
+  const user = o.user;
+  const userWsol = await associatedTokenAddress(user, WSOL_MINT);
+  const own = (a: Address | null) => a === user || a === userWsol;
+  const recipients = new Set(o.outflow?.recipients ?? []);
+  const tips = new Set(P.tipAccounts);
+  const programs = new Set(P.programs);
+
+  let rent = 0n;
+  let tipLamports = 0n;
+  let outflow = 0n;
+  let cuLimit: number | undefined;
+  let cuPrice: bigint | undefined;
+  const cbSeen = new Set<number>();
+
+  for (const [i, ix] of ixs.entries()) {
+    const a = ix.accounts;
+    const d = ix.data;
+    if (!programs.has(ix.program)) refuse("program_not_allowed", i, `program ${ix.program} is not allowlisted.`);
+
+    if (ix.program === TX_PROGRAMS.system) {
+      if (d.length < 4) refuse("system_instruction", i, "malformed System instruction.");
+      const tag = rdU32(d, 0);
+      if (tag === 1) refuse("system_assign", i, "System Assign is not allowed.");
+      if (tag === 4) refuse("system_nonce", i, "durable-nonce AdvanceNonceAccount is not allowed.");
+      if (tag === 0) {
+        if (d.length !== 52 || a.length < 2) refuse("system_instruction", i, "malformed CreateAccount.");
+        if (a[0] === user) rent += rdU64(d, 4);
+      } else if (tag === 2) {
+        if (d.length !== 12 || a.length < 2) refuse("system_instruction", i, "malformed Transfer.");
+        const lamports = rdU64(d, 4);
+        const [from, to] = a;
+        if (own(to)) continue; // into the user's own wallet or wSOL account
+        if (to && tips.has(to)) tipLamports += lamports;
+        else if (from === user && to && recipients.has(to)) outflow += lamports;
+        else if (from === user) refuse("user_transfer", i, `transfer of ${lamports} lamports from the user to ${to ?? "a lookup-table account"}.`);
+        else refuse("foreign_transfer", i, `transfer of ${lamports} lamports from ${from} to ${to ?? "a lookup-table account"}.`);
+      } else {
+        refuse("system_instruction", i, `System instruction ${tag} is not allowed.`);
+      }
+    } else if (ix.program === TX_PROGRAMS.token || ix.program === TX_PROGRAMS.token2022) {
+      const tag = d[0];
+      /** True when the user is the authority from account `k` on (single owner or a multisig signer). */
+      const userAuth = (k: number) => a.slice(k).includes(user);
+      switch (tag) {
+        case 1: case 16: case 18: // InitializeAccount(2/3)
+        case 5: // Revoke
+        case 17: // SyncNative
+          break;
+        case 3: case 12: { // Transfer, TransferChecked
+          if (d.length < 9) refuse("token_instruction", i, "malformed transfer.");
+          const auth = tag === 3 ? 2 : 3;
+          const dest = a[tag === 3 ? 1 : 2];
+          if (!userAuth(auth)) break;
+          if (dest && recipients.has(dest)) outflow += rdU64(d, 1);
+          else refuse("token_transfer", i, `token transfer under the user's authority to ${dest ?? "a lookup-table account"}.`);
+          break;
+        }
+        case 4: case 13: { // Approve, ApproveChecked
+          const delegate = a[tag === 4 ? 1 : 2];
+          if (userAuth(tag === 4 ? 2 : 3) && delegate !== user) refuse("token_approve", i, `approve to delegate ${delegate ?? "a lookup-table account"}.`);
+          break;
+        }
+        case 6: { // SetAuthority
+          if (d.length < 3) refuse("token_instruction", i, "malformed SetAuthority.");
+          const next = d[2] === 1 && d.length >= 35 ? getBase58Decoder().decode(d.slice(3, 35)) : null;
+          if (userAuth(1) && next !== user) refuse("token_set_authority", i, `set authority to ${next ?? "none"}.`);
+          break;
+        }
+        case 9: // CloseAccount
+          if (a[1] !== user) refuse("token_close", i, `close pays ${a[1] ?? "a lookup-table account"}, not the user.`);
+          break;
+        default:
+          refuse("token_instruction", i, `Token instruction ${tag} is not allowed.`);
+      }
+    } else if (ix.program === TX_PROGRAMS.ata) {
+      if (d.length > 1 || (d.length === 1 && d[0] !== 0 && d[0] !== 1)) refuse("ata_instruction", i, `ATA instruction ${d[0]} is not allowed.`);
+      if (a[0] === user) rent += TOKEN_ACCOUNT_RENT_LAMPORTS;
+    } else if (ix.program === TX_PROGRAMS.computeBudget) {
+      const tag = d[0];
+      const len = { 1: 5, 2: 5, 3: 9, 4: 5 }[tag as 1 | 2 | 3 | 4];
+      if (len === undefined || d.length !== len) refuse("compute_budget_instruction", i, "unsupported compute budget instruction.");
+      if (cbSeen.has(tag)) refuse("compute_budget_instruction", i, "duplicate compute budget instruction.");
+      cbSeen.add(tag);
+      if (tag === 2) cuLimit = rdU32(d, 1);
+      if (tag === 3) cuPrice = rdU64(d, 1);
+    }
+  }
+
+  if (rent > P.maxRentLamports) refuse("rent_too_high", undefined, `User-funded rent ${rent} lamports is over the ${P.maxRentLamports} cap.`);
+  if (o.outflow && outflow > o.outflow.maxAmount) refuse("outflow_too_high", undefined, `Transfers of ${outflow} to the recipients exceed ${o.outflow.maxAmount}.`);
+  const others = ixs.filter((ix) => ix.program !== TX_PROGRAMS.computeBudget).length;
+  const limit = BigInt(cuLimit ?? Math.min(1_400_000, 200_000 * others));
+  const priority = ((cuPrice ?? 0n) * limit + 999_999n) / 1_000_000n + decoded.v1PriorityFee + tipLamports;
+  if (priority > P.maxPriorityFeeLamports) refuse("priority_fee_too_high", undefined, `Priority fee and tips ${priority} lamports are over the ${P.maxPriorityFeeLamports} cap.`);
+  return { inspection: ins, priorityFeeLamports: priority, rentLamports: rent, outflow };
+}
+
+/**
+ * Check a transaction from Jupiter (`checkTransaction`), then sign it as the
+ * user, and only as the user. There is deliberately no way to pass a second
+ * signer: server keys (our gas sponsor) never sign here.
  */
 export async function checkAndSign(
   wireBase64: string,
-  o: { feePayers: Address[]; mustSign: Address[]; signers: TransactionPartialSigner[] },
-): Promise<{ signedTransaction: string; inspection: TxInspection }> {
-  const ins = inspectTransaction(wireBase64);
-  if (!o.feePayers.includes(ins.feePayer)) {
-    throw new JupiterError(0, "fee_payer", `Unexpected fee payer ${ins.feePayer}; expected ${o.feePayers.join(" or ")}.`);
+  o: { user: TransactionPartialSigner; feePayers: Address[]; policy?: Partial<TxPolicy>; lookups?: Record<Address, Address[]>; outflow?: Outflow },
+): Promise<{ signedTransaction: string; inspection: TxInspection; check: TxCheck }> {
+  if ("signers" in (o as object) || !o.user || typeof o.user.signTransactions !== "function") {
+    throw new JupiterError(0, "server_signer", "checkAndSign signs only as the user; send sponsored transactions to the gas sponsor.");
   }
-  for (const a of o.mustSign) {
-    if (!ins.requiredSigners.includes(a)) throw new JupiterError(0, "not_a_signer", `${a} is not a required signer of this transaction.`);
-  }
-  let tx = ins.tx;
-  for (const s of o.signers) {
-    if (!ins.requiredSigners.includes(s.address)) continue;
-    const [dict] = await s.signTransactions([tx as never]);
-    const sig = dict?.[s.address];
-    if (!sig) throw new JupiterError(0, "sign_failed", `Signer ${s.address} returned no signature.`);
-    tx = { ...tx, signatures: { ...tx.signatures, [s.address]: sig } };
-  }
-  return { signedTransaction: getBase64EncodedWireTransaction(tx), inspection: ins };
+  const check = await checkTransaction(wireBase64, { ...o, user: o.user.address });
+  let tx = check.inspection.tx;
+  const [dict] = await o.user.signTransactions([tx as never]);
+  const sig = dict?.[o.user.address];
+  if (!sig) throw new JupiterError(0, "sign_failed", `Signer ${o.user.address} returned no signature.`);
+  tx = { ...tx, signatures: { ...tx.signatures, [o.user.address]: sig } };
+  return { signedTransaction: getBase64EncodedWireTransaction(tx), inspection: check.inspection, check };
 }
 
 // ---------------------------------------------------------------------------
@@ -321,8 +594,12 @@ export interface ExecuteResult {
 
 export interface SignOrderOptions {
   taker: TransactionPartialSigner;
-  /** The integrator payer the order was requested with: its signer, so we can co-sign, or just its address if it signs elsewhere. */
-  payer?: TransactionPartialSigner | Address;
+  /**
+   * The gas sponsor address the order was requested with. Only an address:
+   * this module never signs with it. The returned transaction is signed by the
+   * taker only; send it to the gas sponsor (sponsor.ts, `Sponsor.sponsor()`).
+   */
+  payer?: Address;
   /** When given, the order must echo these back. */
   expect?: { inputMint: string; outputMint: string; amount: bigint | string | number };
 }
@@ -337,7 +614,7 @@ export class Jupiter {
 
   constructor(private opts: JupiterOptions = {}) {
     this.http = new Http(opts);
-    this.trigger = new JupiterTrigger(this.http);
+    this.trigger = new JupiterTrigger(this.http, opts.txPolicy);
     const fee = opts.referralFeeBps;
     if (fee !== undefined) assertReferralFee(fee);
   }
@@ -382,16 +659,20 @@ export class Jupiter {
   }
 
   /**
-   * Check an order's transaction and sign it as the taker (and the payer, if
-   * we hold its key and it is a required signer).
+   * Check an order's transaction (`checkTransaction`) and sign it as the
+   * taker, and only as the taker.
    *
-   * Expected fee payer: the integrator `payer` when one differs from the
-   * taker, else the taker. On a JupiterZ (RFQ) route the market maker pays
-   * the fee instead, so `order.maker` is also accepted there.
+   * Expected fee payer: the sponsor `payer` when one differs from the taker,
+   * else the taker. On a JupiterZ (RFQ) route the market maker pays the fee
+   * instead; the order's `maker` is accepted there only if it is on
+   * `jupiterZMakers`, otherwise the route is refused (`maker_not_allowed`).
    */
   async signOrder(order: SwapOrder, o: SignOrderOptions): Promise<string> {
     if (!order.transaction) {
       throw new JupiterError(0, "no_transaction", `Order has no transaction${order.errorCode !== undefined ? ` (router ${order.router}, errorCode ${order.errorCode}: ${order.errorMessage ?? order.error ?? ""})` : ""}.`, order);
+    }
+    if (o.payer !== undefined && typeof o.payer !== "string") {
+      throw new JupiterError(0, "server_signer", "Pass the sponsor payer as an address; jupiter.ts never signs with a server key.");
     }
     const taker = o.taker.address;
     if (order.taker && order.taker !== taker) throw new JupiterError(0, "taker", `Order is for taker ${order.taker}, not ${taker}.`);
@@ -399,14 +680,18 @@ export class Jupiter {
       if (order.inputMint !== o.expect.inputMint || order.outputMint !== o.expect.outputMint) throw new JupiterError(0, "order_mismatch", "Order mints differ from the request.");
       if (order.inAmount !== units(o.expect.amount, "amount")) throw new JupiterError(0, "order_mismatch", "Order inAmount differs from the request.");
     }
-    const payer = o.payer === undefined ? undefined : addressOf(o.payer);
+    const payer = o.payer === undefined ? undefined : addr(o.payer, "payer");
     const feePayers: Address[] = [payer && payer !== taker ? payer : taker];
-    // ASSUMPTION: on JupiterZ routes the fee payer is the `maker` in the order
-    // response. Docs say "the market maker is the transaction fee payer" but
-    // don't name the field; `maker` is the only candidate.
-    if (order.router === "jupiterz" && order.maker && isAddress(order.maker)) feePayers.push(order.maker);
-    const signers = [o.taker, ...(o.payer && typeof o.payer !== "string" ? [o.payer] : [])];
-    const { signedTransaction } = await checkAndSign(order.transaction, { feePayers, mustSign: [taker], signers });
+    if (order.router === "jupiterz") {
+      const makers = this.opts.jupiterZMakers ?? [];
+      if (typeof order.maker !== "string" || !isAddress(order.maker) || !makers.includes(order.maker)) {
+        throw new JupiterError(0, "maker_not_allowed", `JupiterZ maker ${String(order.maker)} is not on the allowlist.`);
+      }
+      feePayers.push(order.maker);
+    }
+    const tables = lookupTablesOf(order.transaction);
+    const lookups = tables.length && this.opts.resolveLookupTables ? await this.opts.resolveLookupTables(tables) : undefined;
+    const { signedTransaction } = await checkAndSign(order.transaction, { user: o.taker, feePayers, policy: this.opts.txPolicy, lookups });
     return signedTransaction;
   }
 
@@ -416,10 +701,18 @@ export class Jupiter {
     return this.http.request<ExecuteResult>("POST", "/swap/v2/execute", { body: { signedTransaction, requestId, ...(lastValidBlockHeight ? { lastValidBlockHeight } : {}) } });
   }
 
-  /** Order, check and sign, execute. */
-  async swap(req: Omit<OrderRequest, "taker" | "payer"> & { taker: TransactionPartialSigner; payer?: TransactionPartialSigner | Address }) {
-    const order = await this.getOrder({ ...req, taker: req.taker.address, payer: req.payer === undefined ? undefined : addressOf(req.payer) });
+  /**
+   * Order, check and sign, execute. With a sponsor `payer`, nothing is
+   * executed: the taker-signed transaction is returned for the caller to send
+   * to the gas sponsor service (sponsor.ts), which applies its own policy and
+   * simulation before co-signing.
+   */
+  async swap(
+    req: Omit<OrderRequest, "taker" | "payer"> & { taker: TransactionPartialSigner; payer?: Address },
+  ): Promise<{ order: SwapOrder; result: ExecuteResult } | { order: SwapOrder; sponsorTransaction: string }> {
+    const order = await this.getOrder({ ...req, taker: req.taker.address, payer: req.payer });
     const signed = await this.signOrder(order, { taker: req.taker, payer: req.payer, expect: req });
+    if (req.payer !== undefined && req.payer !== req.taker.address) return { order, sponsorTransaction: signed };
     const result = await this.execute(signed, order.requestId);
     return { order, result };
   }
@@ -592,9 +885,10 @@ const JWT_TTL_MS = 23 * 3_600_000; // docs: 24 h; refresh an hour early
 
 export class JupiterTrigger {
   private tokens = new Map<string, { token: string; until: number }>();
-  private vaults = new Set<string>();
+  /** Wallet → its vault pubkey from GET /vault (null if the response named none). */
+  private vaults = new Map<string, Address | null>();
 
-  constructor(private http: Http) {}
+  constructor(private http: Http, private policy?: Partial<TxPolicy>) {}
 
   /** Challenge → sign → verify. Returns a JWT, cached per wallet. */
   async authenticate(signer: WalletSigner, force = false): Promise<string> {
@@ -627,34 +921,44 @@ export class JupiterTrigger {
 
   /** GET /vault, registering on first use. The vault is resolved from the JWT. */
   async vault(signer: WalletSigner): Promise<unknown> {
-    try {
-      const v = await this.authed<unknown>(signer, "GET", "/trigger/v2/vault");
-      this.vaults.add(signer.address);
+    const remember = (v: unknown) => {
+      const pk = (v as { vaultPubkey?: unknown } | null)?.vaultPubkey;
+      this.vaults.set(signer.address, typeof pk === "string" && isAddress(pk) ? pk : null);
       return v;
+    };
+    try {
+      return remember(await this.authed<unknown>(signer, "GET", "/trigger/v2/vault"));
     } catch (e) {
       if (!(e instanceof JupiterError) || e.status === 0 || e.status === 401) throw e;
       // ASSUMPTION: GET for /vault/register (the docs sample omits the method).
-      const v = await this.authed<unknown>(signer, "GET", "/trigger/v2/vault/register");
-      this.vaults.add(signer.address);
-      return v;
+      return remember(await this.authed<unknown>(signer, "GET", "/trigger/v2/vault/register"));
     }
   }
 
   /** POST /deposit/craft, check the deposit transaction and sign it. */
   private async deposit(signer: WalletSigner, d: { inputMint: Address; outputMint: Address; amount: string; orderType: "price" | "dca"; orderSubType?: string; jlMint?: string }) {
     if (!this.vaults.has(signer.address)) await this.vault(signer);
-    const crafted = await this.authed<{ requestId?: unknown; transaction?: unknown }>(signer, "POST", "/trigger/v2/deposit/craft", {
+    const crafted = await this.authed<{ requestId?: unknown; transaction?: unknown; receiverAddress?: unknown }>(signer, "POST", "/trigger/v2/deposit/craft", {
       body: { inputMint: d.inputMint, outputMint: d.outputMint, userAddress: signer.address, amount: d.amount, orderType: d.orderType, ...(d.orderSubType ? { orderSubType: d.orderSubType } : {}), ...(d.jlMint ? { jlMint: d.jlMint } : {}) },
     });
     if (typeof crafted.requestId !== "string" || typeof crafted.transaction !== "string") throw new JupiterError(0, "bad_response", "Deposit craft returned no transaction.");
-    const signed = await this.signWalletTx(signer, crafted.transaction);
+    // The deposit may move up to `amount` into the vault (its wallet or its
+    // token accounts for the input mint), and nowhere else.
+    const vault = this.vaults.get(signer.address) ?? null;
+    if (crafted.receiverAddress !== undefined && crafted.receiverAddress !== vault) {
+      throw new JupiterError(0, "vault_mismatch", "Deposit receiverAddress is not the wallet's vault.");
+    }
+    const recipients: Address[] = vault
+      ? [vault, ...(await Promise.all([TX_PROGRAMS.token, TX_PROGRAMS.token2022].map((p) => associatedTokenAddress(vault, d.inputMint, p))))]
+      : [];
+    const signed = await this.signWalletTx(signer, crafted.transaction, { recipients, maxAmount: BigInt(d.amount) });
     return { depositRequestId: crafted.requestId, depositSignedTx: signed };
   }
 
   // ASSUMPTION: deposit and withdrawal transactions have the wallet as fee
   // payer. The docs show the wallet signing them but don't say who pays.
-  private async signWalletTx(signer: WalletSigner, wire: string): Promise<string> {
-    const { signedTransaction } = await checkAndSign(wire, { feePayers: [signer.address], mustSign: [signer.address], signers: [signer] });
+  private async signWalletTx(signer: WalletSigner, wire: string, outflow?: Outflow): Promise<string> {
+    const { signedTransaction } = await checkAndSign(wire, { user: signer, feePayers: [signer.address], policy: this.policy, outflow });
     return signedTransaction;
   }
 

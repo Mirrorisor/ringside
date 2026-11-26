@@ -17,7 +17,7 @@ import {
   signatureBytes,
   verifySignature,
 } from "@solana/kit";
-import { Jupiter, JupiterError, netReferralBps, inspectTransaction } from "../dist/trade/jupiter.js";
+import { Jupiter, JupiterError, netReferralBps, inspectTransaction, checkAndSign, checkTransaction, associatedTokenAddress, TX_PROGRAMS } from "../dist/trade/jupiter.js";
 
 const SOL = "So11111111111111111111111111111111111111112";
 const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
@@ -74,6 +74,8 @@ test("netReferralBps keeps 80% and rejects out-of-range fees", () => {
   assert.equal(netReferralBps(50), 40);
   assert.equal(netReferralBps(100), 80);
   assert.equal(netReferralBps(255), 204);
+  assert.equal(netReferralBps(51), 40); // 40.8 floored
+  for (let b = 50; b <= 255; b++) assert.ok(Number.isInteger(netReferralBps(b)));
   for (const bad of [0, 49, 256, 50.5, NaN]) assert.throws(() => netReferralBps(bad), { code: "referral_fee" });
 });
 
@@ -152,29 +154,46 @@ test("signOrder refuses an unexpected fee payer, taker or amount", async () => {
   await assert.rejects(jup.signOrder(orderFor(taker.address, "AAAA"), { taker }), { code: "malformed_tx" });
 });
 
-test("gasless: integrator payer must be the fee payer and co-signs only when required", async () => {
+test("gasless: sponsor payer must be the fee payer; we sign only as the taker", async () => {
   const { jup, taker } = await setup({});
   const payer = await generateKeyPairSigner();
-  let wire = await jup.signOrder(orderFor(taker.address, unsignedTx(payer.address, [taker.address])), { taker, payer });
-  assert.ok(signedBy(wire, taker.address) && signedBy(wire, payer.address));
+  const wire = await jup.signOrder(orderFor(taker.address, unsignedTx(payer.address, [taker.address])), { taker, payer: payer.address });
+  assert.ok(signedBy(wire, taker.address) && !signedBy(wire, payer.address)); // the sponsor service co-signs, not us
   // With a payer set, the taker paying is not what we asked for.
-  await assert.rejects(jup.signOrder(orderFor(taker.address, unsignedTx(taker.address)), { taker, payer }), { code: "fee_payer" });
-  // Payer given as an address only: we sign as taker and leave the payer slot for whoever holds that key.
-  wire = await jup.signOrder(orderFor(taker.address, unsignedTx(payer.address, [taker.address])), { taker, payer: payer.address });
-  assert.ok(signedBy(wire, taker.address) && !signedBy(wire, payer.address));
+  await assert.rejects(jup.signOrder(orderFor(taker.address, unsignedTx(taker.address)), { taker, payer: payer.address }), { code: "fee_payer" });
+  // Handing us the sponsor's key is refused outright.
+  await assert.rejects(jup.signOrder(orderFor(taker.address, unsignedTx(payer.address, [taker.address])), { taker, payer }), { code: "server_signer" });
 });
 
-test("JupiterZ: the market maker may be fee payer; payer not signing on SOL output", async () => {
-  const { jup, taker } = await setup({});
+test("swap() with a sponsor payer returns the taker-signed transaction and does not execute", async () => {
+  const payer = (await generateKeyPairSigner()).address;
+  const { jup, f, taker } = await setup((t) => ({ "GET /swap/v2/order": async () => [200, orderFor(t.address, unsignedTx(payer, [t.address]))] }));
+  const out = await jup.swap({ inputMint: SOL, outputMint: USDC, amount: "1000000000", taker, payer });
+  assert.ok(signedBy(out.sponsorTransaction, taker.address) && !signedBy(out.sponsorTransaction, payer));
+  assert.equal(out.result, undefined);
+  assert.deepEqual(f.calls.map((c) => c.key), ["GET /swap/v2/order"]);
+});
+
+test("JupiterZ: an allowlisted market maker may be fee payer", async () => {
   const maker = (await generateKeyPairSigner()).address;
-  const payer = await generateKeyPairSigner();
+  const { jup, taker } = await setup({}, { jupiterZMakers: [maker] });
+  const payer = (await generateKeyPairSigner()).address;
   const tx = unsignedTx(maker, [taker.address]);
   const wire = await jup.signOrder(orderFor(taker.address, tx, { router: "jupiterz", maker }), { taker, payer });
   assert.ok(signedBy(wire, taker.address));
-  assert.ok(!signedBy(wire, payer.address)); // not a required signer, so not signed
   assert.equal(inspectTransaction(wire).feePayer, maker);
   // The maker exception is only for jupiterz routes.
   await assert.rejects(jup.signOrder(orderFor(taker.address, tx, { router: "metis", maker }), { taker }), { code: "fee_payer" });
+});
+
+test("JupiterZ: a maker not on the allowlist is refused", async () => {
+  const known = (await generateKeyPairSigner()).address;
+  const rogue = (await generateKeyPairSigner()).address;
+  for (const opts of [{}, { jupiterZMakers: [known] }]) {
+    const { jup, taker } = await setup({}, opts);
+    await assert.rejects(jup.signOrder(orderFor(taker.address, unsignedTx(rogue, [taker.address]), { router: "jupiterz", maker: rogue }), { taker }), { code: "maker_not_allowed" });
+    await assert.rejects(jup.signOrder(orderFor(taker.address, unsignedTx(taker.address), { router: "jupiterz" }), { taker }), { code: "maker_not_allowed" });
+  }
 });
 
 test("swap(): order → check → sign → execute", async () => {
@@ -244,7 +263,7 @@ function triggerRoutes(wallet, state) {
     },
     "GET /trigger/v2/vault": async () => (state.vault ? [200, { vault: "V" }] : [404, { error: "no vault" }]),
     "GET /trigger/v2/vault/register": async () => ((state.vault = true), [200, { vault: "V" }]),
-    "POST /trigger/v2/deposit/craft": async (_u, b) => ((state.craft = b), [200, { requestId: "dep-1", transaction: unsignedTx(state.depositFeePayer ?? wallet.address) }]),
+    "POST /trigger/v2/deposit/craft": async (_u, b) => ((state.craft = b), [200, { requestId: "dep-1", transaction: state.depositTx ?? unsignedTx(state.depositFeePayer ?? wallet.address) }]),
     "POST /trigger/v2/orders/price": async (_u, b) => ((state.created = b), [200, { id: "ord-1", txSignature: "dsig", depositConfirmed: true }]),
     "PATCH /trigger/v2/orders/price/ord-1": async (_u, b) => ((state.patched = b), [200, { id: "ord-1" }]),
     "POST /trigger/v2/orders/price/cancel/ord-1": async () => [200, { id: "ord-1", transaction: unsignedTx(wallet.address), requestId: "can-1" }],
@@ -368,4 +387,145 @@ test("trigger: DCA create (time-based and price-conditional), validation and can
   const c = await jup.trigger.cancelDcaOrder(wallet, "dca-1");
   assert.equal(c.txSignature, "wsig2");
   assert.equal(state.dcaConfirmed.cancelRequestId, "can-2");
+});
+
+// ---------------------------------------------------------------------------
+// Transaction policy (review finding H1)
+
+const W = AccountRole.WRITABLE, WS = AccountRole.WRITABLE_SIGNER, R = AccountRole.READONLY, RS = AccountRole.READONLY_SIGNER;
+const le = (n, bytes) => { const b = Buffer.alloc(bytes); bytes === 4 ? b.writeUInt32LE(Number(n)) : b.writeBigUInt64LE(BigInt(n)); return [...b]; };
+const P = TX_PROGRAMS;
+const ixs = {
+  transfer: (from, to, l) => ({ programAddress: P.system, accounts: [{ address: from, role: WS }, { address: to, role: W }], data: new Uint8Array([...le(2, 4), ...le(l, 8)]) }),
+  createAccount: (from, to, l) => ({ programAddress: P.system, accounts: [{ address: from, role: WS }, { address: to, role: WS }], data: new Uint8Array([...le(0, 4), ...le(l, 8), ...le(0, 8), ...new Uint8Array(32)]) }),
+  assign: (who) => ({ programAddress: P.system, accounts: [{ address: who, role: WS }], data: new Uint8Array([...le(1, 4), ...new Uint8Array(32)]) }),
+  advanceNonce: (nonce, auth) => ({ programAddress: P.system, accounts: [{ address: nonce, role: W }, { address: "SysvarRecentB1ockHashes11111111111111111111", role: R }, { address: auth, role: RS }], data: new Uint8Array(le(4, 4)) }),
+  cuLimit: (n) => ({ programAddress: P.computeBudget, data: new Uint8Array([2, ...le(n, 4)]) }),
+  cuPrice: (n) => ({ programAddress: P.computeBudget, data: new Uint8Array([3, ...le(n, 8)]) }),
+  approve: (src, delegate, owner) => ({ programAddress: P.token, accounts: [{ address: src, role: W }, { address: delegate, role: R }, { address: owner, role: RS }], data: new Uint8Array([4, ...le(1_000_000, 8)]) }),
+  setAuthority: (acct, cur, next) => ({ programAddress: P.token, accounts: [{ address: acct, role: W }, { address: cur, role: RS }], data: new Uint8Array([6, 2, 1, ...getBase58Encoder().encode(next)]) }),
+  close: (acct, dest, owner) => ({ programAddress: P.token, accounts: [{ address: acct, role: W }, { address: dest, role: W }, { address: owner, role: RS }], data: new Uint8Array([9]) }),
+  tokenTransfer: (src, dest, owner, n) => ({ programAddress: P.token, accounts: [{ address: src, role: W }, { address: dest, role: W }, { address: owner, role: RS }], data: new Uint8Array([3, ...le(n, 8)]) }),
+  syncNative: (acct) => ({ programAddress: P.token, accounts: [{ address: acct, role: W }], data: new Uint8Array([17]) }),
+  ataCreate: (funder, ata, owner, mint) => ({ programAddress: P.ata, accounts: [{ address: funder, role: WS }, { address: ata, role: W }, { address: owner, role: R }, { address: mint, role: R }, { address: P.system, role: R }, { address: P.token, role: R }], data: new Uint8Array([1]) }),
+  jup: (taker) => ({ programAddress: PROGRAM, accounts: [{ address: taker, role: WS }], data: new Uint8Array([1]) }),
+};
+function txOf(feePayer, list) {
+  const msg = pipe(
+    createTransactionMessage({ version: 0 }),
+    (m) => setTransactionMessageFeePayer(feePayer, m),
+    (m) => setTransactionMessageLifetimeUsingBlockhash({ blockhash: "EETubP5AKHgjPAhzPAFcb8BAY1hMH639CWCFTqi3hq1k", lastValidBlockHeight: 100n }, m),
+    (m) => appendTransactionMessageInstructions(list, m),
+  );
+  return getBase64EncodedWireTransaction(compileTransaction(msg));
+}
+const addrs = async (n) => Promise.all(Array.from({ length: n }, async () => (await generateKeyPairSigner()).address));
+
+test("H1: the reviewer's 50 SOL payer drain is refused and nothing is signed", async () => {
+  const payer = await generateKeyPairSigner(); const taker = await generateKeyPairSigner(); const [attacker] = await addrs(1);
+  const wire = txOf(payer.address, [ixs.transfer(payer.address, attacker, 50_000_000_000n), ixs.transfer(taker.address, attacker, 1)]);
+  // The reviewer's exact call (server key in `signers`) is refused before anything else.
+  await assert.rejects(checkAndSign(wire, { feePayers: [payer.address], mustSign: [taker.address], signers: [taker, payer] }), { code: "server_signer" });
+  // Signing as the user only: the transfer out of the payer is still refused.
+  await assert.rejects(checkAndSign(wire, { user: taker, feePayers: [payer.address] }), { code: "foreign_transfer" });
+  // Through the client with a sponsor payer.
+  let signed = false;
+  const spy = { address: taker.address, signTransactions: async (t) => ((signed = true), taker.signTransactions(t)) };
+  const { jup } = await setup({});
+  await assert.rejects(jup.signOrder(orderFor(taker.address, wire), { taker: spy, payer: payer.address }), { code: "foreign_transfer" });
+  assert.equal(signed, false);
+});
+
+test("H1: an extra System transfer of the user's SOL is refused", async () => {
+  const { jup, taker } = await setup({});
+  const [stranger] = await addrs(1);
+  const wire = txOf(taker.address, [ixs.jup(taker.address), ixs.transfer(taker.address, stranger, 1)]);
+  await assert.rejects(jup.signOrder(orderFor(taker.address, wire), { taker }), { code: "user_transfer" });
+});
+
+test("H1: Token Approve / SetAuthority / CloseAccount to a stranger are refused", async () => {
+  const { jup, taker } = await setup({});
+  const [stranger, acct] = await addrs(2);
+  const cases = [
+    [ixs.approve(acct, stranger, taker.address), "token_approve"],
+    [ixs.setAuthority(acct, taker.address, stranger), "token_set_authority"],
+    [ixs.close(acct, stranger, taker.address), "token_close"],
+    [ixs.tokenTransfer(acct, stranger, taker.address, 5), "token_transfer"],
+  ];
+  for (const [ix, code] of cases) {
+    await assert.rejects(jup.signOrder(orderFor(taker.address, txOf(taker.address, [ixs.jup(taker.address), ix])), { taker }), { code }, code);
+  }
+});
+
+test("H1: priority fee over the cap is refused; the cap is configurable", async () => {
+  const { jup, taker } = await setup({});
+  // 1.4M CU at 10 lamports/CU = 14M lamports, over the 5M default.
+  const wire = txOf(taker.address, [ixs.cuLimit(1_400_000), ixs.cuPrice(10_000_000), ixs.jup(taker.address)]);
+  await assert.rejects(jup.signOrder(orderFor(taker.address, wire), { taker }), { code: "priority_fee_too_high" });
+  const loose = (await setup({}, { txPolicy: { maxPriorityFeeLamports: 20_000_000n } })).jup;
+  assert.ok(signedBy(await loose.signOrder(orderFor(taker.address, wire), { taker }), taker.address));
+});
+
+test("H1: unknown programs, Assign, AdvanceNonce and rent over the cap are refused", async () => {
+  const { jup, taker } = await setup({});
+  const [stranger, nonce, fresh] = await addrs(3);
+  const cases = [
+    [{ programAddress: stranger, accounts: [{ address: taker.address, role: WS }], data: new Uint8Array([0]) }, "program_not_allowed"],
+    [ixs.assign(taker.address), "system_assign"],
+    [ixs.advanceNonce(nonce, taker.address), "system_nonce"],
+    [ixs.createAccount(taker.address, fresh, 1_000_000_000n), "rent_too_high"],
+  ];
+  for (const [ix, code] of cases) {
+    await assert.rejects(jup.signOrder(orderFor(taker.address, txOf(taker.address, [ix, ixs.jup(taker.address)])), { taker }), { code }, code);
+  }
+});
+
+test("H1: a normal SOL→token swap shape passes", async () => {
+  const { jup, taker } = await setup({});
+  const wsol = await associatedTokenAddress(taker.address, SOL);
+  const usdcAta = await associatedTokenAddress(taker.address, USDC);
+  const wire = txOf(taker.address, [
+    ixs.cuLimit(400_000), ixs.cuPrice(100_000),
+    ixs.ataCreate(taker.address, wsol, taker.address, SOL), ixs.ataCreate(taker.address, usdcAta, taker.address, USDC),
+    ixs.transfer(taker.address, wsol, 1_000_000_000n), ixs.syncNative(wsol),
+    ixs.jup(taker.address),
+    ixs.close(wsol, taker.address, taker.address),
+  ]);
+  const c = await checkTransaction(wire, { user: taker.address, feePayers: [taker.address] });
+  assert.equal(c.priorityFeeLamports, 40_000n);
+  assert.equal(c.rentLamports, 4_078_560n);
+  assert.ok(signedBy(await jup.signOrder(orderFor(taker.address, wire), { taker }), taker.address));
+});
+
+test("H1: Trigger deposits may move at most the amount, and only into the vault", async () => {
+  const wallet = await generateKeyPairSigner();
+  const state = {};
+  const [vault, stranger, src] = await addrs(3);
+  const vaultAta = await associatedTokenAddress(vault, USDC);
+  // Serve a real vault pubkey.
+  const routes = triggerRoutes(wallet, state);
+  routes["GET /trigger/v2/vault"] = async () => [200, { userPubkey: wallet.address, vaultPubkey: vault }];
+  const jup2 = new Jupiter({ apiKey: KEY, fetch: fakeFetch(routes) });
+  const order = { orderType: "oco", inputMint: USDC, outputMint: SOL, inputAmount: "50", triggerMint: SOL, tpPriceUsd: 2, slPriceUsd: 1, expiresAt: future() };
+  for (const [ixList, code] of [
+    [[ixs.tokenTransfer(src, vaultAta, wallet.address, 50)], null],
+    [[ixs.tokenTransfer(src, vaultAta, wallet.address, 51)], "outflow_too_high"],
+    [[ixs.tokenTransfer(src, stranger, wallet.address, 50)], "token_transfer"],
+  ]) {
+    state.depositTx = txOf(wallet.address, ixList);
+    const p = jup2.trigger.createPriceOrder(wallet, order);
+    if (code) await assert.rejects(p, { code }); else assert.equal((await p).id, "ord-1");
+  }
+});
+
+test("baseUrl is pinned to api.jup.ag unless opted out, and must be https", async () => {
+  assert.throws(() => new Jupiter({ apiKey: KEY, baseUrl: "https://evil.example" }), { code: "custom_base_url" });
+  assert.throws(() => new Jupiter({ apiKey: KEY, baseUrl: "https://api.jup.ag.evil.example" }), { code: "custom_base_url" });
+  assert.throws(() => new Jupiter({ apiKey: KEY, baseUrl: "http://api.jup.ag" }), { code: "insecure_base_url" });
+  assert.throws(() => new Jupiter({ apiKey: KEY, baseUrl: "http://localhost:8080", allowCustomBaseUrl: true }), { code: "insecure_base_url" });
+  assert.throws(() => new Jupiter({ apiKey: KEY, baseUrl: "not a url", allowCustomBaseUrl: true }), { code: "insecure_base_url" });
+  new Jupiter({ apiKey: KEY, baseUrl: "https://api.jup.ag/" });
+  const f = fakeFetch({ "GET /price/v3/": async () => [200, {}] });
+  await new Jupiter({ apiKey: KEY, fetch: f, baseUrl: "https://jup-proxy.example", allowCustomBaseUrl: true }).getPrices([SOL]);
+  assert.equal(f.calls[0].url.origin, "https://jup-proxy.example");
 });
