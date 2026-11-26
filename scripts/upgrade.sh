@@ -4,7 +4,7 @@
 #   2. Upgrades both programs in place (same IDs), one at a time, checking SOL
 #      before each and extending the program accounts if they grew.
 #   3. Restarts the keeper (now on Pyth) and relayer.
-#   4. Sets devnet fees/caps and runs the graduation test.
+#   4. Sets devnet fees/caps, runs the graduation test and the creator-fee lock test.
 # Safe to re-run: every step picks up where it left off.
 set -euo pipefail
 . "$HOME/.cargo/env" 2>/dev/null || true
@@ -76,6 +76,18 @@ ensure() { # ensure <lamports> <what>
 # SOL left in buffers by interrupted deploys comes back first.
 solana program close --buffers --url "$RPC" 2>/dev/null | grep -i "closed\|reclaim" | redact || true
 
+# Refuse a target/deploy keypair that isn't the real program (a fresh clone's anchor
+# build makes random ones; deploying with them would create a new, useless program).
+for p in ringside_perps ringside_launch; do
+  want=$(sed -n '/^\[programs.devnet\]/,/^\[/p' Anchor.toml | awk -F'"' -v p="$p" '$0 ~ "^"p" " {print $2}')
+  have=$(solana address -k target/deploy/$p-keypair.json 2>/dev/null || echo missing)
+  if [ "$want" != "$have" ]; then
+    echo "Not deploying: target/deploy/$p-keypair.json is $have but Anchor.toml says $want."
+    echo "Put the real program keypair there (or run from the copy that has it), then run this again."
+    exit 1
+  fi
+done
+
 for p in ringside_perps ringside_launch; do
   id=$(solana address -k target/deploy/$p-keypair.json)
   size=$(stat -c%s target/deploy/$p.so)
@@ -122,5 +134,7 @@ if [ $GRAD_TEST = 1 ]; then
   say "Graduation and Pyth test"
   ANCHOR_PROVIDER_URL=$RPC ANCHOR_WALLET=$WALLET npx tsx scripts/graduation-devnet.ts 2>&1 | sed -u -E 's/api-key=[A-Za-z0-9-]+/api-key=<redacted>/g' | tee "$LOG/graduation-test.log"
 fi
+say "Creator-fee lock test (a claim before 7 days must fail)"
+ANCHOR_PROVIDER_URL=$RPC ANCHOR_WALLET=$WALLET npx tsx scripts/fee-lock-devnet.ts 2>&1 | sed -u -E 's/api-key=[A-Za-z0-9-]+/api-key=<redacted>/g' | tee "$LOG/fee-lock-test.log"
 say "Treasury sweep (protocol fees into treasury-owned vault liquidity)"
 TREASURY_KEEP_USDC=${TREASURY_KEEP_USDC:-1000} ANCHOR_PROVIDER_URL=$RPC ANCHOR_WALLET=$WALLET npx tsx scripts/treasury.ts sweep 2>&1 | sed -u -E 's/api-key=[A-Za-z0-9-]+/api-key=<redacted>/g' | tee "$LOG/treasury.log"

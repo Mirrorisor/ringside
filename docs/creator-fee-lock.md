@@ -4,7 +4,7 @@
 `claim_creator_fees` (launch program) now requires `curve.complete` OR
 `now >= curve.created_ts + CREATOR_FEE_LOCK_SECONDS`. Otherwise it fails with the new
 error `CreatorFeesLocked`. `CREATOR_FEE_LOCK_SECONDS = 7 * 24 * 3600` is a plain constant.
-Fees accrued after graduation follow the same rule, which `complete` satisfies.
+No curve fees accrue after graduation: `buy` and `sell` refuse a complete curve.
 
 ## Rationale
 Creator fees accrue on every curve trade. Until now a creator could claim them at
@@ -31,8 +31,15 @@ for the launch claim, so a locked claim logs a failure rather than aborting.
 ## Audit notes
 - `complete` is set when the curve sells out, before `migrate`, so claims are
   allowed between sell-out and migration. Intended ("coin graduates").
-- Perps `claim_creator_fees` is a separate instruction and is NOT changed here.
+- Perps `claim_creator_fees` is a separate instruction and is NOT changed here. It pays
+  the creator's 10% share of perp trading fees at any time, including launch day, so
+  "no early payout" holds for curve fees only. It is not a bypass (wash-trading perps
+  costs the full fee to earn back 10%). Founder decision: leave it, or apply the same
+  rule in perps using the launch `Curve` it already reads.
+- Buying out your own curve unlocks fees early; that is the graduation case. Cost from
+  zero at 100 bps total fees: about 88 SOL on mainnet (30 virtual SOL), about 1.5 SOL
+  on devnet, and the tokens can only be sold into the new pool.
 - `target/idl/ringside_launch.json` was already stale relative to lib.rs (it lacks
-  several errors and instructions); regenerate it with `anchor build` (adds error 6015).
+  several errors and instructions); regenerate it with `anchor build` (adds error 6014, `CreatorFeesLocked`).
 - Tests: `creator_fees_locked_for_seven_days`, `creator_fees_claimable_right_after_graduation`
   in `tests/tests/flow.rs`.
