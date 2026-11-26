@@ -7,10 +7,14 @@
  *   INDEXER_RATE_LIMIT_MAX        read requests per client IP per window (default 120; 0 disables)
  *   INDEXER_RATE_LIMIT_WINDOW_MS  rate-limit window (default 60000)
  *   INDEXER_REQUEST_TIMEOUT_MS    whole-request timeout (default 10000)
+ *   INDEXER_RPC_URL               Solana JSON-RPC URL: looks up signers of third-party-gas trades (bots, gasless apps) in the background; unset = no lookup
+ *   INDEXER_SIGNER_QUEUE_MAX      pending lookups kept at most (default 1000; the oldest are dropped, counted in /health)
+ *   INDEXER_SIGNER_MIN_INTERVAL_MS  gap between RPC lookups (default 100)
  *   INDEXER_TRUST_PROXY=1         key clients by the last X-Forwarded-For entry (behind one trusted proxy)
  */
 import { isAddress } from "./helius.js";
 import { createIndexerServer, DEFAULT_RATE_LIMIT, DEFAULT_REQUEST_TIMEOUT_MS } from "./server.js";
+import { DEFAULT_SIGNER_MIN_INTERVAL_MS, DEFAULT_SIGNER_QUEUE_MAX, RpcSignerPort, SignerQueue } from "./signers.js";
 import { SqliteStore } from "./store.js";
 
 const port = Number(process.env.INDEXER_PORT ?? 8787);
@@ -38,8 +42,17 @@ const requestTimeoutMs = intEnv("INDEXER_REQUEST_TIMEOUT_MS", DEFAULT_REQUEST_TI
 if (sponsorAddresses.length === 0) console.warn("[indexer] INDEXER_SPONSOR_ADDRESSES is empty: sponsored trades rely on account order alone");
 
 const store = new SqliteStore(dbPath);
+const rpcUrl = process.env.INDEXER_RPC_URL ?? "";
+if (rpcUrl && !/^https?:\/\//.test(rpcUrl)) throw new Error("INDEXER_RPC_URL must be an http(s) URL");
+const signerQueue = rpcUrl
+  ? new SignerQueue(new RpcSignerPort(rpcUrl, { minIntervalMs: intEnv("INDEXER_SIGNER_MIN_INTERVAL_MS", DEFAULT_SIGNER_MIN_INTERVAL_MS) }), store, {
+      maxQueue: intEnv("INDEXER_SIGNER_QUEUE_MAX", DEFAULT_SIGNER_QUEUE_MAX),
+      parse: { sponsors: new Set(sponsorAddresses) },
+    })
+  : undefined;
 const server = createIndexerServer({
   store,
+  signerQueue,
   webhookSecret: secret,
   sponsorAddresses,
   rateLimit: rateMax > 0 ? { windowMs: rateWindow, max: rateMax } : false,

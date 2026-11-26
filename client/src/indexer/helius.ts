@@ -325,6 +325,57 @@ function tokensMoved(tx: HeliusEnhancedTransaction, wallet: string): boolean {
   return false;
 }
 
+/**
+ * Does this transaction need its signer list fetched before it can be attributed? True for a swap
+ * that yields no trade today, whose fee payer is a third party that only paid gas (not our sponsor,
+ * and none of its own tokens moved), when the payload named no signers. A lookup can then show who
+ * signed, and `pickTrader` accepts only a listed signer.
+ */
+export function needsSignerLookup(tx: HeliusEnhancedTransaction, opts: ParseOptions = {}): boolean {
+  const sponsors = opts.sponsors ?? NO_SPONSORS;
+  if (!isValidTx(tx) || tx.transactionError != null || Array.isArray(tx.signers)) return false;
+  if (!(SWAP_TYPES.has(tx.type ?? "") || tx.events?.swap)) return false;
+  const fp = tx.feePayer;
+  if (!isAddress(fp) || sponsors.has(fp) || tokensMoved(tx, fp)) return false;
+  if (parseNormalizedSwap(tx, opts)) return false;
+  // Someone other than the fee payer must have moved a token, or there is nothing to attribute.
+  return (tx.tokenTransfers ?? []).some((t) => t && isAddress(t.mint) && t.mint !== SOL_MINT && t.mint !== USDC_MINT && (isAddress(t.toUserAccount) || isAddress(t.fromUserAccount)));
+}
+
+/** Pump.fun bonding-curve program. */
+export const PUMP_FUN_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+/**
+ * Helius `type` labels of a token-creation transaction. ASSUMPTION: Helius's published type list
+ * (webhooks/transaction-types) names only `TOKEN_MINT` for token creation and has no Pump.fun
+ * entry; `CREATE` with `source: PUMP_FUN` is what Helius tags Pump.fun creations with in practice
+ * but is not documented. Both are accepted, and only with source PUMP_FUN.
+ */
+export const CREATE_TYPES = new Set(["CREATE", "TOKEN_MINT"]);
+
+/**
+ * Infers a Pump.fun launch from its creation transaction.
+ * ASSUMPTIONS: (1) the creator is the signing fee payer: when the payload lists signers it must be
+ * one, and a sponsor is never the creator (the first non-sponsor signer is used instead); a
+ * third-party gas payer on a creation would be named wrongly. (2) The new mint is the one non-quote
+ * mint that moves in the transaction (the creator's initial buy), else the first account of the
+ * Pump.fun instruction (the `create` instruction lists the mint first).
+ */
+export function inferPumpLaunch(tx: HeliusEnhancedTransaction, sponsors: ReadonlySet<string> = NO_SPONSORS): Launch | null {
+  if (!CREATE_TYPES.has((tx.type ?? "").toUpperCase()) || (tx.source ?? "").toUpperCase() !== "PUMP_FUN") return null;
+  const fp = isAddress(tx.feePayer) ? tx.feePayer : undefined;
+  const creator = Array.isArray(tx.signers) ? tx.signers.find((a) => isAddress(a) && !sponsors.has(a)) : fp && !sponsors.has(fp) ? fp : undefined;
+  if (!creator) return null;
+  const mints = new Set<string>();
+  for (const t of tx.tokenTransfers ?? []) if (t && isAddress(t.mint) && t.mint !== SOL_MINT && t.mint !== USDC_MINT) mints.add(t.mint);
+  let mint = mints.size === 1 ? [...mints][0] : undefined;
+  if (!mint && mints.size === 0) {
+    const ix = (tx.instructions ?? []).find((i) => i?.programId === PUMP_FUN_PROGRAM);
+    if (isAddress(ix?.accounts?.[0])) mint = ix!.accounts![0];
+  }
+  if (!mint || mint === creator) return null;
+  return { mint, creator, slot: tx.slot!, timestamp: tx.timestamp!, signature: tx.signature };
+}
+
 /** Parses one swap into at most one trade (or null). Exposed for tests. */
 export function parseSwap(input: HeliusEnhancedTransaction | HeliusParsedEvent, opts: ParseOptions = {}): Trade | null {
   const tx = normalizeTransaction(input);
@@ -365,8 +416,15 @@ export function isValidTx(tx: unknown): tx is HeliusEnhancedTransaction {
  * configured sponsor are dropped (gas top-ups and fee recovery).
  */
 export function parseTransaction(input: HeliusEnhancedTransaction | HeliusParsedEvent, parsers: ProgramParser[] = DEFAULT_PARSERS, opts: ParseOptions = {}): ParsedTx | null {
+  return parseNormalizedTransaction(normalizeTransaction(input), parsers, opts);
+}
+
+/**
+ * As `parseTransaction`, for a transaction already normalised (so a `signers` list set on it, by the
+ * parsed-events normaliser or the background signer lookup, is kept).
+ */
+export function parseNormalizedTransaction(tx: HeliusEnhancedTransaction | null, parsers: ProgramParser[] = DEFAULT_PARSERS, opts: ParseOptions = {}): ParsedTx | null {
   const sponsors = opts.sponsors ?? NO_SPONSORS;
-  const tx = normalizeTransaction(input);
   if (!isValidTx(tx)) return null;
   if (tx.transactionError != null) return null;
   const out: ParsedTx = { signature: tx.signature, slot: tx.slot!, timestamp: tx.timestamp!, trades: [], transfers: [], launches: [] };
@@ -381,6 +439,10 @@ export function parseTransaction(input: HeliusEnhancedTransaction | HeliusParsed
       programTrades ??= [];
       for (const t of r.trades) programTrades.push(t);
     }
+  }
+  if (out.launches.length === 0) {
+    const l = inferPumpLaunch(tx, sponsors);
+    if (l) out.launches.push(l);
   }
   if (programTrades) out.trades = programTrades;
   else if (SWAP_TYPES.has(tx.type ?? "") || tx.events?.swap) {

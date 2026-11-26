@@ -34,13 +34,14 @@
  */
 import { DatabaseSync, type StatementSync } from "node:sqlite";
 import { applyTrade, compareTrades, type LeaderboardMetric } from "./stats.js";
+import { DEAD_PRICE_DROP, DEAD_QUIET_AFTER_SECONDS, DEAD_WINDOW_SECONDS, GRADUATED_SOURCE, isSerialRugger, type CoinStatus, type CreatorCoin, type CreatorStats } from "./creators.js";
 import type { Launch, ParsedTx, Quote, SolTransfer, Trade } from "./types.js";
 
 /** A single SOL transfer at least this large links two wallets for the wash dampener (0.05 SOL). */
 export const WASH_MIN_FUNDING_LAMPORTS = 50_000_000;
 /** Leaderboard bucket size (seconds). */
 export const AGG_BUCKET_SECONDS = 3_600;
-const AGG_VERSION = "1";
+const AGG_VERSION = "2";
 
 export interface LeaderboardQuery {
   sinceTimestamp: number;
@@ -78,6 +79,15 @@ export interface Store {
   /** All trades of one mint, oldest first. */
   mintTrades(mint: string): Trade[];
   launch(mint: string): Launch | undefined;
+  /**
+   * Stores trades for transactions already ingested (a background signer lookup resolved who
+   * traded). Idempotent per (signature, wallet, mint); returns how many were new.
+   */
+  addTrades(trades: Trade[]): number;
+  /** A creator's launch history, as SQL aggregates over launches and per-mint stats. */
+  creatorStats(creator: string, nowSec: number): CreatorStats;
+  /** A creator's most recent coins, newest first. */
+  creatorCoins(creator: string, nowSec: number, limit: number): CreatorCoin[];
   /** SOL transfers from `from` to any of `to` (any number of recipients). */
   transfersFrom(from: string, to: string[]): SolTransfer[];
   /** SOL transfers from `from` to any wallet that bought `mint`. */
@@ -134,6 +144,19 @@ CREATE TABLE IF NOT EXISTS launches (
   signature TEXT NOT NULL
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS launches_creator ON launches (creator);
+-- One row per traded mint, maintained with the trades: first/last trade, the 24h price window
+-- (peak and last SOL price per token) and trades after the first hour. Feeds creator reputation.
+CREATE TABLE IF NOT EXISTS token_stats (
+  mint TEXT PRIMARY KEY,
+  first_ts INTEGER NOT NULL,
+  peak_price REAL,
+  last_price REAL,
+  last_ts INTEGER NOT NULL DEFAULT 0,
+  last_slot INTEGER NOT NULL DEFAULT 0,
+  last_sig TEXT NOT NULL DEFAULT '',
+  late_trades INTEGER NOT NULL DEFAULT 0,
+  graduated INTEGER NOT NULL DEFAULT 0
+) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS positions (
   wallet TEXT NOT NULL,
   mint TEXT NOT NULL,
@@ -204,6 +227,12 @@ WHERE trades > 0 AND vol_sol >= ? AND trades >= ?
 ORDER BY value DESC, wallet ASC
 LIMIT ?`;
 
+/** A coin's verdict, over `launches l LEFT JOIN token_stats s`; params: now (for maturity), drop threshold. Shared by the aggregate and the list. */
+const COIN_COLS = `
+  COALESCE(s.first_ts, l.timestamp) <= ? - ${DEAD_WINDOW_SECONDS} AS mature,
+  (s.mint IS NULL OR s.late_trades = 0 OR (s.peak_price > 0 AND s.last_price <= s.peak_price * (1 - ?))) AS dead,
+  COALESCE(s.graduated, 0) AS graduated`;
+
 type Row = Record<string, unknown>;
 const toTrade = (r: Row): Trade => ({
   signature: r.signature as string, wallet: r.wallet as string, mint: r.mint as string, side: r.side as Trade["side"],
@@ -268,7 +297,7 @@ export class SqliteStore implements Store {
     const ins = this.q(`INSERT OR IGNORE INTO trades (${TRADE_COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
     for (const t of tx.trades) {
       const tr = ins.run(t.signature, t.wallet, t.mint, t.side, t.tokenAmount, t.quote, t.quoteAmount, t.slot, t.timestamp, t.source);
-      if (Number(tr.changes) > 0) this.aggregateTrade(t);
+      if (Number(tr.changes) > 0) { this.aggregateTrade(t); this.updateTokenStats(t); }
     }
     const trs = this.q("INSERT OR IGNORE INTO sol_transfers (signature, idx, from_addr, to_addr, lamports, slot, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)");
     tx.transfers.forEach((t, i) => {
@@ -278,6 +307,75 @@ export class SqliteStore implements Store {
     const la = this.q("INSERT OR IGNORE INTO launches (mint, creator, slot, timestamp, signature) VALUES (?, ?, ?, ?, ?)");
     for (const l of tx.launches) la.run(l.mint, l.creator, l.slot, l.timestamp, l.signature);
     return true;
+  }
+
+  addTrades(trades: Trade[]): number {
+    const db = this.db;
+    let n = 0;
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const ins = this.q(`INSERT OR IGNORE INTO trades (${TRADE_COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+      for (const t of trades) {
+        const tr = ins.run(t.signature, t.wallet, t.mint, t.side, t.tokenAmount, t.quote, t.quoteAmount, t.slot, t.timestamp, t.source);
+        if (Number(tr.changes) > 0) { this.aggregateTrade(t); this.updateTokenStats(t); n++; }
+      }
+      db.exec("COMMIT");
+      return n;
+    } catch (e) {
+      db.exec("ROLLBACK");
+      throw e;
+    }
+  }
+
+  /** Folds one new (already inserted) trade into its mint's stats; an earlier first trade recomputes the mint. */
+  private updateTokenStats(t: Trade) {
+    const r = this.q("SELECT first_ts, peak_price, last_price, last_ts, last_slot, last_sig, late_trades, graduated FROM token_stats WHERE mint = ?").get(t.mint) as Row | undefined;
+    if (!r || t.timestamp < (r.first_ts as number)) return this.rebuildTokenStats(t.mint);
+    const first = r.first_ts as number;
+    let peak = r.peak_price as number | null, last = r.last_price as number | null;
+    let [lts, lslot, lsig] = [r.last_ts as number, r.last_slot as number, r.last_sig as string];
+    if (t.quote === "SOL" && t.tokenAmount > 0 && Number.isFinite(t.quoteAmount) && t.timestamp <= first + DEAD_WINDOW_SECONDS) {
+      const price = t.quoteAmount / t.tokenAmount;
+      peak = peak === null ? price : Math.max(peak, price);
+      if (last === null || compareTrades(t, { timestamp: lts, slot: lslot, signature: lsig }) > 0) [last, lts, lslot, lsig] = [price, t.timestamp, t.slot, t.signature];
+    }
+    this.q("UPDATE token_stats SET peak_price = ?, last_price = ?, last_ts = ?, last_slot = ?, last_sig = ?, late_trades = late_trades + ?, graduated = ? WHERE mint = ?")
+      .run(peak, last, lts, lslot, lsig, t.timestamp > first + DEAD_QUIET_AFTER_SECONDS ? 1 : 0, (r.graduated as number) || (t.source === GRADUATED_SOURCE ? 1 : 0), t.mint);
+  }
+
+  /** Recomputes one mint's stats from its trades (new mint, out-of-order first trade, upgrades). */
+  private rebuildTokenStats(mint: string) {
+    const f = this.q("SELECT MIN(timestamp) AS first FROM trades WHERE mint = ?").get(mint) as Row;
+    if (f.first === null || f.first === undefined) return;
+    const first = f.first as number;
+    const agg = this.q(`SELECT MAX(CASE WHEN quote = 'SOL' AND token_amount > 0 AND timestamp <= ?1 + ${DEAD_WINDOW_SECONDS} THEN quote_amount / token_amount END) AS peak,
+        SUM(timestamp > ?1 + ${DEAD_QUIET_AFTER_SECONDS}) AS late, MAX(source = ?2) AS grad FROM trades WHERE mint = ?3`).get(first, GRADUATED_SOURCE, mint) as Row;
+    const last = this.q(`SELECT quote_amount / token_amount AS price, timestamp, slot, signature FROM trades
+      WHERE mint = ? AND quote = 'SOL' AND token_amount > 0 AND timestamp <= ? + ${DEAD_WINDOW_SECONDS} ORDER BY timestamp DESC, slot DESC, signature DESC LIMIT 1`).get(mint, first) as Row | undefined;
+    this.q(`INSERT OR REPLACE INTO token_stats (mint, first_ts, peak_price, last_price, last_ts, last_slot, last_sig, late_trades, graduated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(mint, first, (agg.peak as number | null) ?? null, (last?.price as number | undefined) ?? null, (last?.timestamp as number | undefined) ?? 0, (last?.slot as number | undefined) ?? 0, (last?.signature as string | undefined) ?? "", (agg.late as number) ?? 0, (agg.grad as number) ?? 0);
+  }
+
+  creatorStats(creator: string, nowSec: number): CreatorStats {
+    const r = this.q(`SELECT COUNT(*) AS launched, COALESCE(SUM(mature), 0) AS matured, COALESCE(SUM(mature AND dead), 0) AS dead, COALESCE(SUM(graduated), 0) AS graduated
+      FROM (SELECT ${COIN_COLS} FROM launches l LEFT JOIN token_stats s ON s.mint = l.mint WHERE l.creator = ?)`).get(nowSec, DEAD_PRICE_DROP, creator) as Row;
+    const [matured, dead] = [r.matured as number, r.dead as number];
+    return { creator, launched: r.launched as number, matured, dead, graduated: r.graduated as number, deadRate: matured > 0 ? dead / matured : null, serialRugger: isSerialRugger(matured, dead) };
+  }
+
+  creatorCoins(creator: string, nowSec: number, limit: number): CreatorCoin[] {
+    return this.q(`SELECT l.mint AS mint, l.timestamp AS launched_at, s.first_ts AS first_ts, s.peak_price AS peak, s.last_price AS last, ${COIN_COLS}
+      FROM launches l LEFT JOIN token_stats s ON s.mint = l.mint WHERE l.creator = ? ORDER BY l.timestamp DESC, l.mint LIMIT ?`)
+      .all(nowSec, DEAD_PRICE_DROP, creator, limit)
+      .map((r) => ({
+        mint: r.mint as string,
+        launchedAt: r.launched_at as number,
+        firstTradeAt: (r.first_ts as number | null) ?? null,
+        peakPrice: (r.peak as number | null) ?? null,
+        lastPrice: (r.last as number | null) ?? null,
+        graduated: r.graduated === 1,
+        status: (r.mature ? (r.dead ? "dead" : "alive") : "pending") as CoinStatus,
+      }));
   }
 
   /** Volume, counts and (in trade order) realised PnL of one new trade. */
@@ -346,11 +444,12 @@ export class SqliteStore implements Store {
     const db = this.db;
     db.exec("BEGIN IMMEDIATE");
     try {
-      db.exec("DELETE FROM positions; DELETE FROM agg_hourly; DELETE FROM funding_links; DELETE FROM wash_positions;");
+      db.exec("DELETE FROM positions; DELETE FROM agg_hourly; DELETE FROM funding_links; DELETE FROM wash_positions; DELETE FROM token_stats;");
       db.exec(`INSERT INTO agg_hourly (wallet, mint, quote, hour, volume, trades, buys, sells)
         SELECT wallet, mint, quote, timestamp / ${AGG_BUCKET_SECONDS}, SUM(quote_amount), COUNT(*), SUM(side = 'buy'), SUM(side = 'sell')
         FROM trades GROUP BY wallet, mint, quote, timestamp / ${AGG_BUCKET_SECONDS}`);
       for (const r of this.db.prepare("SELECT DISTINCT wallet, mint, quote FROM trades").all()) this.rebuildPosition(r.wallet as string, r.mint as string, r.quote as string);
+      for (const r of db.prepare("SELECT DISTINCT mint FROM trades").all()) this.rebuildTokenStats(r.mint as string);
       db.prepare(`INSERT OR IGNORE INTO funding_links (a, b) SELECT from_addr, to_addr FROM sol_transfers WHERE lamports >= ? AND from_addr <> to_addr
         UNION SELECT to_addr, from_addr FROM sol_transfers WHERE lamports >= ? AND from_addr <> to_addr`).run(WASH_MIN_FUNDING_LAMPORTS, WASH_MIN_FUNDING_LAMPORTS);
       db.exec(`INSERT OR IGNORE INTO wash_positions (wallet, mint)

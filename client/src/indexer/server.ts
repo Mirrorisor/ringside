@@ -5,7 +5,8 @@
  *                                Authorization header must equal the shared secret.
  *   GET  /feed?wallets=a,b&limit=50&before=<unix s>
  *   GET  /wallet/:addr
- *   GET  /token/:mint/flags
+ *   GET  /token/:mint/flags      (includes creator, creatorStats and a serial_rugger flag)
+ *   GET  /creator/:wallet?limit=20   launch history: coins launched / dead within 24h / graduated, recent coins
  *   GET  /leaderboard?window=7d&by=pnl&limit=50
  *   GET  /health
  *
@@ -17,11 +18,13 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { bundles, holderBalances, insiders, snipers, topHolderConcentration } from "./flags.js";
-import { DEFAULT_PARSERS, isAddress, parseTransaction, type ProgramParser } from "./helius.js";
+import { DEFAULT_CREATOR_COINS, MAX_CREATOR_COINS } from "./creators.js";
+import { DEFAULT_PARSERS, isAddress, normalizeTransaction, parseNormalizedTransaction, type ProgramParser } from "./helius.js";
+import type { SignerQueue } from "./signers.js";
 import { isIP } from "node:net";
 import { isMetric, isWindow, walletStats, WINDOWS } from "./stats.js";
 import type { Store } from "./store.js";
-import type { ParsedTx } from "./types.js";
+import type { HeliusEnhancedTransaction, ParsedTx } from "./types.js";
 
 export const MAX_BODY_BYTES = 5 * 1024 * 1024;
 export const MAX_TXS_PER_WEBHOOK = 1_000;
@@ -61,6 +64,8 @@ export interface IndexerOptions {
   cacheTtlMs?: number;
   leaderboardMinVolumeSol?: number;
   leaderboardMinTrades?: number;
+  /** Background signer lookup for third-party-gas trades; without it such trades yield no trade. */
+  signerQueue?: SignerQueue;
 }
 
 class HttpError extends Error {
@@ -186,15 +191,22 @@ export function createIndexerServer(opts: IndexerOptions): Server {
     if (payload.length > MAX_TXS_PER_WEBHOOK) throw new HttpError(413, "too many transactions");
     let ingested = 0, duplicates = 0, skipped = 0, trades = 0;
     const batch: ParsedTx[] = [];
+    const normalised: HeliusEnhancedTransaction[] = [];
     for (const tx of payload) {
-      const parsed = parseTransaction(tx, parsers, parseOpts);
-      if (parsed) batch.push(parsed);
+      const norm = normalizeTransaction(tx);
+      const parsed = parseNormalizedTransaction(norm, parsers, parseOpts);
+      if (parsed) { batch.push(parsed); normalised.push(norm!); }
       else skipped++;
     }
+    let queued = 0;
     store.ingestMany(batch).forEach((ok, i) => {
-      if (ok) { ingested++; trades += batch[i].trades.length; }
-      else duplicates++;
+      if (ok) {
+        ingested++; trades += batch[i].trades.length;
+        // Only a transaction with no trade can be an ambiguous third-party-gas swap; resolved in the background.
+        if (opts.signerQueue && batch[i].trades.length === 0 && opts.signerQueue.consider(normalised[i])) queued++;
+      } else duplicates++;
     });
+    if (opts.signerQueue) return send(res, 200, { received: payload.length, ingested, duplicates, skipped, trades, queued });
     send(res, 200, { received: payload.length, ingested, duplicates, skipped, trades });
   }
 
@@ -215,10 +227,13 @@ export function createIndexerServer(opts: IndexerOptions): Server {
     const trades = store.mintTrades(mint);
     const launch = store.launch(mint);
     const creator = launch?.creator;
+    const creatorStats = creator ? store.creatorStats(creator, now()) : null;
     return {
       mint,
       trades: trades.length,
       creator: creator ?? null,
+      creatorStats,
+      flags: creatorStats?.serialRugger ? ["serial_rugger"] : [],
       snipers: snipers(trades, launch?.slot, creator),
       bundles: bundles(trades),
       insiders: creator ? insiders(creator, trades, store.transfersToBuyers(creator, mint)) : null,
@@ -240,6 +255,11 @@ export function createIndexerServer(opts: IndexerOptions): Server {
     }));
   }
 
+  function creatorHistory(wallet: string, q: URLSearchParams) {
+    const limit = intParam(q.get("limit"), DEFAULT_CREATOR_COINS, 1, MAX_CREATOR_COINS, "limit");
+    return cache.get(`creator|${wallet}|${limit}`, () => ({ ...store.creatorStats(wallet, now()), recent: store.creatorCoins(wallet, now(), limit) }));
+  }
+
   async function route(req: IncomingMessage, res: ServerResponse) {
     const url = new URL(req.url ?? "/", "http://indexer.local");
     const path = url.pathname;
@@ -248,7 +268,7 @@ export function createIndexerServer(opts: IndexerOptions): Server {
       return webhook(req, res);
     }
     if (req.method !== "GET") throw new HttpError(405, "method not allowed");
-    if (path === "/health") return send(res, 200, { ok: true });
+    if (path === "/health") return send(res, 200, opts.signerQueue ? { ok: true, signerQueue: opts.signerQueue.stats() } : { ok: true });
     const wait = rl?.take(ipOf(req)) ?? 0;
     if (wait) return send(res, 429, { error: "rate limited" }, { "retry-after": String(wait) });
     if (path === "/feed") return send(res, 200, feed(url.searchParams));
@@ -257,6 +277,11 @@ export function createIndexerServer(opts: IndexerOptions): Server {
     if (m) {
       if (!isAddress(m[1])) throw new HttpError(400, "invalid wallet address");
       return send(res, 200, walletStats(m[1], store.walletTrades(m[1]), now()));
+    }
+    m = /^\/creator\/([^/]+)$/.exec(path);
+    if (m) {
+      if (!isAddress(m[1])) throw new HttpError(400, "invalid wallet address");
+      return send(res, 200, creatorHistory(m[1], url.searchParams));
     }
     m = /^\/token\/([^/]+)\/flags$/.exec(path);
     if (m) {

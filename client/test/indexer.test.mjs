@@ -2,8 +2,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { parseSwap, parseTransaction, ringsideLaunchParser, RINGSIDE_LAUNCH_PROGRAM } from "../dist/indexer/helius.js";
+import { normalizeTransaction as normTx, parseSwap, parseTransaction, parseNormalizedTransaction, needsSignerLookup, inferPumpLaunch, ringsideLaunchParser, RINGSIDE_LAUNCH_PROGRAM } from "../dist/indexer/helius.js";
 import { SqliteStore, WASH_MIN_FUNDING_LAMPORTS } from "../dist/indexer/store.js";
+import { SignerQueue, RpcSignerPort } from "../dist/indexer/signers.js";
+import { DEAD_PRICE_DROP, SERIAL_RUGGER_MIN_LAUNCHES, SERIAL_RUGGER_MIN_DEAD_RATE, DEAD_WINDOW_SECONDS } from "../dist/indexer/creators.js";
 import { walletStats } from "../dist/indexer/stats.js";
 import { bundles, holderBalances, insiders, snipers, topHolderConcentration, SNIPER_MAX_SLOTS, BUNDLE_MIN_WALLETS, INSIDER_MIN_FUNDING_LAMPORTS, TOP_HOLDERS } from "../dist/indexer/flags.js";
 import { createIndexerServer, secretMatches, MAX_FEED_LIMIT, LEADERBOARD_MIN_TRADES, LEADERBOARD_MIN_VOLUME_SOL, RateLimiter, clientKey } from "../dist/indexer/server.js";
@@ -622,4 +624,238 @@ test("live Helius swaps: net balances, not the summary; no guessing pool account
   assert.equal(one("2ToZUsXk").length, 0);
   // Labelled SWAP but just a token transfer with no SOL leg.
   assert.equal(one("364Vt5MG").length, 0);
+});
+
+// ---- signer lookup for third-party-gas trades ----
+const liveTxs = () => JSON.parse(readFileSync(new URL("./fixtures/helius/live-swaps.json", import.meta.url), "utf8")).txs;
+const BOT_TX = () => liveTxs()["2ToZUsXk"];
+const BOT_FEE_PAYER = "Gygj9QQby4j2jryqyqBHvLP7ctv2SaANgh4sCb69BUpA";
+const BOT_BUYER = "BwWK17cbHxwWBKZkUYvzxLcNQ1YVyaFezduWbtm2de6s";
+const BOT_MINT = "97T5TfNPmF4CeHnHvNSLdRkZEGhzdrmncNnHPzrvpump";
+const stubPort = (fn) => { const p = { calls: 0, signers: async (sig) => { p.calls++; return fn(sig); } }; return p; };
+/** The bot swap under a different (valid-looking) signature. */
+const botVariant = (i) => { const t = BOT_TX(); t.signature = t.signature.slice(0, -2) + "abcdefghij"[i] + "Z"; return t; };
+
+test("signer lookup: ambiguous third-party-gas swap is flagged; resolved signers decide the trader", () => {
+  const tx = normTx(BOT_TX());
+  assert.equal(needsSignerLookup(tx), true);
+  assert.equal(needsSignerLookup(normTx(liveTxs()["5z576FzZ"])), false, "self-paid trade is not ambiguous");
+  assert.equal(needsSignerLookup(tx, { sponsors: new Set([BOT_FEE_PAYER]) }), false, "sponsored: existing inference");
+  // only the fee payer signed: the buyer vault did not, so no trade
+  assert.equal(parseNormalizedTransaction({ ...tx, signers: [BOT_FEE_PAYER] }).trades.length, 0);
+  const [t] = parseNormalizedTransaction({ ...tx, signers: [BOT_FEE_PAYER, BOT_BUYER] }).trades;
+  assert.equal(t.wallet, BOT_BUYER);
+  assert.equal(t.mint, BOT_MINT);
+  assert.equal(t.side, "buy");
+});
+
+test("signer queue: webhook returns without a trade, worker stores the buyer once; replays are idempotent", async () => {
+  const store = new SqliteStore(":memory:");
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const port = stubPort(async () => { await gate; return [BOT_FEE_PAYER, BOT_BUYER]; });
+  const queue = new SignerQueue(port, store);
+  const s = await startServer(undefined, { store, signerQueue: queue });
+  try {
+    const body = await (await s.post([BOT_TX()])).json();
+    assert.deepEqual([body.ingested, body.trades, body.queued], [1, 0, 1]);
+    assert.equal(store.walletTrades(BOT_BUYER).length, 0, "ingest did not wait for the lookup");
+    release();
+    await queue.idle();
+    assert.equal(store.walletTrades(BOT_BUYER).length, 1);
+    const again = await (await s.post([BOT_TX()])).json();
+    assert.deepEqual([again.ingested, again.duplicates, again.queued], [0, 1, 0]);
+    await queue.idle();
+    assert.equal(port.calls, 1);
+    assert.equal(store.addTrades(store.walletTrades(BOT_BUYER)), 0, "re-storing the same trade adds nothing");
+    assert.equal(store.walletTrades(BOT_BUYER).length, 1);
+    const h = (await s.get("/health")).body;
+    assert.deepEqual([h.ok, h.signerQueue.resolved, h.signerQueue.tradesStored, h.signerQueue.dropped], [true, 1, 1, 0]);
+  } finally { s.stop(); }
+});
+
+test("signer queue: fee payer only, null, throw and timeout all mean no trade", async () => {
+  const store = new SqliteStore(":memory:");
+  const cases = [() => [BOT_FEE_PAYER], () => null, () => { throw new Error("rpc down"); }, () => new Promise(() => {})];
+  try {
+    for (const [i, fn] of cases.entries()) {
+      const q = new SignerQueue(stubPort(fn), store, { timeoutMs: 30, log: () => {} });
+      const tx = normTx(botVariant(i));
+      assert.equal(q.consider(tx), true);
+      await q.idle();
+      assert.equal(q.stats().tradesStored, 0, `case ${i}`);
+    }
+    assert.equal(store.walletTrades(BOT_BUYER).length, 0);
+  } finally { store.close(); }
+});
+
+test("signer queue: bounded, drops the oldest and counts them", async () => {
+  const store = new SqliteStore(":memory:");
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const seen = [];
+  const port = { signers: async (sig) => { seen.push(sig); await gate; return [BOT_FEE_PAYER, BOT_BUYER]; } };
+  const q = new SignerQueue(port, store, { maxQueue: 2 });
+  try {
+    const txs = [0, 1, 2, 3, 4].map((i) => normTx(botVariant(i)));
+    for (const t of txs) assert.equal(q.consider(t), true);
+    assert.equal(q.consider(txs[4]), false, "already queued");
+    assert.deepEqual([q.stats().queued, q.stats().dropped], [2, 3]);
+    release();
+    await q.idle();
+    assert.deepEqual(seen, [txs[3].signature, txs[4].signature], "the newest two survive");
+    assert.equal(store.walletTrades(BOT_BUYER).length, 2);
+  } finally { store.close(); }
+});
+
+test("rpc signer port: first numRequiredSignatures keys, cached, timed out and rate limited", async () => {
+  const keys = ["A1", "B2", "C3", "D4"];
+  let calls = 0, lastBody;
+  const ok = async (_url, init) => { calls++; lastBody = JSON.parse(init.body); return { ok: true, json: async () => ({ result: { transaction: { message: { header: { numRequiredSignatures: 2 }, accountKeys: keys } } } }) }; };
+  const port = new RpcSignerPort("http://rpc.test", { fetch: ok, minIntervalMs: 0 });
+  assert.deepEqual(await port.signers("sigA"), ["A1", "B2"]);
+  assert.deepEqual(await port.signers("sigA"), ["A1", "B2"]);
+  assert.equal(calls, 1, "cache hit");
+  assert.equal(lastBody.method, "getTransaction");
+  assert.deepEqual(lastBody.params, ["sigA", { maxSupportedTransactionVersion: 0, encoding: "json" }]);
+  const nul = new RpcSignerPort("http://rpc.test", { fetch: async () => ({ ok: true, json: async () => ({ result: null }) }), minIntervalMs: 0 });
+  assert.equal(await nul.signers("sigB"), null);
+  const hang = new RpcSignerPort("http://rpc.test", { fetch: (_u, init) => new Promise((_, rej) => init.signal.addEventListener("abort", () => rej(new Error("aborted")))), timeoutMs: 20, minIntervalMs: 0 });
+  assert.equal(await hang.signers("sigC"), null);
+  const starts = [];
+  const slow = new RpcSignerPort("http://rpc.test", { fetch: async (...a) => { starts.push(Date.now()); return ok(...a); }, minIntervalMs: 40 });
+  await Promise.all([slow.signers("s1"), slow.signers("s2"), slow.signers("s3")]);
+  assert.ok(starts[2] - starts[0] >= 70, `requests spaced: ${starts[2] - starts[0]}ms`);
+});
+
+// ---- creator reputation ----
+const T0 = NOW - 3 * 86_400;
+const CREATOR_X = "5yPdvSUXfMBfGMRKYUGE8ZtxgesrXAnUrXzdGSYduQHb";
+const mintN = (n) => ["Hq2wp8", "9M4giF", "GesfTA", "13ec7X", "FUUuz2", "MAyhSm"][n].padEnd(43, "x") + "1";
+let seq = 0;
+const ctrade = (mint, side, tokens, sol, ts, source = "PUMP_FUN", wallet = ALICE) => ({ signature: `ct${++seq}`, wallet, mint, side, tokenAmount: tokens, quote: "SOL", quoteAmount: sol, slot: ts, timestamp: ts, source });
+const ctx = (trades, launches = []) => ({ signature: `ctx${++seq}`, slot: 1, timestamp: trades[0]?.timestamp ?? 1, trades, transfers: [], launches });
+const launchOf = (mint, ts, creator = CREATOR_X) => ({ mint, creator, slot: ts, timestamp: ts, signature: `l${mint}` });
+
+function seedCreator(store, { creator = CREATOR_X } = {}) {
+  const [healthy, dead1, dead2, dead3] = [0, 1, 2, 3].map(mintN);
+  for (const m of [healthy, dead1, dead2, dead3]) store.ingest({ ...ctx([], [launchOf(m, T0, creator)]) , signature: `L${m}` });
+  // healthy: price 1 -> 3, keeps trading after the first hour
+  store.ingestMany([ctx([ctrade(healthy, "buy", 100, 100, T0 + 10), ctrade(healthy, "buy", 100, 300, T0 + 7200), ctrade(healthy, "sell", 10, 25, T0 + 80_000)])]);
+  // dead1: peak 1, then price 0.05 (95% below the peak), trading goes on
+  store.ingestMany([ctx([ctrade(dead1, "buy", 100, 100, T0 + 5), ctrade(dead1, "sell", 100, 5, T0 + 7000)])]);
+  // dead2: a single trade, nothing after the first hour
+  store.ingestMany([ctx([ctrade(dead2, "buy", 100, 100, T0 + 20), ctrade(dead2, "buy", 100, 100, T0 + 3000)])]);
+  // dead3: price halves only (not dead by price) but nothing after the first hour: dead
+  store.ingestMany([ctx([ctrade(dead3, "buy", 100, 100, T0 + 30), ctrade(dead3, "sell", 100, 50, T0 + 600)])]);
+  return { healthy, dead1, dead2, dead3 };
+}
+
+test("creator stats: one healthy coin and three dead ones", () => {
+  const store = new SqliteStore(":memory:");
+  try {
+    const m = seedCreator(store);
+    const st = store.creatorStats(CREATOR_X, NOW);
+    assert.deepEqual([st.launched, st.matured, st.dead, st.graduated, st.deadRate, st.serialRugger], [4, 4, 3, 0, 0.75, true]);
+    const coins = store.creatorCoins(CREATOR_X, NOW, 10);
+    const byMint = Object.fromEntries(coins.map((c) => [c.mint, c]));
+    assert.equal(byMint[m.healthy].status, "alive");
+    assert.deepEqual([m.dead1, m.dead2, m.dead3].map((x) => byMint[x].status), ["dead", "dead", "dead"]);
+    assert.equal(byMint[m.dead1].firstTradeAt, T0 + 5);
+    close(byMint[m.dead1].peakPrice, 1);
+    close(byMint[m.dead1].lastPrice, 0.05);
+    assert.equal(store.creatorCoins(CREATOR_X, NOW, 2).length, 2);
+    assert.equal(store.creatorStats(ALICE, NOW).launched, 0);
+  } finally { store.close(); }
+});
+
+test("creator stats: a coin dies by price alone; young coins are pending; graduation is derived", () => {
+  const store = new SqliteStore(":memory:");
+  try {
+    const [a, b, c] = [0, 1, 2].map(mintN);
+    for (const m of [a, b, c]) store.ingest({ ...ctx([], [launchOf(m, T0)]), signature: `L${m}` });
+    store.ingestMany([ctx([ctrade(a, "buy", 100, 100, T0), ctrade(a, "sell", 100, 9, T0 + 9000, "PUMP_FUN"), ctrade(a, "buy", 1, 0.5, T0 + 90_000)])]);
+    // b: a 91% fall within 24h, trading goes on, then it recovers after the window (ignored)
+    store.ingestMany([ctx([ctrade(b, "buy", 100, 100, T0), ctrade(b, "sell", 100, 9, T0 + 9000), ctrade(b, "buy", 100, 900, T0 + 2 * 86_400, "PUMP_AMM")])]);
+    // c is still inside its 24h window
+    store.ingestMany([ctx([ctrade(c, "buy", 100, 100, NOW - 600)])]);
+    const st = store.creatorStats(CREATOR_X, NOW);
+    assert.deepEqual([st.launched, st.matured, st.dead, st.graduated], [3, 2, 2, 1]);
+    assert.equal(store.creatorCoins(CREATOR_X, NOW, 5).find((x) => x.mint === c).status, "pending");
+    assert.equal(store.creatorCoins(CREATOR_X, NOW, 5).find((x) => x.mint === b).graduated, true);
+    assert.equal(DEAD_PRICE_DROP, 0.9);
+  } finally { store.close(); }
+});
+
+test("creator stats do not depend on trade arrival order", () => {
+  const trades = (m) => [ctrade(m, "buy", 100, 100, T0 + 10), ctrade(m, "buy", 100, 300, T0 + 7200), ctrade(m, "sell", 100, 1, T0 + 8000), ctrade(m, "buy", 10, 1, T0 + 100_000)];
+  const view = (order) => {
+    const store = new SqliteStore(":memory:");
+    try {
+      const m = mintN(0);
+      store.ingest({ ...ctx([], [launchOf(m, T0)]), signature: "L" });
+      const t = trades(m);
+      for (const i of order) store.ingestMany([ctx([t[i]])]);
+      return [store.creatorStats(CREATOR_X, NOW), store.creatorCoins(CREATOR_X, NOW, 5)];
+    } finally { store.close(); }
+  };
+  assert.deepEqual(view([3, 2, 1, 0]).map((x) => JSON.stringify(x)), view([0, 1, 2, 3]).map((x) => JSON.stringify(x)));
+});
+
+test("creator stats: rebuilt from trades when the aggregate version changes", () => {
+  const path = `${process.env.TMPDIR ?? "/tmp"}/indexer-creators-${process.pid}.db`;
+  const a = new SqliteStore(path);
+  seedCreator(a);
+  const want = JSON.stringify(a.creatorStats(CREATOR_X, NOW));
+  a.close();
+  const { DatabaseSync } = require_sqlite();
+  const raw = new DatabaseSync(path);
+  raw.exec("DELETE FROM token_stats; UPDATE meta SET value = '0' WHERE key = 'agg_version'");
+  raw.close();
+  const b = new SqliteStore(path);
+  try { assert.equal(JSON.stringify(b.creatorStats(CREATOR_X, NOW)), want); } finally { b.close(); }
+});
+function require_sqlite() { return globalThis.process.getBuiltinModule("node:sqlite"); }
+
+test("pump.fun creation transactions: creator inferred, sponsor never the creator", () => {
+  const [raw] = fixture("pump-create");
+  const p = parseTransaction(raw);
+  assert.deepEqual(p.launches, [{ mint: MINT, creator: CREATOR, slot: 300000010, timestamp: 1763990010, signature: raw.signature }]);
+  assert.equal(parseTransaction({ ...raw, type: "TOKEN_MINT" }).launches.length, 1);
+  assert.equal(parseTransaction({ ...raw, source: "JUPITER" }).launches.length, 0);
+  assert.equal(parseTransaction({ ...raw, type: "SWAP" }).launches.length, 0);
+  assert.equal(parseTransaction(raw, undefined, { sponsors: new Set([CREATOR]) }).launches.length, 0);
+  assert.equal(inferPumpLaunch({ ...raw, signers: [CREATOR, ALICE] }, new Set([CREATOR])).creator, ALICE);
+});
+
+test("GET /creator/:wallet and token flags with serial_rugger", async () => {
+  const s = await startServer(undefined, { rateLimit: { windowMs: 60_000, max: 3 } });
+  try {
+    const m = seedCreator(s.store);
+    const r = await s.get(`/creator/${CREATOR_X}?limit=3`);
+    assert.equal(r.status, 200);
+    assert.deepEqual([r.body.launched, r.body.dead, r.body.deadRate, r.body.serialRugger, r.body.recent.length], [4, 3, 0.75, true, 3]);
+    const f = (await s.get(`/token/${m.healthy}/flags`)).body;
+    assert.equal(f.creator, CREATOR_X);
+    assert.equal(f.creatorStats.dead, 3);
+    assert.deepEqual(f.flags, ["serial_rugger"]);
+    assert.equal((await s.get("/creator/not-an-address")).status, 400);
+    assert.equal((await s.get(`/creator/${ALICE}`)).status, 429, "shares the read rate limit");
+    // a token without a known creator
+    assert.equal(SERIAL_RUGGER_MIN_LAUNCHES, 3);
+    assert.equal(SERIAL_RUGGER_MIN_DEAD_RATE, 0.7);
+    assert.equal(DEAD_WINDOW_SECONDS, 86_400);
+  } finally { s.stop(); }
+});
+
+test("token flags: no serial_rugger below the launch threshold, null stats without a creator", async () => {
+  const s = await startServer();
+  try {
+    const [a, b] = [0, 1].map(mintN);
+    for (const m of [a, b]) s.store.ingest({ ...ctx([ctrade(m, "buy", 1, 1, T0)], m === a ? [launchOf(m, T0)] : []), signature: `S${m}` });
+    const fa = (await s.get(`/token/${a}/flags`)).body;
+    assert.deepEqual([fa.flags, fa.creatorStats.launched, fa.creatorStats.serialRugger], [[], 1, false]);
+    const fb = (await s.get(`/token/${b}/flags`)).body;
+    assert.deepEqual([fb.creatorStats, fb.flags], [null, []]);
+  } finally { s.stop(); }
 });
