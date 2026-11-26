@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { generateKeyPairSync, sign } from "node:crypto";
 import { createSocialServer } from "../dist/social/server.js";
 import { SocialStore } from "../dist/social/store.js";
-import { hmacSessionAuth, verifySessionToken } from "../dist/session.js";
+import { createSessionToken, hmacSessionAuth, verifySessionToken } from "../dist/session.js";
 
 const SECRET = "s".repeat(40);
 const DOMAIN = "app.ringside.test";
@@ -65,9 +65,19 @@ test("SIWS happy path (base58 and base64 signatures), token accepted by hmacSess
     assert.ok(n.message.includes(u.wallet) && n.message.includes(n.nonce) && n.message.includes("Issued At:") && n.message.includes("Expiration Time:"));
     const v = await s.call("POST", "/auth/verify", { body: { wallet: u.wallet, message: n.message, signature: u.signMsg(n.message).toString("base64") } });
     assert.equal(v.status, 200);
-    assert.equal(verifySessionToken(SECRET, v.json.token).userId, u.wallet);
+    assert.equal(verifySessionToken(SECRET, v.json.token, Date.now(), { aud: "social" }).userId, u.wallet);
     const auth = await hmacSessionAuth(SECRET)({ headers: { authorization: `Bearer ${v.json.token}` } });
-    assert.deepEqual(auth, { userId: u.wallet });
+    assert.equal(auth, null); // the social token is not a sponsor/audience-less token
+    assert.equal(verifySessionToken(SECRET, v.json.token), null);
+    assert.equal(verifySessionToken(SECRET, v.json.tokens.copy, Date.now(), { aud: "copy" }).userId, u.wallet);
+    assert.equal(v.json.tokens.social, v.json.token);
+    const sp = verifySessionToken(SECRET, v.json.tokens.sponsor, Date.now(), { aud: "sponsor" });
+    assert.equal(sp.userId, u.wallet);
+    assert.ok(Math.abs(sp.firstSeen - Date.now() / 1000) < 5);
+    assert.equal(verifySessionToken(SECRET, v.json.tokens.social, Date.now(), { aud: "social" }).userId, u.wallet);
+    assert.ok(await hmacSessionAuth(SECRET, { aud: "social" })({ headers: { authorization: `Bearer ${v.json.token}` } }));
+    assert.equal(await hmacSessionAuth(SECRET, { aud: "social" })({ headers: { authorization: `Bearer ${v.json.tokens.copy}` } }), null);
+    assert.equal((await s.call("GET", "/me", { token: v.json.tokens.sponsor })).status, 401);
     const me = await s.call("GET", "/me", { token: v.json.token });
     assert.equal(me.status, 200);
     assert.equal(me.json.wallet, u.wallet);
@@ -318,5 +328,130 @@ test("notification stream: SSE delivers only the user's intents and needs a bear
     assert.ok(text.includes('"id":"for-a"'));
     assert.ok(!text.includes("for-b"));
     ac.abort();
+  } finally { s.close(); }
+});
+
+// ---- security review: session tokens and social backend ----
+
+test("L1: an attacker cannot evict a victim's pending nonce (regression for PoC4)", async () => {
+  const s = await setup();
+  try {
+    const v = newUser();
+    const victim = (await s.nonce(v.wallet)).json;
+    // the attacker (same IP here, the worst case) hammers the nonce endpoint for the victim's wallet
+    const rs = [];
+    for (let k = 0; k < 8; k++) rs.push((await s.nonce(v.wallet)).status);
+    assert.ok(rs.includes(429), "extra requests are refused rather than evicting");
+    assert.ok(s.store.consumeNonce(victim.nonce), "the victim's nonce survived");
+    // after 60 s the oldest may be evicted again
+    s.advance(61_000);
+    assert.equal((await s.nonce(v.wallet)).status, 200);
+  } finally { s.close(); }
+});
+
+test("L1: per-wallet nonce rate limit, and nonces are bound to the requesting IP", async () => {
+  const s = await setup({ server: { walletNonceRateLimit: { windowMs: 60_000, max: 2 } } });
+  try {
+    const v = newUser();
+    assert.equal((await s.nonce(v.wallet)).status, 200);
+    assert.equal((await s.nonce(v.wallet)).status, 200);
+    assert.equal((await s.nonce(v.wallet)).status, 429);
+  } finally { s.close(); }
+  // IP binding: trustProxy lets the test choose the client address
+  for (const bind of [true, false]) {
+    const s2 = await setup({ server: { trustProxy: true, bindNonceIp: bind } });
+    try {
+      const u = newUser();
+      const n = (await s2.call("POST", "/auth/nonce", { body: { wallet: u.wallet }, headers: { "x-forwarded-for": "198.51.100.1" } })).json;
+      const body = { wallet: u.wallet, message: n.message, signature: b58(u.signMsg(n.message)) };
+      const other = await s2.call("POST", "/auth/verify", { body, headers: { "x-forwarded-for": "203.0.113.9" } });
+      assert.equal(other.status, bind ? 401 : 200, `bind=${bind}`);
+      if (bind) { // the nonce is burned by the failed attempt; a fresh one from the same IP works
+        const n2 = (await s2.call("POST", "/auth/nonce", { body: { wallet: u.wallet }, headers: { "x-forwarded-for": "198.51.100.1" } })).json;
+        const ok = await s2.call("POST", "/auth/verify", { body: { wallet: u.wallet, message: n2.message, signature: b58(u.signMsg(n2.message)) }, headers: { "x-forwarded-for": "198.51.100.1" } });
+        assert.equal(ok.status, 200);
+      }
+    } finally { s2.close(); }
+  }
+});
+
+test("L3: private profiles are hidden from followers/following lists and counts; 404 matches unknown users", async () => {
+  const s = await setup();
+  try {
+    const [a, b, c, ghost] = [await s.login(), await s.login(), await s.login(), newUser()];
+    await s.call("POST", `/follows/${a.wallet}`, { token: b.token });
+    await s.call("POST", `/follows/${a.wallet}`, { token: c.token });
+    await s.call("PUT", "/me", { token: c.token, body: { public: false } }); // c goes private
+    const list = await s.call("GET", `/users/${a.wallet}/followers`, { token: b.token });
+    assert.deepEqual(list.json.followers, [b.wallet]);
+    assert.equal((await s.call("GET", `/users/${a.wallet}`, { token: b.token })).json.followers, 1);
+    // the owner still sees everyone
+    assert.deepEqual((await s.call("GET", `/users/${a.wallet}/followers`, { token: a.token })).json.followers, [b.wallet, c.wallet]);
+    assert.equal((await s.call("GET", `/users/${a.wallet}`, { token: a.token })).json.followers, 2);
+    // c follows a: a's view of c's following hides nothing about c to others, c is private so 404
+    const priv = await s.call("GET", `/users/${c.wallet}/followers`, { token: b.token });
+    const none = await s.call("GET", `/users/${ghost.wallet}/followers`, { token: b.token });
+    assert.equal(priv.status, 404);
+    assert.deepEqual([priv.status, priv.json], [none.status, none.json]);
+    await s.call("PUT", "/me", { token: a.token, body: { public: false } });
+    await s.call("POST", `/follows/${b.wallet}`, { token: c.token });
+    assert.deepEqual((await s.call("GET", `/users/${b.wallet}/following`, { token: c.token })).json.following, []);
+    assert.equal((await s.call("GET", `/users/${b.wallet}`, { token: c.token })).json.following, 0);
+    assert.equal((await s.call("GET", `/users/${ghost.wallet}`, { token: b.token })).status, 404);
+    const p1 = await s.call("GET", `/users/${a.wallet}`, { token: b.token });
+    const p2 = await s.call("GET", `/users/${ghost.wallet}`, { token: b.token });
+    assert.deepEqual([p1.status, p1.json], [p2.status, p2.json]);
+  } finally { s.close(); }
+});
+
+test("L4: stream caps (global and per IP) and close at token expiry", async () => {
+  const s = await setup({ server: { maxStreams: 3, maxStreamsPerIp: 2 } });
+  const ctrls = [];
+  try {
+    const open = async (u) => {
+      const ac = new AbortController(); ctrls.push(ac);
+      const r = await fetch(`http://127.0.0.1:${s.server.address().port}/notifications/stream`, { headers: { authorization: `Bearer ${u.token}` }, signal: ac.signal });
+      return r;
+    };
+    const [a, b, c] = [await s.login(), await s.login(), await s.login()];
+    assert.equal((await open(a)).status, 200);
+    assert.equal((await open(b)).status, 200);
+    const third = await open(c); // same IP: per-IP cap of 2
+    assert.equal(third.status, 429);
+    assert.equal((await third.json()).error.code, "too_many_streams");
+  } finally { for (const c of ctrls) c.abort(); s.close(); }
+
+  const s2 = await setup({ server: { sessionTtlSeconds: 1 } });
+  try {
+    const u = await s2.login();
+    const r = await fetch(`http://127.0.0.1:${s2.server.address().port}/notifications/stream`, { headers: { authorization: `Bearer ${u.token}` } });
+    assert.equal(r.status, 200);
+    const t0 = Date.now();
+    const reader = r.body.getReader();
+    for (;;) { const { done } = await reader.read(); if (done) break; if (Date.now() - t0 > 5000) assert.fail("stream stayed open"); }
+  } finally { s2.close(); }
+});
+
+test("L5: logout revokes earlier tokens; default TTL is 12 h; revocation port", async () => {
+  const s = await setup();
+  try {
+    const u = await s.login();
+    const claims = verifySessionToken(SECRET, u.token, Date.now(), { aud: "social" });
+    assert.equal(claims.exp - claims.iat, 12 * 3600);
+    assert.equal((await s.call("GET", "/me", { token: u.token })).status, 200);
+    assert.equal((await s.call("POST", "/auth/logout", { token: u.token })).status, 200);
+    assert.equal((await s.call("GET", "/me", { token: u.token })).status, 401);
+    assert.equal((await s.call("POST", "/auth/logout")).status, 401);
+    // the port the copy and sponsor auth can use sees it for every audience's token
+    assert.equal(s.store.isRevoked(u.wallet, claims.iat), true);
+    assert.equal(s.store.isRevoked(u.wallet, claims.iat + 5), false);
+    const copyTok = createSessionToken(SECRET, u.wallet, 3600, (claims.iat - 10) * 1000, "copy");
+    const hdr = { headers: { authorization: `Bearer ${copyTok}` } };
+    assert.ok(await hmacSessionAuth(SECRET, { aud: "copy" })(hdr));
+    assert.equal(await hmacSessionAuth(SECRET, { aud: "copy", revocation: s.store })(hdr), null);
+    // sign in again later: works
+    s.advance(2000);
+    const again = await s.login(u);
+    assert.equal((await s.call("GET", "/me", { token: again.token })).status, 200);
   } finally { s.close(); }
 });

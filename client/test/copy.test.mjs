@@ -340,12 +340,12 @@ async function http(extra = {}) {
   const server = createCopyServer({
     store: r.store, engine: r.engine,
     build: { store: r.store, pump: pumpFake("curve"), jupiter: jupFake(ALICE), chain },
-    authenticate: hmacSessionAuth(SESSION), ingestSecret: INGEST, corsOrigin: "https://app.example", now: () => r.clock.t, ...extra,
+    authenticate: hmacSessionAuth(SESSION, { aud: "copy" }), ingestSecret: INGEST, corsOrigin: "https://app.example", now: () => r.clock.t, ...extra,
   });
   server.listen(0);
   await new Promise((res) => server.once("listening", res));
   const base = `http://127.0.0.1:${server.address().port}`;
-  const tok = (u) => ({ authorization: `Bearer ${createSessionToken(SESSION, u, 600)}` });
+  const tok = (u) => ({ authorization: `Bearer ${createSessionToken(SESSION, u, 600, Date.now(), "copy")}` });
   const call = async (method, path, { headers = {}, body } = {}) => {
     const res = await fetch(base + path, { method, headers: { "content-type": "application/json", ...headers }, body: body === undefined ? undefined : typeof body === "string" ? body : JSON.stringify(body) });
     const text = await res.text();

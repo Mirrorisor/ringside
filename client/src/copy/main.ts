@@ -35,7 +35,8 @@ export function startCopyService(social: SocialPort, indexer: SqliteStore, env: 
   };
   const server = createCopyServer({
     store, engine, build,
-    authenticate: hmacSessionAuth(need("SESSION_SECRET")),
+    // aud "copy": tokens for other services are refused. Revocation: see RevocationPort (multi-process gap).
+    authenticate: hmacSessionAuth(need("SESSION_SECRET"), { aud: "copy" }),
     ingestSecret: need("COPY_INGEST_SECRET"),
     corsOrigin: env.COPY_CORS_ORIGIN,
     trustProxy: env.COPY_TRUST_PROXY === "1",

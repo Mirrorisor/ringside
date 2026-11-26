@@ -1,16 +1,19 @@
 /** SQLite storage for the social backend (node:sqlite) and the SocialPort implementation. */
 import { DatabaseSync } from "node:sqlite";
+import type { RevocationPort } from "../session.js";
 import type { CopyIntent, CopySettings, RiskFlag, SocialPort } from "./ports.js";
 
 export const RISK_FLAGS: readonly RiskFlag[] = ["sniper", "bundle", "insider", "concentrated"];
 const MAX_NOTIFICATIONS_PER_USER = 1_000;
 const MAX_LIVE_NONCES_PER_WALLET = 5;
+/** A nonce younger than this is never evicted to make room; new requests are refused instead. */
+export const NONCE_MIN_AGE_MS = 60_000;
 
 export interface Profile { wallet: string; displayName: string; bio: string; avatarUrl: string | null; public: boolean }
 export type FollowResult = "ok" | "limit" | "self";
 export interface StoredNotification { seq: number; intent: CopyIntent }
 
-export class SocialStore implements SocialPort {
+export class SocialStore implements SocialPort, RevocationPort {
   private db: DatabaseSync;
   private listeners = new Set<(follower: string, n: StoredNotification) => void>();
 
@@ -18,7 +21,9 @@ export class SocialStore implements SocialPort {
     this.db = new DatabaseSync(path);
     this.db.exec(`
       PRAGMA journal_mode = WAL;
-      CREATE TABLE IF NOT EXISTS nonces (nonce TEXT PRIMARY KEY, wallet TEXT NOT NULL, message TEXT NOT NULL, expires_at INTEGER NOT NULL, used INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE IF NOT EXISTS nonces (nonce TEXT PRIMARY KEY, wallet TEXT NOT NULL, message TEXT NOT NULL, expires_at INTEGER NOT NULL, used INTEGER NOT NULL DEFAULT 0, issued_at INTEGER NOT NULL DEFAULT 0, ip_hash TEXT NOT NULL DEFAULT '');
+      CREATE TABLE IF NOT EXISTS users (wallet TEXT PRIMARY KEY, first_seen INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS revocations (user TEXT PRIMARY KEY, before INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS profiles (wallet TEXT PRIMARY KEY, display_name TEXT NOT NULL, bio TEXT NOT NULL, avatar_url TEXT, public INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS follows (id INTEGER PRIMARY KEY AUTOINCREMENT, follower TEXT NOT NULL, leader TEXT NOT NULL, UNIQUE (follower, leader));
       CREATE INDEX IF NOT EXISTS follows_leader ON follows (leader, id);
@@ -27,6 +32,9 @@ export class SocialStore implements SocialPort {
       CREATE TABLE IF NOT EXISTS notifications (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, follower TEXT NOT NULL, json TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS notif_follower ON notifications (follower, seq);
     `);
+    const cols = (this.db.prepare("PRAGMA table_info(nonces)").all() as { name: string }[]).map((c) => c.name);
+    if (!cols.includes("issued_at")) this.db.exec("ALTER TABLE nonces ADD COLUMN issued_at INTEGER NOT NULL DEFAULT 0");
+    if (!cols.includes("ip_hash")) this.db.exec("ALTER TABLE nonces ADD COLUMN ip_hash TEXT NOT NULL DEFAULT ''");
   }
 
   close() { this.db.close(); }
@@ -37,20 +45,52 @@ export class SocialStore implements SocialPort {
   }
 
   // ---- nonces ----
-  issueNonce(wallet: string, nonce: string, message: string, expiresAt: number, now: number) {
-    this.tx(() => {
+  /**
+   * Stores a nonce bound to the requester's IP hash. Live nonces are capped per (wallet, IP hash),
+   * so one client cannot push out another's; at the cap the oldest is evicted only if it is at
+   * least NONCE_MIN_AGE_MS old, otherwise the request is refused (returns false).
+   */
+  issueNonce(wallet: string, nonce: string, message: string, expiresAt: number, now: number, ipHash = ""): boolean {
+    return this.tx(() => {
       this.db.prepare("DELETE FROM nonces WHERE expires_at < ? OR used = 1").run(now);
-      this.db.prepare(`DELETE FROM nonces WHERE wallet = ? AND nonce NOT IN
-        (SELECT nonce FROM nonces WHERE wallet = ? ORDER BY expires_at DESC LIMIT ?)`).run(wallet, wallet, MAX_LIVE_NONCES_PER_WALLET - 1);
-      this.db.prepare("INSERT INTO nonces (nonce, wallet, message, expires_at) VALUES (?, ?, ?, ?)").run(nonce, wallet, message, expiresAt);
+      const live = this.db.prepare("SELECT nonce, issued_at FROM nonces WHERE wallet = ? AND ip_hash = ? ORDER BY issued_at ASC, rowid ASC").all(wallet, ipHash) as { nonce: string; issued_at: number }[];
+      if (live.length >= MAX_LIVE_NONCES_PER_WALLET) {
+        const excess = live.slice(0, live.length - MAX_LIVE_NONCES_PER_WALLET + 1);
+        if (excess.some((n) => now - n.issued_at < NONCE_MIN_AGE_MS)) return false;
+        for (const n of excess) this.db.prepare("DELETE FROM nonces WHERE nonce = ?").run(n.nonce);
+      }
+      this.db.prepare("INSERT INTO nonces (nonce, wallet, message, expires_at, issued_at, ip_hash) VALUES (?, ?, ?, ?, ?, ?)").run(nonce, wallet, message, expiresAt, now, ipHash);
+      return true;
     });
   }
 
   /** Atomically burns the nonce; returns its issued record only the first time. */
-  consumeNonce(nonce: string): { wallet: string; message: string; expiresAt: number } | null {
-    const r = this.db.prepare("UPDATE nonces SET used = 1 WHERE nonce = ? AND used = 0 RETURNING wallet, message, expires_at").get(nonce) as
-      { wallet: string; message: string; expires_at: number } | undefined;
-    return r ? { wallet: r.wallet, message: r.message, expiresAt: r.expires_at } : null;
+  consumeNonce(nonce: string): { wallet: string; message: string; expiresAt: number; ipHash: string } | null {
+    const r = this.db.prepare("UPDATE nonces SET used = 1 WHERE nonce = ? AND used = 0 RETURNING wallet, message, expires_at, ip_hash").get(nonce) as
+      { wallet: string; message: string; expires_at: number; ip_hash: string } | undefined;
+    return r ? { wallet: r.wallet, message: r.message, expiresAt: r.expires_at, ipHash: r.ip_hash } : null;
+  }
+
+  // ---- users, revocation ----
+  /** Records a sign-in; returns the user's first sign-in time in unix seconds (set once). */
+  recordSignIn(wallet: string, nowMs: number): number {
+    this.db.prepare("INSERT OR IGNORE INTO users (wallet, first_seen) VALUES (?, ?)").run(wallet, Math.floor(nowMs / 1000));
+    return (this.db.prepare("SELECT first_seen FROM users WHERE wallet = ?").get(wallet) as { first_seen: number }).first_seen;
+  }
+
+  /** True if the wallet signed in before or has a profile: the only wallets that "exist". */
+  userExists(wallet: string): boolean {
+    return !!this.db.prepare("SELECT 1 FROM users WHERE wallet = ? UNION SELECT 1 FROM profiles WHERE wallet = ?").get(wallet, wallet);
+  }
+
+  /** Revokes every token for `userId` issued at or before `beforeSec` (unix seconds). Only ever moves forward. */
+  revoke(userId: string, beforeSec: number) {
+    this.db.prepare("INSERT INTO revocations (user, before) VALUES (?, ?) ON CONFLICT (user) DO UPDATE SET before = MAX(before, excluded.before)").run(userId, beforeSec);
+  }
+
+  isRevoked(userId: string, iat: number): boolean {
+    const r = this.db.prepare("SELECT before FROM revocations WHERE user = ?").get(userId) as { before: number } | undefined;
+    return !!r && iat <= r.before;
   }
 
   // ---- profiles ----
@@ -92,20 +132,27 @@ export class SocialStore implements SocialPort {
     return !!this.db.prepare("SELECT 1 FROM follows WHERE follower = ? AND leader = ?").get(follower, leader);
   }
 
-  following(follower: string): string[] {
-    return (this.db.prepare("SELECT leader FROM follows WHERE follower = ? ORDER BY id").all(follower) as { leader: string }[]).map((r) => r.leader);
+  /** Who `follower` follows. Others' views (`includePrivate` false) hide private profiles. */
+  following(follower: string, includePrivate = true): string[] {
+    const sql = includePrivate
+      ? "SELECT leader FROM follows WHERE follower = ? ORDER BY id"
+      : "SELECT f.leader FROM follows f LEFT JOIN profiles p ON p.wallet = f.leader WHERE f.follower = ? AND COALESCE(p.public, 1) = 1 ORDER BY f.id";
+    return (this.db.prepare(sql).all(follower) as { leader: string }[]).map((r) => r.leader);
   }
 
-  followers(leader: string, limit: number, after: number): { wallets: string[]; next: number | null } {
-    const rows = this.db.prepare("SELECT id, follower FROM follows WHERE leader = ? AND id > ? ORDER BY id LIMIT ?").all(leader, after, limit) as { id: number; follower: string }[];
+  followers(leader: string, limit: number, after: number, includePrivate = false): { wallets: string[]; next: number | null } {
+    const rows = this.db.prepare(`SELECT f.id, f.follower FROM follows f LEFT JOIN profiles p ON p.wallet = f.follower
+      WHERE f.leader = ? AND f.id > ? AND (? = 1 OR COALESCE(p.public, 1) = 1) ORDER BY f.id LIMIT ?`).all(leader, after, includePrivate ? 1 : 0, limit) as { id: number; follower: string }[];
     return { wallets: rows.map((r) => r.follower), next: rows.length === limit ? rows[rows.length - 1].id : null };
   }
 
-  counts(wallet: string): { followers: number; following: number } {
-    const c = (sql: string) => (this.db.prepare(sql).get(wallet) as { n: number }).n;
+  /** Counts as shown to `includePrivate` false viewers exclude private profiles on the other side. */
+  counts(wallet: string, includePrivate = false): { followers: number; following: number } {
+    const priv = includePrivate ? 1 : 0;
+    const c = (sql: string) => (this.db.prepare(sql).get(wallet, priv) as { n: number }).n;
     return {
-      followers: c("SELECT COUNT(*) AS n FROM follows WHERE leader = ?"),
-      following: c("SELECT COUNT(*) AS n FROM follows WHERE follower = ?"),
+      followers: c("SELECT COUNT(*) AS n FROM follows f LEFT JOIN profiles p ON p.wallet = f.follower WHERE f.leader = ? AND (? = 1 OR COALESCE(p.public, 1) = 1)"),
+      following: c("SELECT COUNT(*) AS n FROM follows f LEFT JOIN profiles p ON p.wallet = f.leader WHERE f.follower = ? AND (? = 1 OR COALESCE(p.public, 1) = 1)"),
     };
   }
 
