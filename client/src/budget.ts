@@ -12,6 +12,7 @@
 import { connect, type Socket } from "node:net";
 import { connect as tlsConnect } from "node:tls";
 import { randomBytes } from "node:crypto";
+import { closeSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 
 export interface BudgetStore {
   countLastHour(key: string): Promise<number>;
@@ -24,11 +25,11 @@ const DAY = 86_400_000;
 const today = () => Math.floor(Date.now() / DAY);
 
 export class MemoryBudget implements BudgetStore {
-  private hourly = new Map<string, number[]>();
-  private daily = new Map<string, bigint>();
-  private day = today();
+  protected hourly = new Map<string, number[]>();
+  protected daily = new Map<string, bigint>();
+  protected day = today();
 
-  private roll() {
+  protected roll() {
     if (today() !== this.day) {
       this.day = today();
       this.daily.clear();
@@ -161,8 +162,110 @@ export class RespClient {
   }
 }
 
+/**
+ * MemoryBudget persisted to a small JSON file after every record, so a restart
+ * does not reset the day's spend. Takes an exclusive lock file
+ * (`<path>.lock`, holding the PID) so a second instance on the same state
+ * refuses to start; a lock left by a dead process is taken over. Writes are
+ * atomic (temp file + rename). Single instance only: use RedisBudget to share.
+ */
+export class FileBudget extends MemoryBudget {
+  private lock: string;
+  private locked = false;
+
+  constructor(private path: string) {
+    super();
+    this.lock = `${path}.lock`;
+    this.acquire();
+    this.load();
+    process.once("exit", () => this.close());
+  }
+
+  private acquire() {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const fd = openSync(this.lock, "wx", 0o600);
+        writeFileSync(fd, String(process.pid));
+        closeSync(fd);
+        this.locked = true;
+        return;
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+        const pid = Number(readFileSync(this.lock, "utf8").trim());
+        if (Number.isInteger(pid) && pid > 0 && alive(pid)) {
+          throw new Error(`Another instance (pid ${pid}) holds ${this.lock}. Run one instance, or share limits through Redis.`);
+        }
+        unlinkSync(this.lock); // stale: its process is gone
+      }
+    }
+    throw new Error(`Could not take the lock ${this.lock}.`);
+  }
+
+  private load() {
+    let raw: string;
+    try {
+      raw = readFileSync(this.path, "utf8");
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw e;
+    }
+    const s = JSON.parse(raw) as { day?: number; daily?: Record<string, string>; hourly?: Record<string, number[]> };
+    const cut = Date.now() - HOUR;
+    for (const [k, ts] of Object.entries(s.hourly ?? {})) {
+      const xs = (Array.isArray(ts) ? ts : []).filter((t) => typeof t === "number" && t > cut);
+      if (xs.length) this.hourly.set(k, xs);
+    }
+    if (s.day === today()) for (const [k, v] of Object.entries(s.daily ?? {})) this.daily.set(k, BigInt(v));
+  }
+
+  private save() {
+    const cut = Date.now() - HOUR;
+    const hourly: Record<string, number[]> = {};
+    for (const [k, ts] of this.hourly) {
+      const xs = ts.filter((t) => t > cut);
+      if (xs.length) hourly[k] = xs;
+      else this.hourly.delete(k);
+    }
+    const daily: Record<string, string> = {};
+    for (const [k, v] of this.daily) daily[k] = v.toString();
+    const tmp = `${this.path}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify({ day: this.day, daily, hourly }), { mode: 0o600 });
+    renameSync(tmp, this.path);
+  }
+
+  async record(keys: string[], lamports: bigint) {
+    await super.record(keys, lamports);
+    this.save();
+  }
+
+  /** Releases the lock (also done on process exit). */
+  close() {
+    if (!this.locked) return;
+    this.locked = false;
+    try {
+      unlinkSync(this.lock);
+    } catch {
+      /* already gone */
+    }
+  }
+}
+
+function alive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/** The one Redis call RedisBudget needs, so another client library can be injected. */
+export interface RedisLike {
+  call(...args: (string | number | bigint)[]): Promise<unknown>;
+}
+
 export class RedisBudget implements BudgetStore {
-  constructor(private redis: RespClient, private prefix = "ringside:relayer:") {}
+  constructor(private redis: RedisLike, private prefix = "ringside:relayer:") {}
 
   async countLastHour(key: string) {
     const k = `${this.prefix}h:${key}`;

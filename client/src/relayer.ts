@@ -41,7 +41,7 @@ import {
   type KeyPairSigner,
   type Transaction,
 } from "@solana/kit";
-import { bigintJson, decodeWire, quoteAndSimulate, refuse, rpcRetry, type Accepted, type Ix, type Refusal, type SimulationRpc } from "./txpolicy.js";
+import { bigintJson, clientIp, decodeWire, quoteAndSimulate, refuse, rpcRetry, type Accepted, type Ix, type Refusal, type SimulationRpc } from "./txpolicy.js";
 import { createHash } from "node:crypto";
 
 export const PROGRAMS = {
@@ -270,8 +270,8 @@ export function createRelayerServer(relayer: Relayer, opts: { allowOrigin?: stri
     });
     res.end(JSON.stringify(body, bigintJson));
   };
-  const ipOf = (req: IncomingMessage) =>
-    (opts.trustProxy ? String(req.headers["x-forwarded-for"] ?? "").split(",")[0].trim() : "") || req.socket.remoteAddress || "unknown";
+  // Rightmost X-Forwarded-For hop: the leftmost is client-controlled.
+  const ipOf = (req: IncomingMessage) => clientIp(req, opts.trustProxy ? 1 : 0);
 
   return createServer(async (req, res) => {
     try {
@@ -323,7 +323,7 @@ export function createRelayerServer(relayer: Relayer, opts: { allowOrigin?: stri
           console.log(`[relayer] sponsored ${out.signature} spent=${out.spentLamports}`);
           return json(res, 200, { signature: out.signature, spentLamports: out.spentLamports });
         }
-        console.log(`[relayer] refused ${out.code}`);
+        console.log(`[relayer] refused ${out.code}${out.internal ? `: ${out.internal}` : ""}`);
         return json(res, out.status, { code: out.code, message: out.message });
       }
       return json(res, 404, { code: "not_found" });

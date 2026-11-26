@@ -17,6 +17,8 @@ test-trading-accounts/
 # Local runtime data
 *.log
 client/metadata-store/
+sponsor-state.json
+sponsor-state.json.lock
 devnet-deployment.json
 
 # Raw third-party market data (GeckoTerminal); fetch it with the collector script

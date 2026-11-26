@@ -13,11 +13,16 @@ import {
   type Transaction,
 } from "@solana/kit";
 
-/** A structured refusal the app can show. `instruction` is the index of the offending instruction, if any. */
-export type Refusal = { ok: false; status: number; code: string; message: string; instruction?: number; details?: Record<string, unknown> };
-export type Accepted = { ok: true; signature: string; spentLamports: bigint };
+/**
+ * A structured refusal the app can show. `instruction` is the index of the
+ * offending instruction, if any. `internal` is for server logs only and must
+ * never be sent to clients.
+ */
+export type Refusal = { ok: false; status: number; code: string; message: string; instruction?: number; details?: Record<string, unknown>; internal?: string };
+/** `status` is set only when the caller waited for confirmation. */
+export type Accepted = { ok: true; signature: string; spentLamports: bigint; status?: "confirmed" | "failed" | "unknown" };
 
-export const refuse = (status: number, code: string, message: string, extra: { instruction?: number; details?: Record<string, unknown> } = {}): Refusal => ({
+export const refuse = (status: number, code: string, message: string, extra: { instruction?: number; details?: Record<string, unknown>; internal?: string } = {}): Refusal => ({
   ok: false,
   status,
   code,
@@ -84,7 +89,8 @@ export function decodeWire(
     if (hasLookups && !opts.lookups) return refuse(400, "lookup_tables", "Address lookup tables are not accepted.");
     message = decompileTransactionMessage(compiled as never, hasLookups ? { addressesByLookupTableAddress: opts.lookups } : undefined);
   } catch (e) {
-    return refuse(400, "malformed", `Could not decode the transaction: ${(e as Error).message}`);
+    // The decoder's text describes our internals; log it, don't return it.
+    return refuse(400, "malformed", "Could not decode the transaction.", { internal: String((e as Error)?.message ?? e) });
   }
   if (getTransactionSize(tx) > 4096) return refuse(400, "too_large", "Transaction is over 4,096 bytes.");
   if (message.feePayer.address !== expectedFeePayer) return refuse(400, "fee_payer", `The ${who} must be the fee payer.`);
@@ -97,6 +103,21 @@ export function decodeWire(
   }));
   if (instructions.length === 0) return refuse(400, "empty", "No instructions.");
   return { ok: true, tx, feePayer: message.feePayer.address, instructions, signerSlots: Object.keys(tx.signatures) as Address[] };
+}
+
+/**
+ * The client IP for rate limiting. Without a trusted proxy, the socket
+ * address. Behind `hops` trusted proxies, each appends the address it saw to
+ * X-Forwarded-For, so the trustworthy entry is the `hops`-th from the right;
+ * everything left of it is whatever the client sent. Too few entries means
+ * the request bypassed a proxy: use the socket address.
+ */
+export function clientIp(req: { headers: Record<string, string | string[] | undefined>; socket: { remoteAddress?: string } }, hops = 0): string {
+  const socket = req.socket.remoteAddress || "unknown";
+  if (hops <= 0) return socket;
+  const raw = req.headers["x-forwarded-for"];
+  const parts = (Array.isArray(raw) ? raw.join(",") : (raw ?? "")).split(",").map((x) => x.trim()).filter(Boolean);
+  return parts.length >= hops ? parts[parts.length - hops] : socket;
 }
 
 /** RPC methods for fee quoting, simulation and sending, so tests can pass a fake. */
