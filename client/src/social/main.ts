@@ -10,7 +10,9 @@
  *   SOCIAL_MAX_TRADE_SOL      server cap on a copy's per-trade size in SOL (default 5)
  *   SOCIAL_MAX_BODY_BYTES     JSON body limit (default 16384)
  *   SOCIAL_RATE_LIMIT_IP / _USER / _AUTH   requests per minute (defaults 300 / 120 / 20; 0 disables)
- *   SOCIAL_SESSION_TTL_SECONDS  default 86400
+ *   SOCIAL_SESSION_TTL_SECONDS  default 43200 (12 h)
+ *   SOCIAL_NONCE_BIND_IP=0    do not bind sign-in nonces to the requesting IP (mobile networks that change IP)
+ *   SOCIAL_MAX_STREAMS / _PER_IP   open notification streams, global and per IP (defaults 2000 / 20)
  *   SOCIAL_TRUST_PROXY=1      key clients by the last X-Forwarded-For entry
  */
 import { MIN_SECRET_BYTES } from "../session.js";
@@ -41,10 +43,13 @@ const server = createSocialServer({
   corsOrigins: (process.env.SOCIAL_CORS_ORIGIN ?? "").split(",").map((s) => s.trim()).filter(Boolean),
   maxTradeLamports: Math.round(num("SOCIAL_MAX_TRADE_SOL", 5) * LAMPORTS_PER_SOL),
   maxBodyBytes: num("SOCIAL_MAX_BODY_BYTES", DEFAULT_MAX_BODY_BYTES),
-  sessionTtlSeconds: num("SOCIAL_SESSION_TTL_SECONDS", 86_400),
+  sessionTtlSeconds: num("SOCIAL_SESSION_TTL_SECONDS", 43_200),
   ipRateLimit: limit("SOCIAL_RATE_LIMIT_IP", 300),
   userRateLimit: limit("SOCIAL_RATE_LIMIT_USER", 120),
   authRateLimit: limit("SOCIAL_RATE_LIMIT_AUTH", 20),
+  bindNonceIp: process.env.SOCIAL_NONCE_BIND_IP !== "0",
+  maxStreams: num("SOCIAL_MAX_STREAMS", 2000),
+  maxStreamsPerIp: num("SOCIAL_MAX_STREAMS_PER_IP", 20),
   trustProxy: process.env.SOCIAL_TRUST_PROXY === "1",
 });
 server.listen(port, process.env.SOCIAL_HOST ?? "127.0.0.1", () => console.log(`[social] listening on :${port}, db ${dbPath}`));

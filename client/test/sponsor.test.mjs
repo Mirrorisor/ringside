@@ -255,13 +255,14 @@ test("other refusals: wrong fee payer, no user signer, too many signers, lookup 
 });
 
 const SECRET = "test-session-secret-0123456789abcdef"; // 36 bytes
-const authed = (userId = "user-1") => ({ authorization: `Bearer ${createSessionToken(SECRET, userId)}` });
+const OLD = Math.floor(Date.now() / 1000) - 86_400; // first sign-in a day ago
+const authed = (userId = "user-1", firstSeen = OLD) => ({ authorization: `Bearer ${createSessionToken(SECRET, userId, 3600, Date.now(), "sponsor", { firstSeen })}` });
 
 // Changed: this test used to start the server with no authenticator (an open
 // gas service, finding H2). It now signs requests with a session token.
 test("HTTP server: /health and /sponsor with structured refusals", async () => {
   const s = await setup();
-  const server = createSponsorServer(s.sponsor, { authenticate: hmacSessionAuth(SECRET) }).listen(0);
+  const server = createSponsorServer(s.sponsor, { authenticate: hmacSessionAuth(SECRET, { aud: "sponsor" }) }).listen(0);
   await new Promise((r) => server.once("listening", r));
   const base = `http://127.0.0.1:${server.address().port}`;
   try {
@@ -344,7 +345,7 @@ test("H2: the server refuses to start without an authenticator unless anonymous 
 test("H2: requests need a valid, unexpired session token", async () => {
   const s = await setup();
   const tx = await build({ feePayer: s.F, instructions: [await pumpBuyIx(s.U)], signers: [s.user] });
-  await withServer(s.sponsor, { authenticate: hmacSessionAuth(SECRET) }, async (base) => {
+  await withServer(s.sponsor, { authenticate: hmacSessionAuth(SECRET, { aud: "sponsor" }) }, async (base) => {
     assert.equal((await post(base, tx)).status, 401);
     assert.equal((await post(base, tx, { authorization: "Bearer junk" })).status, 401);
     const forged = createSessionToken("another-secret-of-at-least-32-bytes!!", "user-1");
@@ -356,9 +357,38 @@ test("H2: requests need a valid, unexpired session token", async () => {
   });
 });
 
+test("M3: tokens are audience-bound; sponsor needs an old enough account", async () => {
+  const s = await setup();
+  const tx = await build({ feePayer: s.F, instructions: [await pumpBuyIx(s.U)], signers: [s.user] });
+  const bearer = (t) => ({ authorization: `Bearer ${t}` });
+  const now = Date.now(), nowS = Math.floor(now / 1000);
+  await withServer(s.sponsor, { authenticate: hmacSessionAuth(SECRET, { aud: "sponsor" }) }, async (base) => {
+    for (const aud of [undefined, "social", "copy"]) // a token for another service (or none) is refused
+      assert.equal((await post(base, tx, bearer(createSessionToken(SECRET, "u", 3600, now, aud, { firstSeen: OLD })))).status, 401, String(aud));
+    // sponsor token with no firstSeen, a brand-new account, or a future firstSeen: not eligible
+    assert.equal((await post(base, tx, bearer(createSessionToken(SECRET, "u", 3600, now, "sponsor")))).status, 403);
+    assert.equal((await post(base, tx, authed("u", nowS - 60))).status, 403);
+    assert.equal((await post(base, tx, authed("u", nowS + 3600))).status, 403);
+    assert.equal(s.rpc.calls.simulated, 0);
+    assert.equal((await post(base, tx, authed("u", nowS - 3601))).status, 200);
+  });
+  // pluggable gate, and a custom minimum age
+  await withServer(s.sponsor, { authenticate: hmacSessionAuth(SECRET, { aud: "sponsor" }), eligible: (u) => u === "vip" }, async (base) => {
+    assert.equal((await post(base, tx, authed("nobody"))).status, 403);
+  });
+  await withServer(s.sponsor, { authenticate: hmacSessionAuth(SECRET, { aud: "sponsor" }), minAccountAgeSec: 10 }, async (base) => {
+    assert.equal((await post(base, tx, authed("u", nowS - 11))).status, 200);
+  });
+  // audience in the verifier
+  const t = createSessionToken(SECRET, "alice", 60, now, "copy");
+  assert.equal(verifySessionToken(SECRET, t), null);
+  assert.equal(verifySessionToken(SECRET, t, now, { aud: "social" }), null);
+  assert.equal(verifySessionToken(SECRET, t, now, { aud: "copy" }).userId, "alice");
+});
+
 test("H2: session tokens: tamper, expiry, secret length", () => {
   const t = createSessionToken(SECRET, "alice", 60);
-  assert.deepEqual(verifySessionToken(SECRET, t), { userId: "alice" });
+  assert.equal(verifySessionToken(SECRET, t).userId, "alice");
   const [v, p, m] = t.split(".");
   const evil = Buffer.from(JSON.stringify({ sub: "bob", exp: Math.floor(Date.now() / 1000) + 60 })).toString("base64url");
   assert.equal(verifySessionToken(SECRET, `${v}.${evil}.${m}`), null);
@@ -511,14 +541,14 @@ test("M3: the blockhash must be a recent one", async () => {
 
 test("L3: decoder errors are not returned; CORS defaults to no origin", async () => {
   const s = await setup();
-  await withServer(s.sponsor, { authenticate: hmacSessionAuth(SECRET) }, async (base) => {
+  await withServer(s.sponsor, { authenticate: hmacSessionAuth(SECRET, { aud: "sponsor" }) }, async (base) => {
     const res = await post(base, Buffer.from([1, 2, 3, 4, 5]).toString("base64"), authed());
     assert.equal(res.status, 400);
     assert.equal(res.headers.get("access-control-allow-origin"), null);
     const body = await res.json();
     assert.deepEqual(body, { ok: false, code: "malformed", message: "Could not decode the transaction." });
   });
-  await withServer(s.sponsor, { authenticate: hmacSessionAuth(SECRET), allowOrigin: "https://app.ringside.example" }, async (base) => {
+  await withServer(s.sponsor, { authenticate: hmacSessionAuth(SECRET, { aud: "sponsor" }), allowOrigin: "https://app.ringside.example" }, async (base) => {
     const res = await fetch(`${base}/sponsor`, { method: "OPTIONS" });
     assert.equal(res.headers.get("access-control-allow-origin"), "https://app.ringside.example");
     assert.match(res.headers.get("access-control-allow-headers"), /authorization/);

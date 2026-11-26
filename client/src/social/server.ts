@@ -2,10 +2,14 @@
  * Social backend HTTP API (JSON; errors are `{error: {code, message}}` with fixed messages).
  *
  *   POST /auth/nonce {wallet}                      -> {nonce, message}
- *   POST /auth/verify {wallet, message, signature} -> {token}
+ *   POST /auth/verify {wallet, message, signature} -> {token, tokens: {social, copy, sponsor}}
+ *                                                    (`token` is the social token; use tokens.copy / tokens.sponsor
+ *                                                    at those services: each token works at its own service only)
+ *   POST /auth/logout                              revokes every token issued to the caller up to now
  *   GET/PUT /me                                    profile (public: displayName, bio, avatarUrl, public)
  *   GET /users/:wallet                             public profile + followers/following counts
- *   GET /users/:wallet/followers?limit&cursor
+ *   GET /users/:wallet/followers?limit&cursor      private profiles are hidden from others' lists and counts
+ *   GET /users/:wallet/following
  *   GET /follows                                   -> {following}
  *   POST/DELETE /follows/:wallet                   idempotent
  *   GET/PUT /copy-settings/:leader                 requires following the leader
@@ -13,6 +17,7 @@
  *   GET /notifications/stream                      Server-Sent Events (Authorization: Bearer)
  *   GET /health
  */
+import { createHmac } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { RateLimiter, clientKey } from "../indexer/server.js";
 import { hmacSessionAuth, createSessionToken, MIN_SECRET_BYTES, type Authenticator } from "../session.js";
@@ -29,6 +34,9 @@ export const MAX_DISPLAY_NAME = 50;
 export const MAX_BIO = 280;
 export const MAX_AVATAR_URL = 512;
 const MAX_STREAMS_PER_USER = 5;
+const MAX_STREAMS_TOTAL = 2_000;
+const MAX_STREAMS_PER_IP = 20;
+export const DEFAULT_SESSION_TTL_SECONDS = 12 * 3600;
 const HEARTBEAT_MS = 25_000;
 
 export interface SocialOptions {
@@ -52,6 +60,13 @@ export interface SocialOptions {
   trustProxy?: boolean;
   requestTimeoutMs?: number;
   heartbeatMs?: number;
+  /** Per-wallet limit on /auth/nonce (in addition to per-IP). Default 10 per minute. */
+  walletNonceRateLimit?: { windowMs: number; max: number } | false;
+  /** Bind each nonce to the requesting IP and require the same IP at verify. Default true (SOCIAL_NONCE_BIND_IP=0 opts out for mobile networks). */
+  bindNonceIp?: boolean;
+  /** Open notification streams: global and per client IP. */
+  maxStreams?: number;
+  maxStreamsPerIp?: number;
 }
 
 class HttpError extends Error {
@@ -87,10 +102,10 @@ export function createSocialServer(opts: SocialOptions): Server {
   if (!domain || /[\s/]/.test(domain)) throw new Error("SOCIAL_DOMAIN must be a bare domain such as app.example.com");
   const origins = new Set(opts.corsOrigins ?? []);
   for (const o of origins) if (o === "*" || !/^https?:\/\/[^\s/*]+$/.test(o)) throw new Error("SOCIAL_CORS_ORIGIN must list exact origins, never *");
-  const authenticate = opts.authenticate ?? hmacSessionAuth(opts.secret);
+  const authenticate = opts.authenticate ?? hmacSessionAuth(opts.secret, { aud: "social", revocation: store });
   const now = opts.now ?? Date.now;
   const nonceTtl = (opts.nonceTtlSeconds ?? 300) * 1000;
-  const sessionTtl = opts.sessionTtlSeconds ?? 24 * 3600;
+  const sessionTtl = opts.sessionTtlSeconds ?? DEFAULT_SESSION_TTL_SECONDS;
   const maxBody = opts.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
   const maxTrade = opts.maxTradeLamports ?? DEFAULT_MAX_TRADE_LAMPORTS;
   const heartbeatMs = opts.heartbeatMs ?? HEARTBEAT_MS;
@@ -101,12 +116,19 @@ export function createSocialServer(opts: SocialOptions): Server {
   };
   const ipRl = mk(opts.ipRateLimit, { windowMs: 60_000, max: 300 });
   const authRl = mk(opts.authRateLimit, { windowMs: 60_000, max: 20 });
+  const walletRl = mk(opts.walletNonceRateLimit, { windowMs: 60_000, max: 10 });
+  const bindIp = opts.bindNonceIp ?? true;
+  const maxStreams = opts.maxStreams ?? MAX_STREAMS_TOTAL;
+  const maxStreamsPerIp = opts.maxStreamsPerIp ?? MAX_STREAMS_PER_IP;
   const userRl = mk(opts.userRateLimit, { windowMs: 60_000, max: 120 });
   const ipOf = (req: IncomingMessage) => {
     const xff = opts.trustProxy ? String(req.headers["x-forwarded-for"] ?? "").split(",").pop()!.trim() : "";
     return clientKey(xff || req.socket.remoteAddress || "unknown");
   };
 
+  const ipHashOf = (ip: string) => createHmac("sha256", opts.secret).update(`nonce-ip|${ip}`).digest("hex").slice(0, 32);
+  let streamCount = 0;
+  const streamsByIp = new Map<string, number>();
   const streams = new Map<string, Set<ServerResponse>>();
   const sseWrite = (res: ServerResponse, n: StoredNotification) => res.write(`id: ${n.seq}\nevent: intent\ndata: ${JSON.stringify(n.intent)}\n\n`);
   store.onNotify((follower, n) => { for (const r of streams.get(follower) ?? []) sseWrite(r, n); });
@@ -132,17 +154,20 @@ export function createSocialServer(opts: SocialOptions): Server {
   };
 
   // ---- auth ----
-  async function nonce(req: IncomingMessage, res: ServerResponse) {
+  async function nonce(req: IncomingMessage, res: ServerResponse, ip: string) {
     const { wallet } = await readJson(req);
     if (!isWallet(wallet)) throw bad("invalid_wallet", "Not a valid wallet address.");
+    const wwait = walletRl?.take(`w|${wallet}`) ?? 0;
+    if (wwait) return send(res, 429, { error: { code: "rate_limited", message: "Too many requests." } }, { "retry-after": String(wwait) });
     const issuedAt = now(), expiresAt = issuedAt + nonceTtl;
     const n = newNonce();
     const message = buildMessage({ domain, wallet, nonce: n, issuedAt, expiresAt });
-    store.issueNonce(wallet, n, message, expiresAt, issuedAt);
+    if (!store.issueNonce(wallet, n, message, expiresAt, issuedAt, ipHashOf(ip)))
+      return send(res, 429, { error: { code: "rate_limited", message: "Too many requests." } }, { "retry-after": "60" });
     send(res, 200, { nonce: n, message });
   }
 
-  async function verify(req: IncomingMessage, res: ServerResponse) {
+  async function verify(req: IncomingMessage, res: ServerResponse, ip: string) {
     const { wallet, message, signature } = await readJson(req);
     const fail = () => new HttpError(401, "invalid_signin", "Sign-in failed.");
     if (!isWallet(wallet) || typeof message !== "string" || message.length > 1024) throw fail();
@@ -151,9 +176,17 @@ export function createSocialServer(opts: SocialOptions): Server {
     if (!sig || !n) throw fail();
     const issued = store.consumeNonce(n); // burned whatever happens next
     if (!issued || issued.wallet !== wallet || issued.message !== message || issued.expiresAt <= now()) throw fail();
+    if (bindIp && issued.ipHash !== ipHashOf(ip)) throw fail();
     if (!message.startsWith(`${domain} wants you to sign in`)) throw fail();
     if (!verifyEd25519(wallet, message, sig)) throw fail();
-    send(res, 200, { token: createSessionToken(opts.secret, wallet, sessionTtl, now()) });
+    const t = now();
+    const firstSeen = store.recordSignIn(wallet, t);
+    const tokens = {
+      social: createSessionToken(opts.secret, wallet, sessionTtl, t, "social"),
+      copy: createSessionToken(opts.secret, wallet, sessionTtl, t, "copy"),
+      sponsor: createSessionToken(opts.secret, wallet, sessionTtl, t, "sponsor", { firstSeen }),
+    };
+    send(res, 200, { token: tokens.social, tokens });
   }
 
   // ---- profiles ----
@@ -184,7 +217,7 @@ export function createSocialServer(opts: SocialOptions): Server {
 
   function publicUser(wallet: string, viewer: string) {
     const p = store.getProfile(wallet);
-    if (!p.public && viewer !== wallet) throw new HttpError(404, "not_found", "Not found.");
+    if (viewer !== wallet && (!p.public || !store.userExists(wallet))) throw new HttpError(404, "not_found", "Not found.");
     return p;
   }
 
@@ -257,9 +290,12 @@ export function createSocialServer(opts: SocialOptions): Server {
     return Number(v);
   };
 
-  function stream(req: IncomingMessage, res: ServerResponse, me: string) {
+  function stream(req: IncomingMessage, res: ServerResponse, me: string, ip: string, expSec?: number) {
     const set = streams.get(me) ?? new Set();
-    if (set.size >= MAX_STREAMS_PER_USER) throw new HttpError(429, "too_many_streams", "Too many open streams.");
+    if (set.size >= MAX_STREAMS_PER_USER || streamCount >= maxStreams || (streamsByIp.get(ip) ?? 0) >= maxStreamsPerIp)
+      throw new HttpError(429, "too_many_streams", "Too many open streams.");
+    streamCount++;
+    streamsByIp.set(ip, (streamsByIp.get(ip) ?? 0) + 1);
     req.socket.setTimeout(0);
     res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store", connection: "keep-alive", "x-accel-buffering": "no" });
     res.write("retry: 5000\n\n");
@@ -268,7 +304,16 @@ export function createSocialServer(opts: SocialOptions): Server {
     set.add(res);
     streams.set(me, set);
     const beat = setInterval(() => res.write(": ping\n\n"), heartbeatMs);
-    res.on("close", () => { clearInterval(beat); set.delete(res); if (!set.size) streams.delete(me); });
+    // Close the stream when the token that opened it expires (clients reconnect with a fresh token).
+    const life = expSec === undefined ? null : setTimeout(() => res.end(), Math.max(0, expSec * 1000 - now()));
+    life?.unref();
+    res.on("close", () => {
+      clearInterval(beat); if (life) clearTimeout(life);
+      set.delete(res); if (!set.size) streams.delete(me);
+      streamCount--;
+      const k = (streamsByIp.get(ip) ?? 1) - 1;
+      if (k <= 0) streamsByIp.delete(ip); else streamsByIp.set(ip, k);
+    });
   }
 
   // ---- routing ----
@@ -297,7 +342,7 @@ export function createSocialServer(opts: SocialOptions): Server {
 
     if (path === "/auth/nonce" || path === "/auth/verify") {
       if (method !== "POST") throw new HttpError(405, "method_not_allowed", "Method not allowed.");
-      return path === "/auth/nonce" ? nonce(req, res) : verify(req, res);
+      return path === "/auth/nonce" ? nonce(req, res, ip) : verify(req, res, ip);
     }
 
     const auth = await authenticate(req);
@@ -305,6 +350,13 @@ export function createSocialServer(opts: SocialOptions): Server {
     if (!me || !isWallet(me)) throw new HttpError(401, "unauthorized", "Sign in required.");
     const uwait = userRl?.take(me) ?? 0;
     if (uwait) return send(res, 429, { error: { code: "rate_limited", message: "Too many requests." } }, { "retry-after": String(uwait) });
+
+    if (path === "/auth/logout") {
+      if (method !== "POST") throw new HttpError(405, "method_not_allowed", "Method not allowed.");
+      store.revoke(me, Math.floor(now() / 1000)); // tokens issued before the next second are dead
+      for (const r of streams.get(me) ?? []) r.end();
+      return send(res, 200, { ok: true });
+    }
 
     if (path === "/me") {
       if (method === "GET") return send(res, 200, publicProfile(store.getProfile(me)));
@@ -327,16 +379,18 @@ export function createSocialServer(opts: SocialOptions): Server {
       throw new HttpError(405, "method_not_allowed", "Method not allowed.");
     }
 
-    m = /^\/users\/([^/]+)(\/followers)?$/.exec(path);
+    m = /^\/users\/([^/]+)(\/followers|\/following)?$/.exec(path);
     if (m) {
       if (method !== "GET") throw new HttpError(405, "method_not_allowed", "Method not allowed.");
       const w = walletParam(m[1]);
       const p = publicUser(w, me);
+      const own = w === me;
+      if (m[2] === "/following") return send(res, 200, { following: store.following(w, own) });
       if (m[2]) {
-        const r = store.followers(w, limitParam(url.searchParams.get("limit"), 50, 200), cursorParam(url.searchParams.get("cursor")) ?? 0);
+        const r = store.followers(w, limitParam(url.searchParams.get("limit"), 50, 200), cursorParam(url.searchParams.get("cursor")) ?? 0, own);
         return send(res, 200, { followers: r.wallets, next: r.next });
       }
-      return send(res, 200, { ...publicProfile(p), ...store.counts(w) });
+      return send(res, 200, { ...publicProfile(p), ...store.counts(w, own) });
     }
 
     m = /^\/copy-settings\/([^/]+)$/.exec(path);
@@ -355,7 +409,7 @@ export function createSocialServer(opts: SocialOptions): Server {
       const r = store.notifications(me, limitParam(url.searchParams.get("limit"), 50, 100), cursorParam(url.searchParams.get("before")));
       return send(res, 200, { notifications: r.items.map(view), next: r.next });
     }
-    if (path === "/notifications/stream" && method === "GET") return stream(req, res, me);
+    if (path === "/notifications/stream" && method === "GET") return stream(req, res, me, ip, auth?.exp);
 
     throw new HttpError(404, "not_found", "Not found.");
   }

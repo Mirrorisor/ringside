@@ -54,7 +54,7 @@ import {
 } from "@solana/kit";
 import { FileBudget, MemoryBudget, RedisBudget, RespClient, type BudgetStore } from "./budget.js";
 import { LAUNCH_PROGRAM, PERPS_PROGRAM } from "./graduation.js";
-import { hmacSessionAuth, type Authenticator } from "./session.js";
+import { hmacSessionAuth, type Authenticated, type Authenticator } from "./session.js";
 import {
   bigintJson,
   clientIp,
@@ -551,7 +551,50 @@ export class Sponsor {
 
 const MAX_BODY = 16 * 1024;
 
+// ---------------------------------------------------------------------------
+// Eligibility
+//
+// Authentication alone is not enough: sign-in is free (any keypair signs a SIWS message), so
+// without a gate every fresh keypair is a new sponsor account with its own per-user budget.
+// The gate below is a speed bump, not a defence: it makes each sponsor identity wait for
+// SPONSOR_MIN_ACCOUNT_AGE_SEC (default 3600) after its first sign-in.
+//
+// STRONGER OPTION: fee recovery (Policy.feeRecovery / SPONSOR_FEE_WALLET). Require every
+// sponsored transaction to pay the fee wallet at least what it costs the sponsor, so abuse is
+// not free whatever identities the attacker makes. Combine with the age gate for real
+// deployments; prefer it for anything where the per-user budget is large.
+// ---------------------------------------------------------------------------
+
+/** Decides whether an authenticated user may use the sponsor. */
+export type EligibilityGate = (userId: string, who: Authenticated) => boolean | Promise<boolean>;
+
+export const DEFAULT_MIN_ACCOUNT_AGE_SEC = 3600;
+
+/**
+ * Account-age gate. The first sign-in time comes from the injected `lookup` port when given,
+ * otherwise from the token's signed `firstSeen` claim (set by the social backend when it issues
+ * the sponsor token). No first-seen time, or one in the future, means not eligible.
+ */
+export function accountAgeGate(
+  minAgeSec = DEFAULT_MIN_ACCOUNT_AGE_SEC,
+  opts: { now?: () => number; lookup?: (userId: string) => number | null | undefined | Promise<number | null | undefined> } = {},
+): EligibilityGate {
+  const now = opts.now ?? Date.now;
+  return async (userId, who) => {
+    const first = opts.lookup ? await opts.lookup(userId) : who.firstSeen;
+    if (typeof first !== "number" || !Number.isFinite(first)) return false;
+    const age = Math.floor(now() / 1000) - first;
+    return age >= minAgeSec;
+  };
+}
+
 export interface SponsorServerOptions {
+  /** Pluggable eligibility gate, run after authentication. Default: accountAgeGate(minAccountAgeSec). */
+  eligible?: EligibilityGate;
+  /** Minimum account age for the default gate, in seconds (SPONSOR_MIN_ACCOUNT_AGE_SEC; default 3600). */
+  minAccountAgeSec?: number;
+  /** Clock for the default gate, in ms. */
+  now?: () => number;
   /** Identifies the app user; null refuses with 401. Required unless `allowAnonymous`. */
   authenticate?: Authenticator;
   /** Sponsor without authentication (devnet only): limits fall back to client IP and wallet. */
@@ -566,6 +609,7 @@ export function createSponsorServer(sponsor: Sponsor, opts: SponsorServerOptions
   if (!opts.authenticate && !opts.allowAnonymous) {
     throw new Error("The sponsor needs an authenticator (set SPONSOR_SESSION_SECRET); SPONSOR_ALLOW_ANON=1 is for devnet only.");
   }
+  const eligible = opts.eligible ?? accountAgeGate(opts.minAccountAgeSec, { now: opts.now });
   const hops = opts.trustProxy === true ? 1 : Math.max(0, Math.floor(Number(opts.trustProxy || 0)));
   const json = (res: ServerResponse, status: number, body: unknown) => {
     res.writeHead(status, {
@@ -600,7 +644,7 @@ export function createSponsorServer(sponsor: Sponsor, opts: SponsorServerOptions
         // Cheapest first: authenticate before reading the body.
         let userId: string | undefined;
         if (opts.authenticate) {
-          let who: { userId: string } | null;
+          let who: Authenticated | null;
           try {
             who = await opts.authenticate(req);
           } catch (e) {
@@ -608,6 +652,13 @@ export function createSponsorServer(sponsor: Sponsor, opts: SponsorServerOptions
             return json(res, 503, { ok: false, code: "auth_unavailable", message: "Sign-in check is unavailable. Retry shortly." });
           }
           if (!who?.userId) return json(res, 401, { ok: false, code: "unauthenticated", message: "Sign in to use gas sponsorship." });
+          let ok = false;
+          try {
+            ok = await eligible(who.userId, who);
+          } catch (e) {
+            console.error(`[sponsor] eligibility error: ${(e as Error)?.message ?? e}`);
+          }
+          if (!ok) return json(res, 403, { ok: false, code: "not_eligible", message: "This account is not yet eligible for gas sponsorship." });
           userId = who.userId;
         }
         let size = 0;
@@ -663,6 +714,7 @@ const USAGE = `Set RPC_URL, SPONSOR_KEYPAIR_PATH and SPONSOR_SESSION_SECRET (>= 
 Optional: SPONSOR_PORT, SPONSOR_CORS_ORIGIN (the app origin), TRUST_PROXY=1 [+ TRUST_PROXY_HOPS],
 SPONSOR_REDIS_URL (shared limits) or SPONSOR_STATE_FILE (single instance, default ./sponsor-state.json),
 SPONSOR_DAILY_LAMPORTS, SPONSOR_MAX_FAILURES, SPONSOR_FEE_WALLET + SPONSOR_FEE_LAMPORTS, SPONSOR_LOOKUP_TABLES=1,
+SPONSOR_MIN_ACCOUNT_AGE_SEC (default 3600: account-age gate on the token's firstSeen claim),
 SPONSOR_DISABLED=1, SPONSOR_ALLOW_ANON=1 (devnet only: no authentication).`;
 
 async function main() {
@@ -683,7 +735,7 @@ async function main() {
       console.error("The session secret (SESSION_SECRET or SPONSOR_SESSION_SECRET) must be at least 32 bytes.");
       process.exit(1);
     }
-    authenticate = hmacSessionAuth(sessionSecret);
+    authenticate = hmacSessionAuth(sessionSecret, { aud: "sponsor" }); // revocation: see RevocationPort (multi-process gap)
   } else if (anon) {
     if (/mainnet/i.test(RPC_URL)) {
       console.error("SPONSOR_ALLOW_ANON=1 is refused on mainnet. Set SPONSOR_SESSION_SECRET.");
@@ -735,7 +787,7 @@ async function main() {
     `[sponsor] auth ${authenticate ? "session tokens" : "NONE (anonymous)"}; limits in ${where}; global ${P.globalDailyLamports} lamports/day; caps ${P.maxComputeUnits} CU, ${P.maxMicroLamportsPerCu} uL/CU, ${P.maxFeeLamports} lamports fee; block after ${P.maxFailuresPerHour} failures/h; fee recovery ${P.feeRecovery ? `${P.feeRecovery.minLamports} to ${P.feeRecovery.wallet}` : "off"}; lookup tables ${truthy(SPONSOR_LOOKUP_TABLES) ? "on" : "off"}; proxy hops ${hops}; ${sponsor.disabled ? "DISABLED" : "enabled"}`,
   );
   const port = Number(SPONSOR_PORT ?? 8788);
-  createSponsorServer(sponsor, { authenticate, allowAnonymous: anon && !authenticate, allowOrigin: env.SPONSOR_CORS_ORIGIN, trustProxy: hops })
+  createSponsorServer(sponsor, { authenticate, minAccountAgeSec: env.SPONSOR_MIN_ACCOUNT_AGE_SEC ? Number(env.SPONSOR_MIN_ACCOUNT_AGE_SEC) : undefined, allowAnonymous: anon && !authenticate, allowOrigin: env.SPONSOR_CORS_ORIGIN, trustProxy: hops })
     .listen(port, () => console.log(`[sponsor] ${signer.address} listening on :${port}`));
 }
 
