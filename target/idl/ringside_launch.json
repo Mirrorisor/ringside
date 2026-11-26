@@ -7,41 +7,401 @@
   },
   "instructions": [
     {
-      "name": "initialize_global",
+      "name": "accept_authority",
+      "docs": [
+        "Step 2: the successor signs to accept, so a typo can't hand the",
+        "protocol to a key nobody holds."
+      ],
       "discriminator": [
-        47,
-        225,
-        15,
-        112,
+        107,
         86,
-        51,
-        190,
-        231
+        198,
+        91,
+        33,
+        12,
+        107,
+        160
       ],
       "accounts": [
         {
-          "name": "authority",
+          "name": "new_authority",
           "writable": true,
           "signer": true
         },
         {
           "name": "global",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  103,
+                  108,
+                  111,
+                  98,
+                  97,
+                  108
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "pending",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  101,
+                  110,
+                  100,
+                  105,
+                  110,
+                  103,
+                  95,
+                  97,
+                  117,
+                  116,
+                  104,
+                  111,
+                  114,
+                  105,
+                  116,
+                  121
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "buy",
+      "discriminator": [
+        102,
+        6,
+        61,
+        18,
+        1,
+        218,
+        235,
+        234
+      ],
+      "accounts": [
+        {
+          "name": "trader",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "global",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  103,
+                  108,
+                  111,
+                  98,
+                  97,
+                  108
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "mint",
+          "relations": [
+            "curve"
+          ]
+        },
+        {
+          "name": "curve",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  117,
+                  114,
+                  118,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "mint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "curve_token_vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "account",
+                "path": "curve"
+              },
+              {
+                "kind": "const",
+                "value": [
+                  6,
+                  221,
+                  246,
+                  225,
+                  215,
+                  101,
+                  161,
+                  147,
+                  217,
+                  203,
+                  225,
+                  70,
+                  206,
+                  235,
+                  121,
+                  172,
+                  28,
+                  180,
+                  133,
+                  237,
+                  95,
+                  91,
+                  55,
+                  145,
+                  58,
+                  140,
+                  245,
+                  133,
+                  126,
+                  255,
+                  0,
+                  169
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "mint"
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                140,
+                151,
+                37,
+                143,
+                78,
+                36,
+                137,
+                241,
+                187,
+                61,
+                16,
+                41,
+                20,
+                142,
+                13,
+                131,
+                11,
+                90,
+                19,
+                153,
+                218,
+                255,
+                16,
+                132,
+                4,
+                142,
+                123,
+                216,
+                219,
+                233,
+                248,
+                89
+              ]
+            }
+          }
+        },
+        {
+          "name": "trader_token_account",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "account",
+                "path": "trader"
+              },
+              {
+                "kind": "const",
+                "value": [
+                  6,
+                  221,
+                  246,
+                  225,
+                  215,
+                  101,
+                  161,
+                  147,
+                  217,
+                  203,
+                  225,
+                  70,
+                  206,
+                  235,
+                  121,
+                  172,
+                  28,
+                  180,
+                  133,
+                  237,
+                  95,
+                  91,
+                  55,
+                  145,
+                  58,
+                  140,
+                  245,
+                  133,
+                  126,
+                  255,
+                  0,
+                  169
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "mint"
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                140,
+                151,
+                37,
+                143,
+                78,
+                36,
+                137,
+                241,
+                187,
+                61,
+                16,
+                41,
+                20,
+                142,
+                13,
+                131,
+                11,
+                90,
+                19,
+                153,
+                218,
+                255,
+                16,
+                132,
+                4,
+                142,
+                123,
+                216,
+                219,
+                233,
+                248,
+                89
+              ]
+            }
+          }
+        },
+        {
+          "name": "fee_recipient",
           "writable": true
         },
         {
-          "name": "system_program"
+          "name": "insurance_recipient",
+          "writable": true
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        },
+        {
+          "name": "associated_token_program",
+          "address": "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
         }
       ],
       "args": [
         {
-          "name": "params",
-          "type": {
-            "defined": {
-              "name": "GlobalParams"
-            }
-          }
+          "name": "sol_in",
+          "type": "u64"
+        },
+        {
+          "name": "min_tokens_out",
+          "type": "u64"
         }
       ]
+    },
+    {
+      "name": "claim_creator_fees",
+      "discriminator": [
+        0,
+        23,
+        125,
+        234,
+        156,
+        118,
+        134,
+        89
+      ],
+      "accounts": [
+        {
+          "name": "creator",
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "curve"
+          ]
+        },
+        {
+          "name": "curve",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  117,
+                  114,
+                  118,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "curve.mint",
+                "account": "Curve"
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
     },
     {
       "name": "create_token",
@@ -66,7 +426,22 @@
           "signer": true
         },
         {
-          "name": "global"
+          "name": "global",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  103,
+                  108,
+                  111,
+                  98,
+                  97,
+                  108
+                ]
+              }
+            ]
+          }
         },
         {
           "name": "mint",
@@ -75,15 +450,140 @@
         },
         {
           "name": "curve",
-          "writable": true
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  117,
+                  114,
+                  118,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "mint"
+              }
+            ]
+          }
         },
         {
           "name": "curve_token_vault",
-          "writable": true
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "account",
+                "path": "curve"
+              },
+              {
+                "kind": "const",
+                "value": [
+                  6,
+                  221,
+                  246,
+                  225,
+                  215,
+                  101,
+                  161,
+                  147,
+                  217,
+                  203,
+                  225,
+                  70,
+                  206,
+                  235,
+                  121,
+                  172,
+                  28,
+                  180,
+                  133,
+                  237,
+                  95,
+                  91,
+                  55,
+                  145,
+                  58,
+                  140,
+                  245,
+                  133,
+                  126,
+                  255,
+                  0,
+                  169
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "mint"
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                140,
+                151,
+                37,
+                143,
+                78,
+                36,
+                137,
+                241,
+                187,
+                61,
+                16,
+                41,
+                20,
+                142,
+                13,
+                131,
+                11,
+                90,
+                19,
+                153,
+                218,
+                255,
+                16,
+                132,
+                4,
+                142,
+                123,
+                216,
+                219,
+                233,
+                248,
+                89
+              ]
+            }
+          }
         },
         {
           "name": "dev_lock_vault",
-          "writable": true
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  100,
+                  101,
+                  118,
+                  95,
+                  108,
+                  111,
+                  99,
+                  107
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "mint"
+              }
+            ]
+          }
         },
         {
           "name": "fee_recipient",
@@ -94,13 +594,119 @@
           "writable": true
         },
         {
-          "name": "token_program"
+          "name": "metadata",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  101,
+                  116,
+                  97,
+                  100,
+                  97,
+                  116,
+                  97
+                ]
+              },
+              {
+                "kind": "const",
+                "value": [
+                  11,
+                  112,
+                  101,
+                  177,
+                  227,
+                  209,
+                  124,
+                  69,
+                  56,
+                  157,
+                  82,
+                  127,
+                  107,
+                  4,
+                  195,
+                  205,
+                  88,
+                  184,
+                  108,
+                  115,
+                  26,
+                  160,
+                  253,
+                  181,
+                  73,
+                  182,
+                  209,
+                  188,
+                  3,
+                  248,
+                  41,
+                  70
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "mint"
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                11,
+                112,
+                101,
+                177,
+                227,
+                209,
+                124,
+                69,
+                56,
+                157,
+                82,
+                127,
+                107,
+                4,
+                195,
+                205,
+                88,
+                184,
+                108,
+                115,
+                26,
+                160,
+                253,
+                181,
+                73,
+                182,
+                209,
+                188,
+                3,
+                248,
+                41,
+                70
+              ]
+            }
+          }
         },
         {
-          "name": "associated_token_program"
+          "name": "token_metadata_program",
+          "address": "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
         },
         {
-          "name": "system_program"
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        },
+        {
+          "name": "associated_token_program",
+          "address": "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
         }
       ],
       "args": [
@@ -115,69 +721,637 @@
       ]
     },
     {
-      "name": "buy",
+      "name": "initialize_global",
       "discriminator": [
-        102,
-        6,
-        61,
-        18,
-        1,
-        218,
-        235,
-        234
+        47,
+        225,
+        15,
+        112,
+        86,
+        51,
+        190,
+        231
       ],
       "accounts": [
         {
-          "name": "trader",
+          "name": "authority",
           "writable": true,
           "signer": true
         },
         {
-          "name": "global"
+          "name": "global",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  103,
+                  108,
+                  111,
+                  98,
+                  97,
+                  108
+                ]
+              }
+            ]
+          }
         },
         {
-          "name": "mint"
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "params",
+          "type": {
+            "defined": {
+              "name": "GlobalParams"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "migrate",
+      "docs": [
+        "Permissionless graduation. Once the curve has sold out, creates a",
+        "Raydium CPMM pool (token / wSOL) seeded with the raised SOL (minus the",
+        "graduation fee and Raydium's costs) and the 200M reserve tokens, then",
+        "burns every LP token so the liquidity can never be pulled.",
+        "",
+        "A system-owned PDA (`pool_creator`) acts as Raydium's `creator`, because",
+        "Raydium pays rent and its fee from the creator with system transfers."
+      ],
+      "discriminator": [
+        155,
+        234,
+        231,
+        146,
+        236,
+        158,
+        162,
+        30
+      ],
+      "accounts": [
+        {
+          "name": "payer",
+          "docs": [
+            "Anyone (a keeper) can graduate a sold-out curve; pays for two token accounts."
+          ],
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "global",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  103,
+                  108,
+                  111,
+                  98,
+                  97,
+                  108
+                ]
+              }
+            ]
+          }
         },
         {
           "name": "curve",
+          "docs": [
+            "updated in load/mark helpers: deserializing it here put try_accounts over",
+            "SBF's 4 KB stack frame."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  117,
+                  114,
+                  118,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "mint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "mint",
           "writable": true
+        },
+        {
+          "name": "wsol_mint",
+          "address": "So11111111111111111111111111111111111111112"
         },
         {
           "name": "curve_token_vault",
-          "writable": true
-        },
-        {
-          "name": "trader_token_account",
-          "writable": true
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "account",
+                "path": "curve"
+              },
+              {
+                "kind": "const",
+                "value": [
+                  6,
+                  221,
+                  246,
+                  225,
+                  215,
+                  101,
+                  161,
+                  147,
+                  217,
+                  203,
+                  225,
+                  70,
+                  206,
+                  235,
+                  121,
+                  172,
+                  28,
+                  180,
+                  133,
+                  237,
+                  95,
+                  91,
+                  55,
+                  145,
+                  58,
+                  140,
+                  245,
+                  133,
+                  126,
+                  255,
+                  0,
+                  169
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "mint"
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                140,
+                151,
+                37,
+                143,
+                78,
+                36,
+                137,
+                241,
+                187,
+                61,
+                16,
+                41,
+                20,
+                142,
+                13,
+                131,
+                11,
+                90,
+                19,
+                153,
+                218,
+                255,
+                16,
+                132,
+                4,
+                142,
+                123,
+                216,
+                219,
+                233,
+                248,
+                89
+              ]
+            }
+          }
         },
         {
           "name": "fee_recipient",
           "writable": true
         },
         {
-          "name": "insurance_recipient",
+          "name": "pool_creator",
+          "docs": [
+            "System-owned PDA that acts as Raydium's pool creator."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  111,
+                  108,
+                  95,
+                  99,
+                  114,
+                  101,
+                  97,
+                  116,
+                  111,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "mint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "creator_token",
+          "docs": [
+            "the associated-token program verifies the address. Not `init_if_needed`:",
+            "that codegen pushed try_accounts past SBF's 4 KB stack frame."
+          ],
           "writable": true
         },
         {
-          "name": "token_program"
+          "name": "creator_wsol",
+          "writable": true
         },
         {
-          "name": "associated_token_program"
+          "name": "cpmm_program",
+          "address": "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C"
         },
         {
-          "name": "system_program"
+          "name": "amm_config",
+          "address": "D4FPEruKEHrG5TenZ2mpDGEfu1iUvTiqBxvpU8HLBvC2"
+        },
+        {
+          "name": "cpmm_authority",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  97,
+                  110,
+                  100,
+                  95,
+                  108,
+                  112,
+                  95,
+                  109,
+                  105,
+                  110,
+                  116,
+                  95,
+                  97,
+                  117,
+                  116,
+                  104,
+                  95,
+                  115,
+                  101,
+                  101,
+                  100
+                ]
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                169,
+                42,
+                90,
+                139,
+                79,
+                41,
+                89,
+                82,
+                132,
+                37,
+                80,
+                170,
+                147,
+                253,
+                91,
+                149,
+                181,
+                172,
+                230,
+                168,
+                235,
+                146,
+                12,
+                147,
+                148,
+                46,
+                67,
+                105,
+                12,
+                32,
+                236,
+                115
+              ]
+            }
+          }
+        },
+        {
+          "name": "pool_state",
+          "writable": true
+        },
+        {
+          "name": "lp_mint",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  111,
+                  108,
+                  95,
+                  108,
+                  112,
+                  95,
+                  109,
+                  105,
+                  110,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "pool_state"
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                169,
+                42,
+                90,
+                139,
+                79,
+                41,
+                89,
+                82,
+                132,
+                37,
+                80,
+                170,
+                147,
+                253,
+                91,
+                149,
+                181,
+                172,
+                230,
+                168,
+                235,
+                146,
+                12,
+                147,
+                148,
+                46,
+                67,
+                105,
+                12,
+                32,
+                236,
+                115
+              ]
+            }
+          }
+        },
+        {
+          "name": "creator_lp_token",
+          "writable": true
+        },
+        {
+          "name": "token_0_vault",
+          "writable": true
+        },
+        {
+          "name": "token_1_vault",
+          "writable": true
+        },
+        {
+          "name": "create_pool_fee",
+          "writable": true,
+          "address": "DNXgeM9EiiaAbaWvwjHj9fQQLAX5ZsfHyvmYUNRAdNC8"
+        },
+        {
+          "name": "observation_state",
+          "writable": true
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        },
+        {
+          "name": "associated_token_program",
+          "address": "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        },
+        {
+          "name": "rent",
+          "address": "SysvarRent111111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "propose_authority",
+      "docs": [
+        "Admin: fee settings (devnet uses a small graduation fee).",
+        "Admin handover, step 1: the current authority names its successor",
+        "(on mainnet, the Squads multisig vault). Nothing changes until step 2."
+      ],
+      "discriminator": [
+        20,
+        148,
+        236,
+        198,
+        76,
+        119,
+        99,
+        142
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "global"
+          ]
+        },
+        {
+          "name": "global",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  103,
+                  108,
+                  111,
+                  98,
+                  97,
+                  108
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "pending",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  101,
+                  110,
+                  100,
+                  105,
+                  110,
+                  103,
+                  95,
+                  97,
+                  117,
+                  116,
+                  104,
+                  111,
+                  114,
+                  105,
+                  116,
+                  121
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
         }
       ],
       "args": [
         {
-          "name": "sol_in",
-          "type": "u64"
-        },
-        {
-          "name": "min_tokens_out",
-          "type": "u64"
+          "name": "new_authority",
+          "type": "pubkey"
         }
       ]
+    },
+    {
+      "name": "release_dev_lock",
+      "discriminator": [
+        103,
+        71,
+        100,
+        104,
+        174,
+        149,
+        125,
+        232
+      ],
+      "accounts": [
+        {
+          "name": "creator",
+          "signer": true,
+          "relations": [
+            "curve"
+          ]
+        },
+        {
+          "name": "curve",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  117,
+                  114,
+                  118,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "curve.mint",
+                "account": "Curve"
+              }
+            ]
+          }
+        },
+        {
+          "name": "dev_lock_vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  100,
+                  101,
+                  118,
+                  95,
+                  108,
+                  111,
+                  99,
+                  107
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "curve.mint",
+                "account": "Curve"
+              }
+            ]
+          }
+        },
+        {
+          "name": "creator_token_account",
+          "writable": true
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        }
+      ],
+      "args": []
     },
     {
       "name": "sell",
@@ -198,22 +1372,230 @@
           "signer": true
         },
         {
-          "name": "global"
+          "name": "global",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  103,
+                  108,
+                  111,
+                  98,
+                  97,
+                  108
+                ]
+              }
+            ]
+          }
         },
         {
-          "name": "mint"
+          "name": "mint",
+          "relations": [
+            "curve"
+          ]
         },
         {
           "name": "curve",
-          "writable": true
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  117,
+                  114,
+                  118,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "mint"
+              }
+            ]
+          }
         },
         {
           "name": "curve_token_vault",
-          "writable": true
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "account",
+                "path": "curve"
+              },
+              {
+                "kind": "const",
+                "value": [
+                  6,
+                  221,
+                  246,
+                  225,
+                  215,
+                  101,
+                  161,
+                  147,
+                  217,
+                  203,
+                  225,
+                  70,
+                  206,
+                  235,
+                  121,
+                  172,
+                  28,
+                  180,
+                  133,
+                  237,
+                  95,
+                  91,
+                  55,
+                  145,
+                  58,
+                  140,
+                  245,
+                  133,
+                  126,
+                  255,
+                  0,
+                  169
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "mint"
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                140,
+                151,
+                37,
+                143,
+                78,
+                36,
+                137,
+                241,
+                187,
+                61,
+                16,
+                41,
+                20,
+                142,
+                13,
+                131,
+                11,
+                90,
+                19,
+                153,
+                218,
+                255,
+                16,
+                132,
+                4,
+                142,
+                123,
+                216,
+                219,
+                233,
+                248,
+                89
+              ]
+            }
+          }
         },
         {
           "name": "trader_token_account",
-          "writable": true
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "account",
+                "path": "trader"
+              },
+              {
+                "kind": "const",
+                "value": [
+                  6,
+                  221,
+                  246,
+                  225,
+                  215,
+                  101,
+                  161,
+                  147,
+                  217,
+                  203,
+                  225,
+                  70,
+                  206,
+                  235,
+                  121,
+                  172,
+                  28,
+                  180,
+                  133,
+                  237,
+                  95,
+                  91,
+                  55,
+                  145,
+                  58,
+                  140,
+                  245,
+                  133,
+                  126,
+                  255,
+                  0,
+                  169
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "mint"
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                140,
+                151,
+                37,
+                143,
+                78,
+                36,
+                137,
+                241,
+                187,
+                61,
+                16,
+                41,
+                20,
+                142,
+                13,
+                131,
+                11,
+                90,
+                19,
+                153,
+                218,
+                255,
+                16,
+                132,
+                4,
+                142,
+                123,
+                216,
+                219,
+                233,
+                248,
+                89
+              ]
+            }
+          }
         },
         {
           "name": "fee_recipient",
@@ -224,13 +1606,16 @@
           "writable": true
         },
         {
-          "name": "token_program"
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
         },
         {
-          "name": "associated_token_program"
+          "name": "associated_token_program",
+          "address": "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
         },
         {
-          "name": "system_program"
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
         }
       ],
       "args": [
@@ -245,119 +1630,55 @@
       ]
     },
     {
-      "name": "claim_creator_fees",
+      "name": "set_fees",
       "discriminator": [
+        137,
+        178,
+        49,
+        58,
         0,
-        23,
-        125,
-        234,
-        156,
-        118,
-        134,
-        89
+        245,
+        242,
+        190
       ],
       "accounts": [
         {
-          "name": "creator",
+          "name": "authority",
+          "signer": true,
+          "relations": [
+            "global"
+          ]
+        },
+        {
+          "name": "global",
           "writable": true,
-          "signer": true
-        },
-        {
-          "name": "curve",
-          "writable": true
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  103,
+                  108,
+                  111,
+                  98,
+                  97,
+                  108
+                ]
+              }
+            ]
+          }
         }
       ],
-      "args": []
-    },
-    {
-      "name": "release_dev_lock",
-      "discriminator": [
-        103,
-        71,
-        100,
-        104,
-        174,
-        149,
-        125,
-        232
-      ],
-      "accounts": [
+      "args": [
         {
-          "name": "creator",
-          "signer": true
+          "name": "launch_fee_lamports",
+          "type": "u64"
         },
         {
-          "name": "curve",
-          "writable": true
-        },
-        {
-          "name": "dev_lock_vault",
-          "writable": true
-        },
-        {
-          "name": "creator_token_account",
-          "writable": true
-        },
-        {
-          "name": "token_program"
+          "name": "graduation_fee_lamports",
+          "type": "u64"
         }
-      ],
-      "args": []
-    },
-    {
-      "name": "migrate",
-      "docs": [
-        "Hands the raised SOL (minus the graduation fee) and the 200M reserve",
-        "tokens to the migration authority, which seeds the AMM pool and burns",
-        "the LP tokens.",
-        "",
-        "TODO(mainnet): replace the hand-off with a direct CPI into the Meteora",
-        "DAMM v2 or Raydium CPMM pool-creation instruction so no off-chain",
-        "actor ever custodies migration funds."
-      ],
-      "discriminator": [
-        155,
-        234,
-        231,
-        146,
-        236,
-        158,
-        162,
-        30
-      ],
-      "accounts": [
-        {
-          "name": "caller",
-          "signer": true
-        },
-        {
-          "name": "global"
-        },
-        {
-          "name": "curve",
-          "writable": true
-        },
-        {
-          "name": "curve_token_vault",
-          "writable": true
-        },
-        {
-          "name": "fee_recipient",
-          "writable": true
-        },
-        {
-          "name": "migration_authority",
-          "writable": true
-        },
-        {
-          "name": "migration_token_account",
-          "writable": true
-        },
-        {
-          "name": "token_program"
-        }
-      ],
-      "args": []
+      ]
     },
     {
       "name": "set_paused",
@@ -374,11 +1695,29 @@
       "accounts": [
         {
           "name": "authority",
-          "signer": true
+          "signer": true,
+          "relations": [
+            "global"
+          ]
         },
         {
           "name": "global",
-          "writable": true
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  103,
+                  108,
+                  111,
+                  98,
+                  97,
+                  108
+                ]
+              }
+            ]
+          }
         }
       ],
       "args": [
@@ -415,9 +1754,203 @@
         114,
         127
       ]
+    },
+    {
+      "name": "PendingAuthority",
+      "discriminator": [
+        108,
+        91,
+        208,
+        174,
+        216,
+        189,
+        207,
+        93
+      ]
+    }
+  ],
+  "events": [
+    {
+      "name": "AuthorityAccepted",
+      "discriminator": [
+        166,
+        192,
+        219,
+        188,
+        41,
+        209,
+        195,
+        26
+      ]
+    },
+    {
+      "name": "AuthorityProposed",
+      "discriminator": [
+        244,
+        117,
+        94,
+        112,
+        53,
+        151,
+        35,
+        89
+      ]
+    },
+    {
+      "name": "CurveCompleted",
+      "discriminator": [
+        1,
+        174,
+        164,
+        127,
+        219,
+        129,
+        243,
+        14
+      ]
+    },
+    {
+      "name": "Migrated",
+      "discriminator": [
+        2,
+        66,
+        164,
+        53,
+        158,
+        122,
+        128,
+        236
+      ]
+    },
+    {
+      "name": "TokenCreated",
+      "discriminator": [
+        236,
+        19,
+        41,
+        255,
+        130,
+        78,
+        147,
+        172
+      ]
+    },
+    {
+      "name": "TradeEvent",
+      "discriminator": [
+        189,
+        219,
+        127,
+        211,
+        78,
+        230,
+        97,
+        238
+      ]
+    }
+  ],
+  "errors": [
+    {
+      "code": 6000,
+      "name": "NotPendingAuthority",
+      "msg": "Only the proposed new authority can accept"
+    },
+    {
+      "code": 6001,
+      "name": "Paused",
+      "msg": "Program is paused"
+    },
+    {
+      "code": 6002,
+      "name": "FeeTooHigh",
+      "msg": "Total fee is too high"
+    },
+    {
+      "code": 6003,
+      "name": "MetadataTooLong",
+      "msg": "Name, symbol or URI too long"
+    },
+    {
+      "code": 6004,
+      "name": "DevBuyTooLarge",
+      "msg": "Dev buy exceeds 5% of supply"
+    },
+    {
+      "code": 6005,
+      "name": "CurveComplete",
+      "msg": "Curve has sold out"
+    },
+    {
+      "code": 6006,
+      "name": "Slippage",
+      "msg": "Slippage limit exceeded"
+    },
+    {
+      "code": 6007,
+      "name": "ZeroAmount",
+      "msg": "Amount must be greater than zero"
+    },
+    {
+      "code": 6008,
+      "name": "InsufficientLiquidity",
+      "msg": "Not enough SOL in the curve"
+    },
+    {
+      "code": 6009,
+      "name": "MathOverflow",
+      "msg": "Math overflow"
+    },
+    {
+      "code": 6010,
+      "name": "StillLocked",
+      "msg": "Dev tokens are still locked"
+    },
+    {
+      "code": 6011,
+      "name": "NotReadyToMigrate",
+      "msg": "Curve is not complete or already migrated"
+    },
+    {
+      "code": 6012,
+      "name": "NotEnoughToMigrate",
+      "msg": "Not enough SOL raised to create the pool"
+    },
+    {
+      "code": 6013,
+      "name": "MigrationFailed",
+      "msg": "Pool creation did not produce LP tokens"
+    },
+    {
+      "code": 6014,
+      "name": "CreatorFeesLocked",
+      "msg": "Creator fees are locked until the curve completes or 7 days after launch"
     }
   ],
   "types": [
+    {
+      "name": "AuthorityAccepted",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "authority",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "AuthorityProposed",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "new_authority",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
     {
       "name": "CreateTokenArgs",
       "type": {
@@ -555,6 +2088,26 @@
       }
     },
     {
+      "name": "CurveCompleted",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "real_sol",
+            "type": "u64"
+          },
+          {
+            "name": "slot",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
       "name": "Global",
       "type": {
         "kind": "struct",
@@ -647,6 +2200,34 @@
       }
     },
     {
+      "name": "Migrated",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "sol_to_pool",
+            "type": "u64"
+          },
+          {
+            "name": "tokens_to_pool",
+            "type": "u64"
+          },
+          {
+            "name": "pool",
+            "type": "pubkey"
+          },
+          {
+            "name": "lp_burned",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
       "name": "Observation",
       "type": {
         "kind": "struct",
@@ -663,48 +2244,52 @@
       }
     },
     {
-      "name": "CurveCompleted",
+      "name": "PendingAuthority",
+      "docs": [
+        "A proposed admin handover, waiting for the successor to accept."
+      ],
       "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "new_authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TokenCreated",
+      "type": {
+        "kind": "struct",
         "fields": [
           {
             "name": "mint",
             "type": "pubkey"
           },
           {
-            "name": "real_sol",
+            "name": "creator",
+            "type": "pubkey"
+          },
+          {
+            "name": "dev_locked_tokens",
             "type": "u64"
           },
           {
             "name": "slot",
             "type": "u64"
           }
-        ],
-        "kind": "struct"
-      }
-    },
-    {
-      "name": "Migrated",
-      "type": {
-        "fields": [
-          {
-            "name": "mint",
-            "type": "pubkey"
-          },
-          {
-            "name": "sol_to_pool",
-            "type": "u64"
-          },
-          {
-            "name": "tokens_to_pool",
-            "type": "u64"
-          }
-        ],
-        "kind": "struct"
+        ]
       }
     },
     {
       "name": "TradeEvent",
       "type": {
+        "kind": "struct",
         "fields": [
           {
             "name": "mint",
@@ -734,144 +2319,8 @@
             "name": "slot",
             "type": "u64"
           }
-        ],
-        "kind": "struct"
+        ]
       }
-    },
-    {
-      "name": "TokenCreated",
-      "type": {
-        "fields": [
-          {
-            "name": "mint",
-            "type": "pubkey"
-          },
-          {
-            "name": "creator",
-            "type": "pubkey"
-          },
-          {
-            "name": "dev_locked_tokens",
-            "type": "u64"
-          },
-          {
-            "name": "slot",
-            "type": "u64"
-          }
-        ],
-        "kind": "struct"
-      }
-    }
-  ],
-  "errors": [
-    {
-      "code": 6000,
-      "name": "Paused",
-      "msg": "Program is paused"
-    },
-    {
-      "code": 6001,
-      "name": "FeeTooHigh",
-      "msg": "Total fee is too high"
-    },
-    {
-      "code": 6002,
-      "name": "MetadataTooLong",
-      "msg": "Name, symbol or URI too long"
-    },
-    {
-      "code": 6003,
-      "name": "DevBuyTooLarge",
-      "msg": "Dev buy exceeds 5% of supply"
-    },
-    {
-      "code": 6004,
-      "name": "CurveComplete",
-      "msg": "Curve has sold out"
-    },
-    {
-      "code": 6005,
-      "name": "Slippage",
-      "msg": "Slippage limit exceeded"
-    },
-    {
-      "code": 6006,
-      "name": "ZeroAmount",
-      "msg": "Amount must be greater than zero"
-    },
-    {
-      "code": 6007,
-      "name": "InsufficientLiquidity",
-      "msg": "Not enough SOL in the curve"
-    },
-    {
-      "code": 6008,
-      "name": "MathOverflow",
-      "msg": "Math overflow"
-    },
-    {
-      "code": 6009,
-      "name": "StillLocked",
-      "msg": "Dev tokens are still locked"
-    },
-    {
-      "code": 6010,
-      "name": "NotReadyToMigrate",
-      "msg": "Curve is not complete or already migrated"
-    }
-  ],
-  "events": [
-    {
-      "discriminator": [
-        1,
-        174,
-        164,
-        127,
-        219,
-        129,
-        243,
-        14
-      ],
-      "name": "CurveCompleted"
-    },
-    {
-      "discriminator": [
-        2,
-        66,
-        164,
-        53,
-        158,
-        122,
-        128,
-        236
-      ],
-      "name": "Migrated"
-    },
-    {
-      "discriminator": [
-        189,
-        219,
-        127,
-        211,
-        78,
-        230,
-        97,
-        238
-      ],
-      "name": "TradeEvent"
-    },
-    {
-      "discriminator": [
-        236,
-        19,
-        41,
-        255,
-        130,
-        78,
-        147,
-        172
-      ],
-      "name": "TokenCreated"
     }
   ]
 }

@@ -31,3 +31,4 @@ sim/data/launch-data.json
 # Python
 __pycache__/
 *.pyc
+tests/target/

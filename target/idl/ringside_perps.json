@@ -7,141 +7,155 @@
   },
   "instructions": [
     {
-      "name": "initialize_vault",
-      "discriminator": [
-        48,
-        191,
-        163,
-        44,
-        71,
-        129,
-        63,
-        164
-      ],
-      "accounts": [
-        {
-          "name": "authority",
-          "writable": true,
-          "signer": true
-        },
-        {
-          "name": "vault",
-          "writable": true
-        },
-        {
-          "name": "usdc_mint"
-        },
-        {
-          "name": "vault_usdc",
-          "writable": true
-        },
-        {
-          "name": "token_program"
-        },
-        {
-          "name": "system_program"
-        }
-      ],
-      "args": [
-        {
-          "name": "price_authority",
-          "type": "pubkey"
-        }
-      ]
-    },
-    {
-      "name": "set_risk_params",
-      "discriminator": [
-        203,
-        154,
-        198,
-        239,
-        21,
-        242,
-        173,
-        235
-      ],
-      "accounts": [
-        {
-          "name": "authority",
-          "signer": true
-        },
-        {
-          "name": "vault",
-          "writable": true
-        }
-      ],
-      "args": [
-        {
-          "name": "tier0_cap_bps",
-          "type": "u16"
-        },
-        {
-          "name": "skew_cap_bps",
-          "type": "u16"
-        }
-      ]
-    },
-    {
-      "name": "set_sol_price",
+      "name": "accept_authority",
       "docs": [
-        "TODO(mainnet): replace with a Pyth pull-oracle SOL/USD read."
+        "Step 2: the successor signs to accept, so a typo can't hand the",
+        "protocol to a key nobody holds."
       ],
       "discriminator": [
-        151,
-        237,
-        70,
-        191,
-        232,
-        81,
-        138,
-        214
+        107,
+        86,
+        198,
+        91,
+        33,
+        12,
+        107,
+        160
       ],
       "accounts": [
         {
-          "name": "price_authority",
-          "signer": true
-        },
-        {
-          "name": "vault",
-          "writable": true
-        }
-      ],
-      "args": [
-        {
-          "name": "price_e6",
-          "type": "u64"
-        }
-      ]
-    },
-    {
-      "name": "deposit_liquidity",
-      "discriminator": [
-        245,
-        99,
-        59,
-        25,
-        151,
-        71,
-        233,
-        249
-      ],
-      "accounts": [
-        {
-          "name": "owner",
+          "name": "new_authority",
           "writable": true,
           "signer": true
         },
         {
           "name": "vault",
-          "writable": true
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "pending",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  101,
+                  110,
+                  100,
+                  105,
+                  110,
+                  103,
+                  95,
+                  97,
+                  117,
+                  116,
+                  104,
+                  111,
+                  114,
+                  105,
+                  116,
+                  121
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "auto_deleverage",
+      "docs": [
+        "Auto-deleverage a profitable position once the market's budget is spent.",
+        "Keepers rank by unrealised PnL off-chain and close the most profitable first."
+      ],
+      "discriminator": [
+        210,
+        69,
+        163,
+        148,
+        44,
+        245,
+        226,
+        170
+      ],
+      "accounts": [
+        {
+          "name": "keeper",
+          "signer": true
+        },
+        {
+          "name": "vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              }
+            ]
+          }
         },
         {
           "name": "vault_usdc",
-          "writable": true
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  117,
+                  115,
+                  100,
+                  99
+                ]
+              }
+            ]
+          }
         },
         {
-          "name": "lp",
+          "name": "market",
+          "writable": true,
+          "relations": [
+            "position"
+          ]
+        },
+        {
+          "name": "curve",
+          "relations": [
+            "market"
+          ]
+        },
+        {
+          "name": "position",
           "writable": true
         },
         {
@@ -149,10 +163,321 @@
           "writable": true
         },
         {
-          "name": "token_program"
+          "name": "keeper_usdc",
+          "writable": true
         },
         {
-          "name": "system_program"
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "cancel_order",
+      "docs": [
+        "Owner can reclaim escrowed collateral from an order no keeper filled."
+      ],
+      "discriminator": [
+        95,
+        129,
+        237,
+        240,
+        8,
+        49,
+        223,
+        132
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "order"
+          ]
+        },
+        {
+          "name": "vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault_usdc",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  117,
+                  115,
+                  100,
+                  99
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "rent_payer",
+          "writable": true
+        },
+        {
+          "name": "order",
+          "writable": true
+        },
+        {
+          "name": "owner_usdc",
+          "writable": true
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "cancel_withdrawal",
+      "docs": [
+        "Puts a pending request's shares back in the LP account."
+      ],
+      "discriminator": [
+        183,
+        104,
+        181,
+        250,
+        28,
+        128,
+        210,
+        70
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "lp",
+            "request"
+          ]
+        },
+        {
+          "name": "lp",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  112
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "owner"
+              }
+            ]
+          }
+        },
+        {
+          "name": "request",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  119,
+                  105,
+                  116,
+                  104,
+                  100,
+                  114,
+                  97,
+                  119,
+                  97,
+                  108
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "owner"
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "claim_creator_fees",
+      "discriminator": [
+        0,
+        23,
+        125,
+        234,
+        156,
+        118,
+        134,
+        89
+      ],
+      "accounts": [
+        {
+          "name": "creator",
+          "signer": true,
+          "relations": [
+            "market"
+          ]
+        },
+        {
+          "name": "vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault_usdc",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  117,
+                  115,
+                  100,
+                  99
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "market",
+          "writable": true
+        },
+        {
+          "name": "creator_usdc",
+          "writable": true
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "claim_protocol_fees",
+      "docs": [
+        "Admin: pays accumulated protocol fees out to the treasury."
+      ],
+      "discriminator": [
+        34,
+        142,
+        219,
+        112,
+        109,
+        54,
+        133,
+        23
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "signer": true,
+          "relations": [
+            "vault"
+          ]
+        },
+        {
+          "name": "vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault_usdc",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  117,
+                  115,
+                  100,
+                  99
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "treasury_usdc",
+          "writable": true
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
         }
       ],
       "args": [
@@ -163,52 +488,165 @@
       ]
     },
     {
-      "name": "withdraw_liquidity",
+      "name": "compound_protocol_fees",
+      "docs": [
+        "Permissionless (the keeper runs it): turns ALL accrued protocol fees into",
+        "vault liquidity owned by the treasury's LP account (set_treasury),",
+        "at the vault's current share price. Nothing moves: the fees stop being",
+        "reserved and start backing trades. The treasury takes fees as cash by",
+        "claiming them first (claim_protocol_fees, admin only)."
+      ],
       "discriminator": [
-        149,
-        158,
-        33,
-        185,
-        47,
-        243,
-        253,
-        31
+        87,
+        30,
+        31,
+        35,
+        175,
+        189,
+        168,
+        169
       ],
       "accounts": [
         {
-          "name": "owner",
+          "name": "payer",
           "writable": true,
           "signer": true
         },
         {
           "name": "vault",
-          "writable": true
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              }
+            ]
+          }
         },
         {
           "name": "vault_usdc",
-          "writable": true
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  117,
+                  115,
+                  100,
+                  99
+                ]
+              }
+            ]
+          }
         },
         {
-          "name": "lp",
-          "writable": true
+          "name": "treasury_config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  101,
+                  97,
+                  115,
+                  117,
+                  114,
+                  121
+                ]
+              }
+            ]
+          }
         },
         {
-          "name": "owner_usdc",
-          "writable": true
+          "name": "treasury_lp",
+          "docs": [
+            "The treasury's LP account, whoever pays for the call."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  112
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "treasury_config.treasury",
+                "account": "TreasuryConfig"
+              }
+            ]
+          }
         },
         {
-          "name": "token_program"
-        },
-        {
-          "name": "system_program"
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
         }
       ],
-      "args": [
+      "args": []
+    },
+    {
+      "name": "crank_funding",
+      "docs": [
+        "Permissionless crank: accrues funding and rolls the band anchor."
+      ],
+      "discriminator": [
+        83,
+        30,
+        120,
+        80,
+        177,
+        60,
+        27,
+        119
+      ],
+      "accounts": [
         {
-          "name": "shares",
-          "type": "u64"
+          "name": "vault",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "market",
+          "writable": true
+        },
+        {
+          "name": "curve",
+          "relations": [
+            "market"
+          ]
         }
-      ]
+      ],
+      "args": []
     },
     {
       "name": "create_market",
@@ -232,14 +670,808 @@
           "signer": true
         },
         {
-          "name": "curve"
+          "name": "curve",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  117,
+                  114,
+                  118,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "curve.mint",
+                "account": "Curve"
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                143,
+                154,
+                1,
+                58,
+                154,
+                160,
+                155,
+                182,
+                239,
+                18,
+                68,
+                180,
+                195,
+                105,
+                126,
+                22,
+                216,
+                227,
+                158,
+                4,
+                18,
+                131,
+                34,
+                134,
+                246,
+                99,
+                18,
+                41,
+                77,
+                116,
+                179,
+                32
+              ]
+            }
+          }
         },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "curve.mint",
+                "account": "Curve"
+              }
+            ]
+          }
+        },
+        {
+          "name": "registry",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  114,
+                  101,
+                  103,
+                  105,
+                  115,
+                  116,
+                  114,
+                  121
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "deposit_liquidity",
+      "discriminator": [
+        245,
+        99,
+        59,
+        25,
+        151,
+        71,
+        233,
+        249
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault_usdc",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  117,
+                  115,
+                  100,
+                  99
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "lp",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  112
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "owner"
+              }
+            ]
+          }
+        },
+        {
+          "name": "owner_usdc",
+          "writable": true
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "deposit_to_treasury",
+      "docs": [
+        "Anyone (the treasury sweep's hot key) deposits USDC whose shares go to",
+        "the treasury's LP account, never the depositor's."
+      ],
+      "discriminator": [
+        10,
+        195,
+        112,
+        242,
+        107,
+        206,
+        240,
+        198
+      ],
+      "accounts": [
+        {
+          "name": "depositor",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault_usdc",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  117,
+                  115,
+                  100,
+                  99
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "treasury_config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  101,
+                  97,
+                  115,
+                  117,
+                  114,
+                  121
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "treasury_lp",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  112
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "treasury_config.treasury",
+                "account": "TreasuryConfig"
+              }
+            ]
+          }
+        },
+        {
+          "name": "depositor_usdc",
+          "writable": true
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "execute_order",
+      "docs": [
+        "Step 2: keeper fills an order at the delayed, banded TWAP mark."
+      ],
+      "discriminator": [
+        115,
+        61,
+        180,
+        24,
+        168,
+        32,
+        215,
+        20
+      ],
+      "accounts": [
+        {
+          "name": "keeper",
+          "signer": true
+        },
+        {
+          "name": "vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault_usdc",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  117,
+                  115,
+                  100,
+                  99
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "relations": [
+            "order"
+          ]
+        },
+        {
+          "name": "curve",
+          "relations": [
+            "market"
+          ]
+        },
+        {
+          "name": "rent_payer",
+          "writable": true
+        },
+        {
+          "name": "order",
+          "writable": true
+        },
+        {
+          "name": "position",
+          "writable": true
+        },
+        {
+          "name": "owner_usdc",
+          "writable": true
+        },
+        {
+          "name": "keeper_usdc",
+          "writable": true
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "graduate_market",
+      "docs": [
+        "Permissionless: once the token's curve has migrated to Raydium, move its",
+        "market to Tier 1. Prices then come from the pool's TWAP (remaining",
+        "accounts: pool state, observation, token vault, wSOL vault)."
+      ],
+      "discriminator": [
+        202,
+        28,
+        33,
+        115,
+        186,
+        96,
+        1,
+        90
+      ],
+      "accounts": [
         {
           "name": "market",
           "writable": true
         },
         {
-          "name": "system_program"
+          "name": "curve",
+          "relations": [
+            "market"
+          ]
+        },
+        {
+          "name": "registry",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  114,
+                  101,
+                  103,
+                  105,
+                  115,
+                  116,
+                  114,
+                  121
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "retired",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  114,
+                  101,
+                  116,
+                  105,
+                  114,
+                  101,
+                  100
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "initialize_vault",
+      "discriminator": [
+        48,
+        191,
+        163,
+        44,
+        71,
+        129,
+        63,
+        164
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "usdc_mint"
+        },
+        {
+          "name": "vault_usdc",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  117,
+                  115,
+                  100,
+                  99
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "price_authority",
+          "type": "pubkey"
+        }
+      ]
+    },
+    {
+      "name": "liquidate",
+      "docs": [
+        "Permissionless liquidation of an under-margined position."
+      ],
+      "discriminator": [
+        223,
+        179,
+        226,
+        125,
+        48,
+        46,
+        39,
+        74
+      ],
+      "accounts": [
+        {
+          "name": "keeper",
+          "signer": true
+        },
+        {
+          "name": "vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault_usdc",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  117,
+                  115,
+                  100,
+                  99
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "relations": [
+            "position"
+          ]
+        },
+        {
+          "name": "curve",
+          "relations": [
+            "market"
+          ]
+        },
+        {
+          "name": "position",
+          "writable": true
+        },
+        {
+          "name": "owner_usdc",
+          "writable": true
+        },
+        {
+          "name": "keeper_usdc",
+          "writable": true
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "propose_authority",
+      "docs": [
+        "Admin: who may push a SOL price by hand. On mainnet set this to a key",
+        "nobody holds, so only Pyth can move the price.",
+        "Admin handover, step 1: the current authority names its successor",
+        "(on mainnet, the Squads multisig vault). Nothing changes until step 2."
+      ],
+      "discriminator": [
+        20,
+        148,
+        236,
+        198,
+        76,
+        119,
+        99,
+        142
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "vault"
+          ]
+        },
+        {
+          "name": "vault",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "pending",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  101,
+                  110,
+                  100,
+                  105,
+                  110,
+                  103,
+                  95,
+                  97,
+                  117,
+                  116,
+                  104,
+                  111,
+                  114,
+                  105,
+                  116,
+                  121
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "new_authority",
+          "type": "pubkey"
+        }
+      ]
+    },
+    {
+      "name": "refresh_sol_price",
+      "docs": [
+        "Permissionless: copies Pyth's SOL/USD into the vault after checking the",
+        "account owner, feed id, full verification, age (120 s, the vault's own limit) and confidence (2%).",
+        "Older prices than the stored one are ignored."
+      ],
+      "discriminator": [
+        60,
+        102,
+        54,
+        141,
+        211,
+        42,
+        143,
+        65
+      ],
+      "accounts": [
+        {
+          "name": "vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "price_update"
         }
       ],
       "args": []
@@ -278,11 +1510,44 @@
         },
         {
           "name": "vault",
-          "writable": true
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              }
+            ]
+          }
         },
         {
           "name": "vault_usdc",
-          "writable": true
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  117,
+                  115,
+                  100,
+                  99
+                ]
+              }
+            ]
+          }
         },
         {
           "name": "market"
@@ -300,10 +1565,12 @@
           "writable": true
         },
         {
-          "name": "token_program"
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
         },
         {
-          "name": "system_program"
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
         }
       ],
       "args": [
@@ -318,254 +1585,312 @@
       ]
     },
     {
-      "name": "cancel_order",
+      "name": "request_withdrawal",
       "docs": [
-        "Owner can reclaim escrowed collateral from an order no keeper filled."
+        "Step 1 of a withdrawal: moves shares out of the LP account into a",
+        "request that unlocks after WITHDRAW_DELAY_SECONDS. The shares stay in",
+        "total_shares, so they keep sharing the vault's PnL until paid out.",
+        "Adding to an open request restarts its timer."
       ],
       "discriminator": [
-        95,
-        129,
-        237,
-        240,
-        8,
-        49,
-        223,
-        132
+        251,
+        85,
+        121,
+        205,
+        56,
+        201,
+        12,
+        177
       ],
       "accounts": [
         {
           "name": "owner",
           "writable": true,
-          "signer": true
+          "signer": true,
+          "relations": [
+            "lp"
+          ]
         },
         {
-          "name": "vault",
-          "writable": true
+          "name": "lp",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  112
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "owner"
+              }
+            ]
+          }
         },
         {
-          "name": "vault_usdc",
-          "writable": true
+          "name": "request",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  119,
+                  105,
+                  116,
+                  104,
+                  100,
+                  114,
+                  97,
+                  119,
+                  97,
+                  108
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "owner"
+              }
+            ]
+          }
         },
         {
-          "name": "rent_payer",
-          "writable": true
-        },
-        {
-          "name": "order",
-          "writable": true
-        },
-        {
-          "name": "owner_usdc",
-          "writable": true
-        },
-        {
-          "name": "token_program"
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
         }
       ],
-      "args": []
+      "args": [
+        {
+          "name": "shares",
+          "type": "u64"
+        }
+      ]
     },
     {
-      "name": "execute_order",
+      "name": "retire_market",
       "docs": [
-        "Step 2: keeper fills an order at the delayed, banded TWAP mark."
+        "Permissionless: frees the Tier 0 slot of a dead launch. Allowed when the",
+        "curve hasn't sold out, hasn't traded for ~7 days and the market has no",
+        "open interest. The market becomes reduce-only (it can still graduate later)."
       ],
       "discriminator": [
-        115,
-        61,
-        180,
-        24,
-        168,
-        32,
-        215,
-        20
+        68,
+        198,
+        103,
+        192,
+        149,
+        141,
+        34,
+        156
       ],
       "accounts": [
         {
-          "name": "keeper",
+          "name": "payer",
+          "writable": true,
           "signer": true
-        },
-        {
-          "name": "vault",
-          "writable": true
-        },
-        {
-          "name": "vault_usdc",
-          "writable": true
         },
         {
           "name": "market",
           "writable": true
         },
         {
-          "name": "curve"
+          "name": "curve",
+          "relations": [
+            "market"
+          ]
         },
         {
-          "name": "rent_payer",
-          "writable": true
+          "name": "registry",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  114,
+                  101,
+                  103,
+                  105,
+                  115,
+                  116,
+                  114,
+                  121
+                ]
+              }
+            ]
+          }
         },
         {
-          "name": "order",
-          "writable": true
+          "name": "retired",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  114,
+                  101,
+                  116,
+                  105,
+                  114,
+                  101,
+                  100
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
         },
         {
-          "name": "position",
-          "writable": true
-        },
-        {
-          "name": "owner_usdc",
-          "writable": true
-        },
-        {
-          "name": "keeper_usdc",
-          "writable": true
-        },
-        {
-          "name": "token_program"
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
         }
       ],
       "args": []
     },
     {
-      "name": "liquidate",
+      "name": "set_market_limit",
       "docs": [
-        "Permissionless liquidation of an under-margined position."
+        "Admin: how many Tier 0 markets may be live at once."
       ],
       "discriminator": [
-        223,
-        179,
-        226,
-        125,
-        48,
-        46,
-        39,
-        74
-      ],
-      "accounts": [
-        {
-          "name": "keeper",
-          "signer": true
-        },
-        {
-          "name": "vault",
-          "writable": true
-        },
-        {
-          "name": "vault_usdc",
-          "writable": true
-        },
-        {
-          "name": "market",
-          "writable": true
-        },
-        {
-          "name": "curve"
-        },
-        {
-          "name": "position",
-          "writable": true
-        },
-        {
-          "name": "owner_usdc",
-          "writable": true
-        },
-        {
-          "name": "keeper_usdc",
-          "writable": true
-        },
-        {
-          "name": "token_program"
-        }
-      ],
-      "args": []
-    },
-    {
-      "name": "auto_deleverage",
-      "docs": [
-        "Auto-deleverage a profitable position once the market's budget is spent.",
-        "Keepers rank by unrealised PnL off-chain and close the most profitable first."
-      ],
-      "discriminator": [
-        210,
-        69,
-        163,
         148,
+        252,
+        223,
+        14,
+        36,
+        194,
         44,
-        245,
-        226,
-        170
+        64
       ],
       "accounts": [
         {
-          "name": "keeper",
-          "signer": true
+          "name": "authority",
+          "signer": true,
+          "relations": [
+            "vault"
+          ]
         },
         {
           "name": "vault",
-          "writable": true
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              }
+            ]
+          }
         },
         {
-          "name": "vault_usdc",
-          "writable": true
-        },
-        {
-          "name": "market",
-          "writable": true
-        },
-        {
-          "name": "curve"
-        },
-        {
-          "name": "position",
-          "writable": true
-        },
-        {
-          "name": "owner_usdc",
-          "writable": true
-        },
-        {
-          "name": "keeper_usdc",
-          "writable": true
-        },
-        {
-          "name": "token_program"
+          "name": "registry",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  114,
+                  101,
+                  103,
+                  105,
+                  115,
+                  116,
+                  114,
+                  121
+                ]
+              }
+            ]
+          }
         }
       ],
-      "args": []
+      "args": [
+        {
+          "name": "max_live_tier0",
+          "type": "u32"
+        }
+      ]
     },
     {
-      "name": "crank_funding",
+      "name": "set_market_limits",
       "docs": [
-        "Permissionless crank: accrues funding and rolls the band anchor."
+        "Admin: lower any market's OI cap (0 = no override) or make it reduce-only,",
+        "e.g. to keep perps off the protocol's own token. Takes effect on new",
+        "opens; existing positions can always close."
       ],
       "discriminator": [
-        83,
-        30,
-        120,
-        80,
-        177,
-        60,
-        27,
-        119
+        126,
+        115,
+        185,
+        229,
+        122,
+        37,
+        118,
+        59
       ],
       "accounts": [
         {
-          "name": "vault"
+          "name": "authority",
+          "signer": true,
+          "relations": [
+            "vault"
+          ]
+        },
+        {
+          "name": "vault",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              }
+            ]
+          }
         },
         {
           "name": "market",
           "writable": true
         },
         {
-          "name": "curve"
+          "name": "curve",
+          "relations": [
+            "market"
+          ]
         }
       ],
-      "args": []
+      "args": [
+        {
+          "name": "oi_cap_override",
+          "type": "u64"
+        },
+        {
+          "name": "reduce_only",
+          "type": "bool"
+        }
+      ]
     },
     {
       "name": "set_market_tier",
       "docs": [
-        "Authority sets the OI cap for graduated markets (Tier 1+), pending an",
-        "on-chain AMM depth reader."
+        "Admin: promote a graduated market to Tier 2 and optionally cap its OI."
       ],
       "discriminator": [
         166,
@@ -580,17 +1905,37 @@
       "accounts": [
         {
           "name": "authority",
-          "signer": true
+          "signer": true,
+          "relations": [
+            "vault"
+          ]
         },
         {
-          "name": "vault"
+          "name": "vault",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              }
+            ]
+          }
         },
         {
           "name": "market",
           "writable": true
         },
         {
-          "name": "curve"
+          "name": "curve",
+          "relations": [
+            "market"
+          ]
         }
       ],
       "args": [
@@ -605,40 +1950,326 @@
       ]
     },
     {
-      "name": "claim_creator_fees",
+      "name": "set_price_authority",
       "discriminator": [
-        0,
-        23,
-        125,
-        234,
-        156,
-        118,
-        134,
-        89
+        51,
+        241,
+        68,
+        137,
+        206,
+        207,
+        244,
+        107
       ],
       "accounts": [
         {
-          "name": "creator",
-          "signer": true
+          "name": "authority",
+          "signer": true,
+          "relations": [
+            "vault"
+          ]
         },
         {
           "name": "vault",
-          "writable": true
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "price_authority",
+          "type": "pubkey"
+        }
+      ]
+    },
+    {
+      "name": "set_risk_params",
+      "discriminator": [
+        203,
+        154,
+        198,
+        239,
+        21,
+        242,
+        173,
+        235
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "signer": true,
+          "relations": [
+            "vault"
+          ]
+        },
+        {
+          "name": "vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "tier0_cap_bps",
+          "type": "u16"
+        },
+        {
+          "name": "skew_cap_bps",
+          "type": "u16"
+        }
+      ]
+    },
+    {
+      "name": "set_sol_price",
+      "docs": [
+        "Fallback price push by the price authority (devnet; disabled on mainnet",
+        "by setting the authority to an unheld key)."
+      ],
+      "discriminator": [
+        151,
+        237,
+        70,
+        191,
+        232,
+        81,
+        138,
+        214
+      ],
+      "accounts": [
+        {
+          "name": "price_authority",
+          "signer": true,
+          "relations": [
+            "vault"
+          ]
+        },
+        {
+          "name": "vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "price_e6",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "set_treasury",
+      "docs": [
+        "Admin: names the treasury, the owner of protocol-owned LP shares. Set it",
+        "to the multisig vault, so withdrawing the treasury's liquidity needs a",
+        "multisig vote while deposits (below) can come from a hot key."
+      ],
+      "discriminator": [
+        57,
+        97,
+        196,
+        95,
+        195,
+        206,
+        106,
+        136
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "vault"
+          ]
+        },
+        {
+          "name": "vault",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "treasury_config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  101,
+                  97,
+                  115,
+                  117,
+                  114,
+                  121
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "treasury",
+          "type": "pubkey"
+        }
+      ]
+    },
+    {
+      "name": "withdraw_liquidity",
+      "docs": [
+        "Step 2: once unlocked, pays the request's shares at the vault's value now."
+      ],
+      "discriminator": [
+        149,
+        158,
+        33,
+        185,
+        47,
+        243,
+        253,
+        31
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "request"
+          ]
+        },
+        {
+          "name": "vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              }
+            ]
+          }
         },
         {
           "name": "vault_usdc",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  117,
+                  115,
+                  100,
+                  99
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "request",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  119,
+                  105,
+                  116,
+                  104,
+                  100,
+                  114,
+                  97,
+                  119,
+                  97,
+                  108
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "owner"
+              }
+            ]
+          }
+        },
+        {
+          "name": "owner_usdc",
           "writable": true
         },
         {
-          "name": "market",
-          "writable": true
-        },
-        {
-          "name": "creator_usdc",
-          "writable": true
-        },
-        {
-          "name": "token_program"
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
         }
       ],
       "args": []
@@ -698,6 +2329,19 @@
       ]
     },
     {
+      "name": "PendingAuthority",
+      "discriminator": [
+        108,
+        91,
+        208,
+        174,
+        216,
+        189,
+        207,
+        93
+      ]
+    },
+    {
       "name": "Position",
       "discriminator": [
         170,
@@ -708,6 +2352,45 @@
         64,
         247,
         208
+      ]
+    },
+    {
+      "name": "Registry",
+      "discriminator": [
+        47,
+        174,
+        110,
+        246,
+        184,
+        182,
+        252,
+        218
+      ]
+    },
+    {
+      "name": "Retired",
+      "discriminator": [
+        188,
+        174,
+        79,
+        164,
+        193,
+        177,
+        23,
+        78
+      ]
+    },
+    {
+      "name": "TreasuryConfig",
+      "discriminator": [
+        124,
+        54,
+        212,
+        227,
+        213,
+        189,
+        168,
+        41
       ]
     },
     {
@@ -722,9 +2405,360 @@
         117,
         119
       ]
+    },
+    {
+      "name": "WithdrawalRequest",
+      "discriminator": [
+        242,
+        88,
+        147,
+        173,
+        182,
+        62,
+        229,
+        193
+      ]
+    }
+  ],
+  "events": [
+    {
+      "name": "AuthorityAccepted",
+      "discriminator": [
+        166,
+        192,
+        219,
+        188,
+        41,
+        209,
+        195,
+        26
+      ]
+    },
+    {
+      "name": "AuthorityProposed",
+      "discriminator": [
+        244,
+        117,
+        94,
+        112,
+        53,
+        151,
+        35,
+        89
+      ]
+    },
+    {
+      "name": "BudgetExhausted",
+      "discriminator": [
+        103,
+        143,
+        29,
+        167,
+        155,
+        48,
+        107,
+        86
+      ]
+    },
+    {
+      "name": "MarketCreated",
+      "discriminator": [
+        88,
+        184,
+        130,
+        231,
+        226,
+        84,
+        6,
+        58
+      ]
+    },
+    {
+      "name": "MarketGraduated",
+      "discriminator": [
+        66,
+        242,
+        94,
+        146,
+        88,
+        76,
+        225,
+        23
+      ]
+    },
+    {
+      "name": "MarketLimitsSet",
+      "discriminator": [
+        236,
+        113,
+        124,
+        52,
+        137,
+        80,
+        174,
+        75
+      ]
+    },
+    {
+      "name": "OrderRejected",
+      "discriminator": [
+        151,
+        145,
+        92,
+        106,
+        161,
+        17,
+        195,
+        208
+      ]
+    },
+    {
+      "name": "PositionChanged",
+      "discriminator": [
+        185,
+        99,
+        23,
+        242,
+        206,
+        25,
+        115,
+        41
+      ]
+    },
+    {
+      "name": "PositionClosed",
+      "discriminator": [
+        157,
+        163,
+        227,
+        228,
+        13,
+        97,
+        138,
+        121
+      ]
+    },
+    {
+      "name": "ProtocolFeesCompounded",
+      "discriminator": [
+        34,
+        176,
+        174,
+        245,
+        250,
+        253,
+        175,
+        120
+      ]
+    },
+    {
+      "name": "TreasuryDeposit",
+      "discriminator": [
+        176,
+        79,
+        3,
+        202,
+        180,
+        107,
+        127,
+        236
+      ]
+    },
+    {
+      "name": "TreasurySet",
+      "discriminator": [
+        69,
+        231,
+        163,
+        135,
+        254,
+        194,
+        109,
+        166
+      ]
+    },
+    {
+      "name": "WithdrawalRequested",
+      "discriminator": [
+        75,
+        207,
+        21,
+        12,
+        160,
+        102,
+        150,
+        55
+      ]
+    }
+  ],
+  "errors": [
+    {
+      "code": 6000,
+      "name": "NotPendingAuthority",
+      "msg": "Only the proposed new authority can accept"
+    },
+    {
+      "code": 6001,
+      "name": "Paused",
+      "msg": "Program is paused"
+    },
+    {
+      "code": 6002,
+      "name": "BadArgs",
+      "msg": "Invalid arguments"
+    },
+    {
+      "code": 6003,
+      "name": "ZeroAmount",
+      "msg": "Amount must be greater than zero"
+    },
+    {
+      "code": 6004,
+      "name": "BadPrice",
+      "msg": "Price must be positive"
+    },
+    {
+      "code": 6005,
+      "name": "StaleSolPrice",
+      "msg": "SOL/USD price is stale"
+    },
+    {
+      "code": 6006,
+      "name": "ReduceOnly",
+      "msg": "Market is reduce-only"
+    },
+    {
+      "code": 6007,
+      "name": "CurveGraduated",
+      "msg": "Curve has graduated; use the AMM oracle"
+    },
+    {
+      "code": 6008,
+      "name": "TooEarly",
+      "msg": "Order cannot be filled yet"
+    },
+    {
+      "code": 6009,
+      "name": "NotExpired",
+      "msg": "Order has not expired"
+    },
+    {
+      "code": 6010,
+      "name": "Leverage",
+      "msg": "Leverage above the tier maximum"
+    },
+    {
+      "code": 6011,
+      "name": "OiCap",
+      "msg": "Open interest cap reached"
+    },
+    {
+      "code": 6012,
+      "name": "AccountCap",
+      "msg": "Position above the per-account cap"
+    },
+    {
+      "code": 6013,
+      "name": "SkewCap",
+      "msg": "Vault net exposure would exceed the skew cap"
+    },
+    {
+      "code": 6014,
+      "name": "NoPosition",
+      "msg": "No open position"
+    },
+    {
+      "code": 6015,
+      "name": "Healthy",
+      "msg": "Position is above maintenance margin"
+    },
+    {
+      "code": 6016,
+      "name": "NotAdl",
+      "msg": "Market is not in ADL mode"
+    },
+    {
+      "code": 6017,
+      "name": "NotProfitable",
+      "msg": "Position is not profitable"
+    },
+    {
+      "code": 6018,
+      "name": "Insolvent",
+      "msg": "Collateral would go negative"
+    },
+    {
+      "code": 6019,
+      "name": "BadOracle",
+      "msg": "Pyth price account is invalid, unverified or too uncertain"
+    },
+    {
+      "code": 6020,
+      "name": "BadPool",
+      "msg": "Raydium pool accounts are missing or don't match this token"
+    },
+    {
+      "code": 6021,
+      "name": "NotGraduated",
+      "msg": "Curve has not migrated, or the market already graduated"
+    },
+    {
+      "code": 6022,
+      "name": "WithdrawalLocked",
+      "msg": "Withdrawal is still in its waiting period"
+    },
+    {
+      "code": 6023,
+      "name": "MarketLimit",
+      "msg": "Too many Tier 0 markets are live; retire idle ones or wait for graduations"
+    },
+    {
+      "code": 6024,
+      "name": "NotRetirable",
+      "msg": "Market can't be retired: it has open interest, its curve sold out, or it traded in the last 7 days"
     }
   ],
   "types": [
+    {
+      "name": "AuthorityAccepted",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "authority",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "AuthorityProposed",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "new_authority",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "BudgetExhausted",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "trader_net_pnl",
+            "type": "i64"
+          }
+        ]
+      }
+    },
     {
       "name": "Curve",
       "type": {
@@ -838,22 +2872,6 @@
       }
     },
     {
-      "name": "Observation",
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "slot",
-            "type": "u64"
-          },
-          {
-            "name": "cumulative",
-            "type": "u128"
-          }
-        ]
-      }
-    },
-    {
       "name": "LpAccount",
       "type": {
         "kind": "struct",
@@ -957,6 +2975,78 @@
       }
     },
     {
+      "name": "MarketCreated",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "slot",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "MarketGraduated",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "pool",
+            "type": "pubkey"
+          },
+          {
+            "name": "price_q64",
+            "type": "u128"
+          }
+        ]
+      }
+    },
+    {
+      "name": "MarketLimitsSet",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "oi_cap_override",
+            "type": "u64"
+          },
+          {
+            "name": "reduce_only",
+            "type": "bool"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Observation",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "slot",
+            "type": "u64"
+          },
+          {
+            "name": "cumulative",
+            "type": "u128"
+          }
+        ]
+      }
+    },
+    {
       "name": "OrderArgs",
       "type": {
         "kind": "struct",
@@ -980,6 +3070,26 @@
           {
             "name": "acceptable_price_q64",
             "type": "u128"
+          }
+        ]
+      }
+    },
+    {
+      "name": "OrderRejected",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "reason",
+            "type": "u8"
           }
         ]
       }
@@ -1033,6 +3143,25 @@
       }
     },
     {
+      "name": "PendingAuthority",
+      "docs": [
+        "A proposed admin handover, waiting for the successor to accept."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "new_authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
       "name": "Position",
       "type": {
         "kind": "struct",
@@ -1072,6 +3201,180 @@
           {
             "name": "bump",
             "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PositionChanged",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "side",
+            "type": "u8"
+          },
+          {
+            "name": "size_usd",
+            "type": "u64"
+          },
+          {
+            "name": "collateral",
+            "type": "u64"
+          },
+          {
+            "name": "mark_q64",
+            "type": "u128"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PositionClosed",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "side",
+            "type": "u8"
+          },
+          {
+            "name": "realized_pnl",
+            "type": "i64"
+          },
+          {
+            "name": "payout",
+            "type": "u64"
+          },
+          {
+            "name": "mark_q64",
+            "type": "u128"
+          },
+          {
+            "name": "reason",
+            "docs": [
+              "0 = close, 1 = liquidation, 2 = ADL"
+            ],
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ProtocolFeesCompounded",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "amount",
+            "type": "u64"
+          },
+          {
+            "name": "shares",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Registry",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "live_tier0",
+            "type": "u32"
+          },
+          {
+            "name": "max_live_tier0",
+            "type": "u32"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Retired",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TreasuryConfig",
+      "docs": [
+        "Who owns protocol-owned liquidity (set by the vault authority)."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "treasury",
+            "type": "pubkey"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TreasuryDeposit",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "depositor",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          },
+          {
+            "name": "shares",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TreasurySet",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "treasury",
+            "type": "pubkey"
           }
         ]
       }
@@ -1143,286 +3446,48 @@
       }
     },
     {
-      "name": "MarketCreated",
+      "name": "WithdrawalRequest",
       "type": {
-        "fields": [
-          {
-            "name": "mint",
-            "type": "pubkey"
-          },
-          {
-            "name": "slot",
-            "type": "u64"
-          }
-        ],
-        "kind": "struct"
-      }
-    },
-    {
-      "name": "BudgetExhausted",
-      "type": {
-        "fields": [
-          {
-            "name": "mint",
-            "type": "pubkey"
-          },
-          {
-            "name": "trader_net_pnl",
-            "type": "i64"
-          }
-        ],
-        "kind": "struct"
-      }
-    },
-    {
-      "name": "OrderRejected",
-      "type": {
+        "kind": "struct",
         "fields": [
           {
             "name": "owner",
             "type": "pubkey"
           },
           {
-            "name": "market",
-            "type": "pubkey"
-          },
-          {
-            "name": "reason",
-            "type": "u8"
-          }
-        ],
-        "kind": "struct"
-      }
-    },
-    {
-      "name": "PositionChanged",
-      "type": {
-        "fields": [
-          {
-            "name": "owner",
-            "type": "pubkey"
-          },
-          {
-            "name": "market",
-            "type": "pubkey"
-          },
-          {
-            "name": "side",
-            "type": "u8"
-          },
-          {
-            "name": "size_usd",
+            "name": "shares",
             "type": "u64"
           },
           {
-            "name": "collateral",
-            "type": "u64"
-          },
-          {
-            "name": "mark_q64",
-            "type": "u128"
-          }
-        ],
-        "kind": "struct"
-      }
-    },
-    {
-      "name": "PositionClosed",
-      "type": {
-        "fields": [
-          {
-            "name": "owner",
-            "type": "pubkey"
-          },
-          {
-            "name": "market",
-            "type": "pubkey"
-          },
-          {
-            "name": "side",
-            "type": "u8"
-          },
-          {
-            "name": "realized_pnl",
+            "name": "unlock_ts",
             "type": "i64"
           },
           {
-            "name": "payout",
+            "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "WithdrawalRequested",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "shares",
             "type": "u64"
           },
           {
-            "name": "mark_q64",
-            "type": "u128"
-          },
-          {
-            "docs": [
-              "0 = close, 1 = liquidation, 2 = ADL"
-            ],
-            "name": "reason",
-            "type": "u8"
+            "name": "unlock_ts",
+            "type": "i64"
           }
-        ],
-        "kind": "struct"
+        ]
       }
-    }
-  ],
-  "errors": [
-    {
-      "code": 6000,
-      "name": "Paused",
-      "msg": "Program is paused"
-    },
-    {
-      "code": 6001,
-      "name": "BadArgs",
-      "msg": "Invalid arguments"
-    },
-    {
-      "code": 6002,
-      "name": "ZeroAmount",
-      "msg": "Amount must be greater than zero"
-    },
-    {
-      "code": 6003,
-      "name": "BadPrice",
-      "msg": "Price must be positive"
-    },
-    {
-      "code": 6004,
-      "name": "StaleSolPrice",
-      "msg": "SOL/USD price is stale"
-    },
-    {
-      "code": 6005,
-      "name": "ReduceOnly",
-      "msg": "Market is reduce-only"
-    },
-    {
-      "code": 6006,
-      "name": "CurveGraduated",
-      "msg": "Curve has graduated; use the AMM oracle"
-    },
-    {
-      "code": 6007,
-      "name": "TooEarly",
-      "msg": "Order cannot be filled yet"
-    },
-    {
-      "code": 6008,
-      "name": "NotExpired",
-      "msg": "Order has not expired"
-    },
-    {
-      "code": 6009,
-      "name": "Leverage",
-      "msg": "Leverage above the tier maximum"
-    },
-    {
-      "code": 6010,
-      "name": "OiCap",
-      "msg": "Open interest cap reached"
-    },
-    {
-      "code": 6011,
-      "name": "AccountCap",
-      "msg": "Position above the per-account cap"
-    },
-    {
-      "code": 6012,
-      "name": "SkewCap",
-      "msg": "Vault net exposure would exceed the skew cap"
-    },
-    {
-      "code": 6013,
-      "name": "NoPosition",
-      "msg": "No open position"
-    },
-    {
-      "code": 6014,
-      "name": "Healthy",
-      "msg": "Position is above maintenance margin"
-    },
-    {
-      "code": 6015,
-      "name": "NotAdl",
-      "msg": "Market is not in ADL mode"
-    },
-    {
-      "code": 6016,
-      "name": "NotProfitable",
-      "msg": "Position is not profitable"
-    },
-    {
-      "code": 6017,
-      "name": "Insolvent",
-      "msg": "Collateral would go negative"
-    }
-  ],
-  "events": [
-    {
-      "discriminator": [
-        88,
-        184,
-        130,
-        231,
-        226,
-        84,
-        6,
-        58
-      ],
-      "name": "MarketCreated"
-    },
-    {
-      "discriminator": [
-        103,
-        143,
-        29,
-        167,
-        155,
-        48,
-        107,
-        86
-      ],
-      "name": "BudgetExhausted"
-    },
-    {
-      "discriminator": [
-        151,
-        145,
-        92,
-        106,
-        161,
-        17,
-        195,
-        208
-      ],
-      "name": "OrderRejected"
-    },
-    {
-      "discriminator": [
-        185,
-        99,
-        23,
-        242,
-        206,
-        25,
-        115,
-        41
-      ],
-      "name": "PositionChanged"
-    },
-    {
-      "discriminator": [
-        157,
-        163,
-        227,
-        228,
-        13,
-        97,
-        138,
-        121
-      ],
-      "name": "PositionClosed"
     }
   ]
 }
