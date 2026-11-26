@@ -1,0 +1,51 @@
+[
+  {
+    "_source": "Header, the wSOL tokenTransfers entry and the summary are copied from the example in https://www.helius.dev/docs/parsed-events/quickstart.md (step 3). The page trims the example, so the second tokenTransfers entry (pump token leg) is ASSUMED: amount and mint come from summary.parsedData.actual_out_amount / output_mint, the token accounts are invented, and instructions are omitted.",
+    "signature": "5xSKzM8bvpudE521jikHqASzMr23Ms4X4ieY3K8oFPFrJWCSSgYocJmHznrR8b12voDxKDH8ykdCLXSRrx6duVLH",
+    "parserStatus": "OK",
+    "parsed": {
+      "slot": 433950192,
+      "blockTime": 1784487060,
+      "fee": 2005000,
+      "feePayer": "GV6UUmNxz2RpKxmNAPadYKb7uQpszwqQAu3qLJxVdC52",
+      "transactionStatus": "OK",
+      "nativeTransfers": [],
+      "tokenTransfers": [
+        {
+          "fromUserAccount": "GV6UUmNxz2RpKxmNAPadYKb7uQpszwqQAu3qLJxVdC52",
+          "toUserAccount": "7iWnBRRhBCiNXXPhqiGzvvBkKrvFSWqqmxRyu9VyYBxE",
+          "fromTokenAccount": "teBPkZtsnaKDpGHTy1KUZeh1PbVtbrKXhzruYpRiUUs",
+          "toTokenAccount": "2oL6my4QDDCfpgJZX1bZV1NgbmuNptKdgcE8wJm6efgk",
+          "rawTokenAmount": 1498500000000,
+          "decimals": 9,
+          "tokenStandard": "Fungible",
+          "mint": "So11111111111111111111111111111111111111112"
+        },
+        {
+          "fromUserAccount": "7iWnBRRhBCiNXXPhqiGzvvBkKrvFSWqqmxRyu9VyYBxE",
+          "toUserAccount": "GV6UUmNxz2RpKxmNAPadYKb7uQpszwqQAu3qLJxVdC52",
+          "fromTokenAccount": "9f2cite7PgVFQBGPGPGfMxaTebQvesxCuxkKaq3GUAES",
+          "toTokenAccount": "6jj9HN2KCJ14QDBC5wfHUasoStm3jS9UCzRyiUrDmLnS",
+          "rawTokenAmount": 64672839261950,
+          "decimals": 6,
+          "tokenStandard": "Fungible",
+          "mint": "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn"
+        }
+      ],
+      "summary": {
+        "type": "swap",
+        "description": "GV6UUmNxz2RpKxmNAPadYKb7uQpszwqQAu3qLJxVdC52 swapped 1500 SOL for 64672839.26195 pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn via Jupiter",
+        "parsedData": {
+          "type": "swap",
+          "protocol": "jupiter",
+          "kind": "swap",
+          "in_amount": "1500000000000",
+          "actual_out_amount": "64672839261950",
+          "input_mint": "So11111111111111111111111111111111111111112",
+          "output_mint": "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn"
+        }
+      },
+      "instructions": []
+    }
+  }
+]

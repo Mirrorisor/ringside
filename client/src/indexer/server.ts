@@ -182,7 +182,7 @@ export function createIndexerServer(opts: IndexerOptions): Server {
       if (e instanceof HttpError) throw e;
       throw new HttpError(400, "invalid JSON");
     }
-    if (!Array.isArray(payload)) throw new HttpError(400, "expected an array of enhanced transactions");
+    if (!Array.isArray(payload)) throw new HttpError(400, "expected an array of transactions");
     if (payload.length > MAX_TXS_PER_WEBHOOK) throw new HttpError(413, "too many transactions");
     let ingested = 0, duplicates = 0, skipped = 0, trades = 0;
     const batch: ParsedTx[] = [];

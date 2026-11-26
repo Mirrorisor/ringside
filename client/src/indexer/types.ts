@@ -56,6 +56,60 @@ export interface HeliusEnhancedTransaction {
   instructions?: HeliusInstruction[];
   events?: { swap?: HeliusSwapEvent | null; [k: string]: unknown };
   transactionError?: unknown;
+  /**
+   * Set only by `normalizeTransaction` for the parsed-events format, which names signers in its
+   * decoded instruction accounts. When present, a trader must be one of these. Never read from an
+   * incoming enhanced transaction (the normaliser clears it).
+   */
+  signers?: string[];
+}
+
+/**
+ * Helius parsed-events format (https://www.helius.dev/docs/parsed-events/parsed-response.md): one item of
+ * `POST /v1/parsed-events/transactions` or `transaction-history`. Differences from enhanced transactions:
+ * the transaction sits under `parsed`, `timestamp` is `parsed.blockTime`, `type` and `description` move under
+ * `parsed.summary` (nullable), token transfers carry `rawTokenAmount` (raw integer) plus `decimals` instead of
+ * a pre-scaled `tokenAmount`, and instructions are a flat decoded list. Every field is untrusted.
+ */
+export interface HeliusParsedTokenTransfer {
+  fromUserAccount?: string | null;
+  toUserAccount?: string | null;
+  fromTokenAccount?: string | null;
+  toTokenAccount?: string | null;
+  rawTokenAmount?: number | string;
+  decimals?: number;
+  tokenStandard?: string;
+  mint?: string;
+}
+export interface HeliusParsedSummary { type?: string; description?: string; parsedData?: { protocol?: string; [k: string]: unknown } | null }
+export interface HeliusParsedInstruction {
+  instructionIndex?: number;
+  innerInstructionIndex?: number | null;
+  programId?: string;
+  rawAccounts?: string[];
+  rawData?: string;
+  summary?: HeliusParsedSummary | null;
+  programName?: string | null;
+  instructionName?: string | null;
+  decoded?: { args?: unknown; accounts?: { name?: string; pubkey?: string; isSigner?: boolean; isWritable?: boolean }[] } | null;
+}
+export interface HeliusParsedTransaction {
+  slot?: number;
+  blockTime?: number | null;
+  fee?: number;
+  feePayer?: string | null;
+  transactionStatus?: string;
+  error?: unknown;
+  nativeTransfers?: HeliusNativeTransfer[];
+  tokenTransfers?: HeliusParsedTokenTransfer[];
+  summary?: HeliusParsedSummary | null;
+  instructions?: HeliusParsedInstruction[];
+}
+export interface HeliusParsedEvent {
+  signature: string;
+  parserStatus?: string;
+  parsed?: HeliusParsedTransaction;
+  parserError?: unknown;
 }
 
 export type Side = "buy" | "sell";

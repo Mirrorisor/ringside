@@ -9,9 +9,14 @@
  * as SOL. A trade is emitted only for a single non-quote mint moving against
  * SOL or USDC in the opposite direction; token-to-token routes and
  * SOL<->USDC swaps are skipped.
+ *
+ * Two payload formats are accepted, detected per item: enhanced transactions
+ * and Helius's newer parsed events (`{signature, parserStatus, parsed}`).
+ * `normalizeTransaction` maps the latter onto the former, so everything
+ * below, including the trader attribution rules, is shared.
  */
 import { LAMPORTS_PER_SOL, SOL_MINT, USDC_MINT } from "./types.js";
-import type { HeliusEnhancedTransaction, HeliusInstruction, HeliusSwapEvent, Launch, ParsedTx, Quote, SolTransfer, Trade } from "./types.js";
+import type { HeliusEnhancedTransaction, HeliusInstruction, HeliusParsedEvent, HeliusParsedInstruction, HeliusSwapEvent, Launch, ParsedTx, Quote, SolTransfer, Trade } from "./types.js";
 
 export const RINGSIDE_LAUNCH_PROGRAM = "AfZWCTaDQEC9CVTwXkH7pFtDXs4RtLWCK5godexWQDVH";
 
@@ -68,6 +73,91 @@ function rawToUi(raw: { tokenAmount?: string | number; decimals?: number } | und
   if (!raw) return 0;
   const dec = Number.isInteger(raw.decimals) && raw.decimals! >= 0 && raw.decimals! <= 18 ? raw.decimals! : 0;
   return num(raw.tokenAmount) / 10 ** dec;
+}
+
+const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+
+/** Plain object check without type narrowing (the callers hold typed values). */
+const isRec = (v: unknown): boolean => typeof v === "object" && v !== null && !Array.isArray(v);
+
+/** True for a parsed-events item: `{signature, parserStatus, parsed: {...}}` (enhanced transactions have neither key). */
+export function isParsedEvent(tx: unknown): tx is HeliusParsedEvent {
+  return isObj(tx) && typeof tx.parserStatus === "string" && "parsed" in tx;
+}
+
+/** `swap` -> `SWAP`, so the enhanced-transaction `SWAP_TYPES` check applies. */
+const upperType = (t: unknown) => (typeof t === "string" && t ? t.toUpperCase() : undefined);
+
+/**
+ * Maps a parsed-events item to the enhanced-transaction shape. Returns null for an item whose
+ * `parserStatus` is not OK or that has no `parsed` body (Helius reports unparseable signatures
+ * this way, not as an HTTP error). Failed transactions keep a `transactionError`, so
+ * `parseTransaction` drops them like failed enhanced transactions.
+ *
+ * Signers: the format has no signer list, but decoded instruction accounts carry `isSigner`.
+ * `signers` is the fee payer plus every account flagged `isSigner`, and is set only when at least
+ * one instruction was decoded with account flags; otherwise it is left unset and `pickTrader`
+ * falls back to its inference.
+ */
+export function normalizeParsedEvent(ev: HeliusParsedEvent): HeliusEnhancedTransaction | null {
+  const p = ev.parsed!;
+  if (ev.parserStatus !== "OK" || !isRec(ev.parsed)) return null;
+  const ixs: HeliusParsedInstruction[] = Array.isArray(p.instructions) ? p.instructions.filter(isRec) : [];
+  const feePayer = isAddress(p.feePayer) ? p.feePayer : undefined;
+
+  const instructions: HeliusInstruction[] = [];
+  const byIndex = new Map<number, HeliusInstruction>();
+  const toIx = (i: HeliusParsedInstruction): HeliusInstruction => ({ programId: i.programId, accounts: Array.isArray(i.rawAccounts) ? i.rawAccounts : [], data: typeof i.rawData === "string" ? i.rawData : "", innerInstructions: [] });
+  for (const i of ixs.filter((x) => x.innerInstructionIndex == null)) {
+    const ix = toIx(i);
+    instructions.push(ix);
+    if (Number.isInteger(i.instructionIndex)) byIndex.set(i.instructionIndex!, ix);
+  }
+  // Inner instructions are listed flat with a parent `instructionIndex`; an orphan is kept at the top level.
+  for (const i of ixs.filter((x) => x.innerInstructionIndex != null)) (byIndex.get(i.instructionIndex as number)?.innerInstructions ?? instructions).push(toIx(i));
+
+  let sawFlags = false;
+  const signers = new Set<string>(feePayer ? [feePayer] : []);
+  for (const i of ixs) {
+    for (const a of Array.isArray(i.decoded?.accounts) ? i.decoded!.accounts! : []) {
+      if (!isRec(a) || typeof a.isSigner !== "boolean") continue;
+      sawFlags = true;
+      if (a.isSigner && isAddress(a.pubkey)) signers.add(a.pubkey);
+    }
+  }
+
+  // ASSUMPTION: when the transaction-level summary is null, a decoded `swap` instruction summary marks a swap.
+  const type = upperType(p.summary?.type) ?? (ixs.some((i) => upperType(i.summary?.type) === "SWAP") ? "SWAP" : undefined);
+  // ASSUMPTION: `summary.parsedData.protocol` (documented on the Jupiter swap example) is the venue label; other protocols may omit it.
+  const source = upperType(p.summary?.parsedData?.protocol);
+  const failed = p.transactionStatus !== "OK" || (p.error !== undefined && p.error !== null);
+
+  return {
+    signature: ev.signature,
+    slot: p.slot,
+    timestamp: p.blockTime ?? undefined,
+    fee: p.fee,
+    feePayer,
+    type,
+    source,
+    description: p.summary?.description,
+    nativeTransfers: Array.isArray(p.nativeTransfers) ? p.nativeTransfers : [],
+    tokenTransfers: (Array.isArray(p.tokenTransfers) ? p.tokenTransfers : []).filter(isRec).map((t) => ({
+      fromUserAccount: t.fromUserAccount, toUserAccount: t.toUserAccount, fromTokenAccount: t.fromTokenAccount, toTokenAccount: t.toTokenAccount,
+      mint: t.mint, tokenStandard: t.tokenStandard, tokenAmount: rawToUi({ tokenAmount: t.rawTokenAmount, decimals: t.decimals }),
+    })),
+    instructions,
+    transactionError: failed ? (p.error ?? p.transactionStatus ?? "failed") : null,
+    ...(sawFlags ? { signers: [...signers] } : {}),
+  };
+}
+
+/** Returns the enhanced-transaction view of a payload item in either format, or null if it is an unusable parsed event. */
+export function normalizeTransaction(tx: unknown): HeliusEnhancedTransaction | null {
+  if (isParsedEvent(tx)) return normalizeParsedEvent(tx);
+  // `signers` only ever comes from the normaliser above; never trust it on an enhanced transaction.
+  if (isObj(tx) && "signers" in tx) return { ...(tx as unknown as HeliusEnhancedTransaction), signers: undefined };
+  return tx as HeliusEnhancedTransaction;
 }
 
 /** Net UI deltas per mint (SOL under SOL_MINT) for the swapping wallet. */
@@ -150,6 +240,9 @@ function tradeFromDeltas(d: Deltas, base: Omit<Trade, "mint" | "side" | "tokenAm
  *    non-signer, so a signing user precedes the pool's accounts;
  *  - with no `accountData` only a single candidate is accepted; an
  *    ambiguous transaction yields no trade rather than a wrong trader.
+ *
+ * Parsed-events transactions that name their signers (`tx.signers`) skip the
+ * inference: a candidate must be a listed signer.
  */
 export function pickTrader(tx: HeliusEnhancedTransaction, sponsors: ReadonlySet<string> = NO_SPONSORS): string | undefined {
   const tokenDelta = new Map<string, number>();
@@ -164,10 +257,11 @@ export function pickTrader(tx: HeliusEnhancedTransaction, sponsors: ReadonlySet<
   for (const n of tx.nativeTransfers ?? []) if (n && isAddress(n.fromUserAccount)) spent.add(n.fromUserAccount);
   const feePayer = isAddress(tx.feePayer) ? tx.feePayer : undefined;
   const base = { signature: tx.signature, slot: 0, timestamp: 0, source: "" };
+  const signers = Array.isArray(tx.signers) ? new Set(tx.signers) : undefined;
   const candidates: string[] = [];
   for (const [w, d] of tokenDelta) {
     if (sponsors.has(w) || !(Math.abs(d) > DUST)) continue;
-    if (w !== feePayer && !spent.has(w)) continue;
+    if (signers ? !signers.has(w) : w !== feePayer && !spent.has(w)) continue;
     if (tradeFromDeltas(deltasFromTransfers(tx, w), { ...base, wallet: w })) candidates.push(w);
   }
   if (feePayer && candidates.includes(feePayer)) return feePayer;
@@ -183,7 +277,12 @@ export function pickTrader(tx: HeliusEnhancedTransaction, sponsors: ReadonlySet<
 }
 
 /** Parses one swap into at most one trade (or null). Exposed for tests. */
-export function parseSwap(tx: HeliusEnhancedTransaction, opts: ParseOptions = {}): Trade | null {
+export function parseSwap(input: HeliusEnhancedTransaction | HeliusParsedEvent, opts: ParseOptions = {}): Trade | null {
+  const tx = normalizeTransaction(input);
+  return tx ? parseNormalizedSwap(tx, opts) : null;
+}
+
+function parseNormalizedSwap(tx: HeliusEnhancedTransaction, opts: ParseOptions): Trade | null {
   const sponsors = opts.sponsors ?? NO_SPONSORS;
   const base = { signature: tx.signature, slot: tx.slot!, timestamp: tx.timestamp!, source: typeof tx.source === "string" && tx.source ? tx.source.slice(0, 64) : "UNKNOWN" };
   const ev = tx.events?.swap;
@@ -207,13 +306,14 @@ export function isValidTx(tx: unknown): tx is HeliusEnhancedTransaction {
 }
 
 /**
- * Parses one enhanced transaction. Failed transactions return null. SOL
+ * Parses one transaction in either payload format. Failed transactions return null. SOL
  * transfers are kept only from transactions that are not trades, so swap
  * legs to pools are not mistaken for wallet funding; transfers touching a
  * configured sponsor are dropped (gas top-ups and fee recovery).
  */
-export function parseTransaction(tx: HeliusEnhancedTransaction, parsers: ProgramParser[] = DEFAULT_PARSERS, opts: ParseOptions = {}): ParsedTx | null {
+export function parseTransaction(input: HeliusEnhancedTransaction | HeliusParsedEvent, parsers: ProgramParser[] = DEFAULT_PARSERS, opts: ParseOptions = {}): ParsedTx | null {
   const sponsors = opts.sponsors ?? NO_SPONSORS;
+  const tx = normalizeTransaction(input);
   if (!isValidTx(tx)) return null;
   if (tx.transactionError != null) return null;
   const out: ParsedTx = { signature: tx.signature, slot: tx.slot!, timestamp: tx.timestamp!, trades: [], transfers: [], launches: [] };
@@ -231,7 +331,7 @@ export function parseTransaction(tx: HeliusEnhancedTransaction, parsers: Program
   }
   if (programTrades) out.trades = programTrades;
   else if (SWAP_TYPES.has(tx.type ?? "") || tx.events?.swap) {
-    const t = parseSwap(tx, opts);
+    const t = parseNormalizedSwap(tx, opts);
     if (t) out.trades.push(t);
   }
 

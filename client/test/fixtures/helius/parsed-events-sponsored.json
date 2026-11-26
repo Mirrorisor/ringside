@@ -1,0 +1,191 @@
+[
+  {
+    "_source": "Synthetic: test/fixtures/helius/sponsored.json re-expressed in the documented parsed-events field names (not a captured payload). decoded.accounts and isSigner flags are ASSUMED from the documented ParsedInstruction shape.",
+    "signature": "Qj4bYfRngHnQM4TQJsVWkhc3Lt7Wi1xdUqtVXnMAEox6sS7fRxVQ39mukxk66nqf3zaEH6yZoYev7AkdLW3YB42",
+    "parserStatus": "OK",
+    "parsed": {
+      "slot": 300000200,
+      "blockTime": 1763990061,
+      "fee": 5000,
+      "feePayer": "9WEcBMSRNFyDsyZ964sGRQU7AR8VBchbUmxEHve8ejv5",
+      "transactionStatus": "OK",
+      "nativeTransfers": [
+        {
+          "fromUserAccount": "EiTEoEJFpxofrtH36vJmqEPEjdJg4wu1BwvALBCaz8T9",
+          "toUserAccount": "6epuRPtABtf9xZYDJVzDBc7iuCSGdoWG7xfCG9isxddS",
+          "amount": 1000000000
+        },
+        {
+          "fromUserAccount": "EiTEoEJFpxofrtH36vJmqEPEjdJg4wu1BwvALBCaz8T9",
+          "toUserAccount": "34QvET7j2m2vdFFFe8147HDiPhnoVb2BXvzknQSg7wCx",
+          "amount": 10000000
+        },
+        {
+          "fromUserAccount": "EiTEoEJFpxofrtH36vJmqEPEjdJg4wu1BwvALBCaz8T9",
+          "toUserAccount": "9WEcBMSRNFyDsyZ964sGRQU7AR8VBchbUmxEHve8ejv5",
+          "amount": 100000
+        },
+        {
+          "fromUserAccount": "9WEcBMSRNFyDsyZ964sGRQU7AR8VBchbUmxEHve8ejv5",
+          "toUserAccount": "EsZ1QrhCKBbEsTrrjHFxEhuYfH99KBfMQfRv8uHEtHRR",
+          "amount": 2039280
+        }
+      ],
+      "tokenTransfers": [
+        {
+          "fromUserAccount": "6epuRPtABtf9xZYDJVzDBc7iuCSGdoWG7xfCG9isxddS",
+          "toUserAccount": "EiTEoEJFpxofrtH36vJmqEPEjdJg4wu1BwvALBCaz8T9",
+          "fromTokenAccount": "HpysNz1rNSKvpvfwYn8PWP7S2H9aYYMX3adQ3JSe5MnM",
+          "toTokenAccount": "EsZ1QrhCKBbEsTrrjHFxEhuYfH99KBfMQfRv8uHEtHRR",
+          "rawTokenAmount": 2000000000000,
+          "decimals": 6,
+          "tokenStandard": "Fungible",
+          "mint": "AbYGhAcF86iLQpQQynmZPZAyMejskVFowy2P2LBktuaH"
+        },
+        {
+          "fromUserAccount": "EiTEoEJFpxofrtH36vJmqEPEjdJg4wu1BwvALBCaz8T9",
+          "toUserAccount": "9WEcBMSRNFyDsyZ964sGRQU7AR8VBchbUmxEHve8ejv5",
+          "fromTokenAccount": "EsZ1QrhCKBbEsTrrjHFxEhuYfH99KBfMQfRv8uHEtHRR",
+          "toTokenAccount": "4kDNxcX8XWf7a1fkNCVuMc2JMnTaK9qzkjmPfV7WAWWm",
+          "rawTokenAmount": 10000000000,
+          "decimals": 6,
+          "tokenStandard": "Fungible",
+          "mint": "AbYGhAcF86iLQpQQynmZPZAyMejskVFowy2P2LBktuaH"
+        }
+      ],
+      "summary": {
+        "type": "swap",
+        "description": "",
+        "parsedData": null
+      },
+      "instructions": [
+        {
+          "instructionIndex": 0,
+          "innerInstructionIndex": null,
+          "stackHeight": 1,
+          "programId": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+          "rawAccounts": [
+            "EiTEoEJFpxofrtH36vJmqEPEjdJg4wu1BwvALBCaz8T9",
+            "6epuRPtABtf9xZYDJVzDBc7iuCSGdoWG7xfCG9isxddS",
+            "HpysNz1rNSKvpvfwYn8PWP7S2H9aYYMX3adQ3JSe5MnM",
+            "EsZ1QrhCKBbEsTrrjHFxEhuYfH99KBfMQfRv8uHEtHRR"
+          ],
+          "rawData": "",
+          "summary": null,
+          "programName": null,
+          "instructionName": null,
+          "decoded": {
+            "args": {},
+            "accounts": [
+              {
+                "name": "user",
+                "pubkey": "EiTEoEJFpxofrtH36vJmqEPEjdJg4wu1BwvALBCaz8T9",
+                "isSigner": true,
+                "isWritable": true
+              },
+              {
+                "name": "curve",
+                "pubkey": "6epuRPtABtf9xZYDJVzDBc7iuCSGdoWG7xfCG9isxddS",
+                "isSigner": false,
+                "isWritable": true
+              },
+              {
+                "name": "payer",
+                "pubkey": "9WEcBMSRNFyDsyZ964sGRQU7AR8VBchbUmxEHve8ejv5",
+                "isSigner": true,
+                "isWritable": true
+              }
+            ]
+          }
+        }
+      ]
+    }
+  },
+  {
+    "_source": "Synthetic: test/fixtures/helius/sponsored.json re-expressed in the documented parsed-events field names (not a captured payload). decoded.accounts and isSigner flags are ASSUMED from the documented ParsedInstruction shape.",
+    "signature": "3jnmpC9ak6c8Pb9JjUi2q4e1pAGn424pKf1WKp158Kqd5WQPSKvJ72vYfAX3Foud8DyEaPQ7JSdWK6q2FX7NcGx3",
+    "parserStatus": "OK",
+    "parsed": {
+      "slot": 300000300,
+      "blockTime": 1763990081,
+      "fee": 5000,
+      "feePayer": "9WEcBMSRNFyDsyZ964sGRQU7AR8VBchbUmxEHve8ejv5",
+      "transactionStatus": "OK",
+      "nativeTransfers": [
+        {
+          "fromUserAccount": "6epuRPtABtf9xZYDJVzDBc7iuCSGdoWG7xfCG9isxddS",
+          "toUserAccount": "EiTEoEJFpxofrtH36vJmqEPEjdJg4wu1BwvALBCaz8T9",
+          "amount": 1200000000
+        },
+        {
+          "fromUserAccount": "EiTEoEJFpxofrtH36vJmqEPEjdJg4wu1BwvALBCaz8T9",
+          "toUserAccount": "34QvET7j2m2vdFFFe8147HDiPhnoVb2BXvzknQSg7wCx",
+          "amount": 12000000
+        },
+        {
+          "fromUserAccount": "EiTEoEJFpxofrtH36vJmqEPEjdJg4wu1BwvALBCaz8T9",
+          "toUserAccount": "9WEcBMSRNFyDsyZ964sGRQU7AR8VBchbUmxEHve8ejv5",
+          "amount": 100000
+        }
+      ],
+      "tokenTransfers": [
+        {
+          "fromUserAccount": "EiTEoEJFpxofrtH36vJmqEPEjdJg4wu1BwvALBCaz8T9",
+          "toUserAccount": "6epuRPtABtf9xZYDJVzDBc7iuCSGdoWG7xfCG9isxddS",
+          "fromTokenAccount": "EsZ1QrhCKBbEsTrrjHFxEhuYfH99KBfMQfRv8uHEtHRR",
+          "toTokenAccount": "HpysNz1rNSKvpvfwYn8PWP7S2H9aYYMX3adQ3JSe5MnM",
+          "rawTokenAmount": 1990000000000,
+          "decimals": 6,
+          "tokenStandard": "Fungible",
+          "mint": "AbYGhAcF86iLQpQQynmZPZAyMejskVFowy2P2LBktuaH"
+        }
+      ],
+      "summary": {
+        "type": "swap",
+        "description": "",
+        "parsedData": null
+      },
+      "instructions": [
+        {
+          "instructionIndex": 0,
+          "innerInstructionIndex": null,
+          "stackHeight": 1,
+          "programId": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+          "rawAccounts": [
+            "EiTEoEJFpxofrtH36vJmqEPEjdJg4wu1BwvALBCaz8T9",
+            "6epuRPtABtf9xZYDJVzDBc7iuCSGdoWG7xfCG9isxddS",
+            "HpysNz1rNSKvpvfwYn8PWP7S2H9aYYMX3adQ3JSe5MnM",
+            "EsZ1QrhCKBbEsTrrjHFxEhuYfH99KBfMQfRv8uHEtHRR"
+          ],
+          "rawData": "",
+          "summary": null,
+          "programName": null,
+          "instructionName": null,
+          "decoded": {
+            "args": {},
+            "accounts": [
+              {
+                "name": "user",
+                "pubkey": "EiTEoEJFpxofrtH36vJmqEPEjdJg4wu1BwvALBCaz8T9",
+                "isSigner": true,
+                "isWritable": true
+              },
+              {
+                "name": "curve",
+                "pubkey": "6epuRPtABtf9xZYDJVzDBc7iuCSGdoWG7xfCG9isxddS",
+                "isSigner": false,
+                "isWritable": true
+              },
+              {
+                "name": "payer",
+                "pubkey": "9WEcBMSRNFyDsyZ964sGRQU7AR8VBchbUmxEHve8ejv5",
+                "isSigner": true,
+                "isWritable": true
+              }
+            ]
+          }
+        }
+      ]
+    }
+  }
+]

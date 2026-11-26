@@ -532,3 +532,73 @@ test("M4: leaderboard responses are cached briefly", async () => {
     assert.ok((await s.get("/leaderboard?window=7d&by=trades&limit=10")).body.entries.length > 0, "other keys are fresh");
   } finally { s.stop(); }
 });
+
+// ---------------------------------------------------------------------------
+// Helius parsed-events format (https://www.helius.dev/docs/parsed-events/parsed-response.md), alongside enhanced transactions.
+// The documented webhook behaviour is "leave Enhanced Transaction webhook payload handling unchanged", so delivery of the new
+// shape to /webhooks/helius is unverified; these tests cover the documented REST response shape fed through the same ingest.
+// ---------------------------------------------------------------------------
+import { isParsedEvent, normalizeTransaction } from "../dist/indexer/helius.js";
+
+test("parsed events: the Quickstart swap normalises to a Trade", () => {
+  const [ev] = fixture("parsed-events-swap-quickstart");
+  assert.equal(isParsedEvent(ev), true);
+  assert.equal(isParsedEvent(fixture("swap-buy-jupiter")[0]), false);
+  const n = normalizeTransaction(ev);
+  assert.deepEqual([n.timestamp, n.slot, n.type, n.source], [1784487060, 433950192, "SWAP", "JUPITER"]);
+  const p = parseTransaction(ev);
+  assert.equal(p.trades.length, 1);
+  const t = p.trades[0];
+  assert.deepEqual([t.wallet, t.mint, t.side, t.quote, t.source, t.slot, t.timestamp], ["GV6UUmNxz2RpKxmNAPadYKb7uQpszwqQAu3qLJxVdC52", "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn", "buy", "SOL", "JUPITER", 433950192, 1784487060]);
+  close(t.tokenAmount, 64672839.26195, "rawTokenAmount / 10^decimals");
+  close(t.quoteAmount, 1498.5, "wSOL leg counts as SOL");
+  assert.equal(p.transfers.length, 0, "a trade's legs are not funding");
+});
+
+test("parsed events: error status, failed transaction and a null blockTime are dropped", () => {
+  const [ev] = fixture("parsed-events-swap-quickstart");
+  assert.equal(parseTransaction({ signature: ev.signature, parserStatus: "ERROR", parserError: { code: "x", message: "y" } }), null);
+  assert.equal(parseTransaction({ ...ev, parsed: { ...ev.parsed, transactionStatus: "ERROR", error: { InstructionError: [0, "Custom"] } } }), null);
+  assert.equal(parseTransaction({ ...ev, parsed: { ...ev.parsed, blockTime: null } }), null);
+  assert.equal(parseTransaction({ ...ev, parserStatus: "OK", parsed: undefined }), null);
+});
+
+test("parsed events: sponsored trades attribute to the signing trader and skip INDEXER_SPONSOR_ADDRESSES", () => {
+  const [buyEv, sellEv] = fixture("parsed-events-sponsored");
+  const [buyOld, sellOld] = fixture("sponsored");
+  assert.deepEqual(normalizeTransaction(buyEv).signers.sort(), [SPONSOR, TRADER].sort());
+  for (const [ev, old] of [[buyEv, buyOld], [sellEv, sellOld]]) {
+    const a = parseSwap(ev, { sponsors: SPONSORS });
+    const b = parseSwap(old, { sponsors: SPONSORS });
+    assert.equal(a.wallet, TRADER);
+    assert.deepEqual([a.side, a.tokenAmount, a.quote, a.slot, a.timestamp], [b.side, b.tokenAmount, b.quote, b.slot, b.timestamp], "both formats agree");
+    close(a.quoteAmount, b.quoteAmount);
+  }
+  // Unconfigured, the fee-payer sponsor still wins as in the old format (it is a signer and took a token fee).
+  assert.equal(parseSwap(buyEv).wallet, SPONSOR);
+  // Signer required: a non-signing wallet is never the trader, even if it is the only one with a token delta.
+  const noTraderSigner = structuredClone(sellEv);
+  for (const i of noTraderSigner.parsed.instructions) for (const a of i.decoded.accounts) if (a.pubkey === TRADER) a.isSigner = false;
+  assert.equal(parseSwap(noTraderSigner, { sponsors: SPONSORS }), null);
+  // An incoming enhanced transaction cannot smuggle in a signer list.
+  assert.equal(parseSwap({ ...sellOld, signers: [CURVE] }, { sponsors: SPONSORS }).wallet, TRADER);
+});
+
+test("parsed events: without decoded signer flags the old inference applies", () => {
+  const [, sellEv] = fixture("parsed-events-sponsored");
+  const bare = structuredClone(sellEv);
+  bare.parsed.instructions = [];
+  assert.equal(normalizeTransaction(bare).signers, undefined);
+  assert.equal(parseSwap(bare, { sponsors: SPONSORS }), null, "ambiguous without account order: no trade rather than a wrong trader");
+});
+
+test("parsed events: webhook ingest accepts both formats in one batch", async () => {
+  const s = await startServer(undefined, { sponsorAddresses: [SPONSOR] });
+  try {
+    const mixed = [...fixture("parsed-events-sponsored"), fixture("swap-buy-jupiter")[0], ...fixture("parsed-events-swap-quickstart"), { signature: "x", parserStatus: "ERROR" }];
+    const r = await s.post(mixed);
+    assert.equal(r.status, 200);
+    const body = await r.json();
+    assert.deepEqual([body.received, body.skipped, body.duplicates, body.trades], [5, 1, 0, 4], JSON.stringify(body));
+  } finally { s.stop(); }
+});
