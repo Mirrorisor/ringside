@@ -298,7 +298,7 @@ export interface TxCheck {
   outflow: bigint;
 }
 
-type CheckIx = { program: Address; accounts: (Address | null)[]; data: Uint8Array };
+export type CheckIx = { program: Address; accounts: (Address | null)[]; data: Uint8Array };
 
 const refuse = (code: string, i: number | undefined, msg: string): never => {
   throw new JupiterError(0, code, i === undefined ? msg : `Instruction ${i}: ${msg}`);
@@ -314,7 +314,7 @@ export async function associatedTokenAddress(owner: Address, mint: Address, toke
 }
 
 /** Top-level instructions with addresses; accounts loaded from an unresolved lookup table are `null`. */
-function instructionsOf(wireBase64: string, lookups?: Record<Address, Address[]>): { ixs: CheckIx[]; v1PriorityFee: bigint } {
+export function instructionsOf(wireBase64: string, lookups?: Record<Address, Address[]>): { ixs: CheckIx[]; v1PriorityFee: bigint } {
   const tx = getTransactionDecoder().decode(Buffer.from(wireBase64, "base64"));
   const compiled = getCompiledTransactionMessageDecoder().decode(tx.messageBytes);
   if (compiled.version === 1) {

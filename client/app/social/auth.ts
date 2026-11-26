@@ -1,4 +1,5 @@
 import { social } from "./api";
+import { checkSiwsMessage } from "../../src/appcheck";
 
 /** What main.ts gives us: the active signer (connected wallet, else the local devnet key). */
 export interface Signer {
@@ -37,6 +38,8 @@ export const signedIn = (s: Signer) => !!token && tokenWallet === s.address();
 export async function signIn(s: Signer): Promise<void> {
   const wallet = s.address();
   const { message } = await social.nonce(wallet);
+  // Never sign a message another site could replay: it must name this site and this wallet, in the SIWS layout.
+  checkSiwsMessage(message, { host: location.host, wallet });
   const sig = await s.signMessage(new TextEncoder().encode(message));
   setToken(await social.verify(wallet, message, b64(sig)), wallet);
 }

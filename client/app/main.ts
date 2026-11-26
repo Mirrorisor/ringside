@@ -10,6 +10,7 @@ import {
 import { TransactionInstruction } from "@solana/web3.js";
 import { ed25519 } from "@noble/curves/ed25519.js";
 import { mountSocial } from "./social/screens";
+import { backendBase, devOverride } from "./social/config";
 import launchIdl from "../../target/idl/ringside_launch.json";
 import perpsIdl from "../../target/idl/ringside_perps.json";
 
@@ -25,10 +26,12 @@ const MAINNET = NETWORK === "mainnet";
 const NET = MAINNET
   ? { rpc: env.VITE_RPC, cpmm: "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C", ammConfig: "D4FPEruKEHrG5TenZ2mpDGEfu1iUvTiqBxvpU8HLBvC2", cluster: "", chain: "solana:mainnet" }
   : { rpc: "https://api.devnet.solana.com", cpmm: "DRaycpLY18LhpbydsBWbVJtxpNv9oXPgjRSfpF2bWpYb", ammConfig: "5MxLgy9oPdTC3YgkiePHqr3EoCRD9uLVYRQS2ANAs7wy", cluster: "?cluster=devnet", chain: "solana:devnet" };
-const RPC = params.get("rpc") ?? NET.rpc ?? "";
+const RPC = devOverride("rpc") ?? NET.rpc ?? "";
 if (!RPC) document.body.insertAdjacentHTML("afterbegin", "<p style='padding:16px;background:#d8382f;color:#fff'>Mainnet needs an RPC: add ?rpc=… or build with VITE_RPC.</p>");
-const RELAYER = params.get("relayer") ?? `${location.origin}/relayer`;
-const FAUCET = params.get("faucet") ?? `${location.origin}/faucet`;
+// Backend overrides (?relayer=, ?faucet=, ?rpc=, ?chain=) work only in dev builds and only for allowlisted origins (see social/config.ts):
+// a hostile relayer could name its own treasury as the USDC fee recipient.
+const RELAYER = backendBase("relayer", "/relayer");
+const FAUCET = backendBase("faucet", "/faucet");
 const USDC = 1_000_000;
 const TWAP_WINDOW = 750n;
 const BAND_BPS = 1500n;
@@ -68,7 +71,7 @@ const localWallet = loadKey("ringside.devnet.wallet");
 // connected, the devnet browser key above signs. The trading account stays a
 // separate fresh key either way (funded privately through Rings).
 // ---------------------------------------------------------------------------
-const CHAIN = params.get("chain") ?? NET.chain;
+const CHAIN = NET.chain; // not overridable by link
 type StdAccount = { address: string; publicKey: Uint8Array };
 let external: { name: string; wallet: any; account: StdAccount } | null = null;
 const wallet = {

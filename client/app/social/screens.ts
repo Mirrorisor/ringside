@@ -1,6 +1,8 @@
 import { ApiError, copy, indexer, social, sponsorSend, streamNotifications } from "./api";
 import { b64, getToken, signIn, signedIn, unb64, type Signer } from "./auth";
 import { ago, avatar, clear, fmt, h, shortAddr, sol, signed } from "./dom";
+import { AppCheckError, checkBuiltTransaction, describeBuilt, type BuiltView } from "../../src/appcheck";
+import { FEE_WALLET, SPONSOR, SPONSOR_ADDRESS } from "./config";
 import type { CopyIntent, CopySettings, LeaderRow, RiskFlag, TokenFlags, Trade, Window } from "./types";
 
 export interface Env { signer: Signer; mainnet: boolean; explorer: (sig: string) => string }
@@ -273,15 +275,11 @@ export function mountSocial(root: HTMLElement, tabs: HTMLElement, env: Env, onTa
   const SIDE_TEXT: Record<CopyIntent["side"], string> = { buy: "Buy", sell: "Sell", long: "Long", short: "Short", close: "Close" };
   const VENUE_TEXT: Record<CopyIntent["venue"], string> = { jupiter: "Jupiter", pumpfun: "Pump.fun", "ringside-perps": "Ringside perps (devnet)" };
   const amountText = (i: CopyIntent) => [
-    i.lamports !== undefined ? sol(i.lamports) : null,
+    // For a sell, intent.lamports is the leader's trade size, not what you will receive; proceeds come from the build.
+    i.lamports !== undefined && i.side !== "sell" ? sol(i.lamports) : null,
     i.tokens !== undefined ? `${i.tokens} tokens (base units)` : null,
     i.leverage !== undefined ? `${i.leverage}x leverage` : null,
   ].filter(Boolean).join(" · ") || "amount set when built";
-  const feeText = (d: Record<string, unknown> | null) => {
-    const f = d && (d.feeLamports ?? d.ringsideFeeLamports ?? d.fee);
-    const n = typeof f === "number" ? f : typeof f === "string" && /^\d+$/.test(f) ? Number(f) : null;
-    return n === null ? "No Ringside fee reported. Network fee is paid by the sponsor." : `${sol(n)} Ringside fee. Network fee is paid by the sponsor.`;
-  };
   const refusalOf = (d: Record<string, unknown> | null) => {
     const r = d && (d.refusal ?? d.refused ?? d.skipReason ?? d.reason);
     return typeof r === "string" ? r : null;
@@ -312,31 +310,73 @@ export function mountSocial(root: HTMLElement, tabs: HTMLElement, env: Env, onTa
     const buyish = i.side === "buy" || i.side === "long";
     const copyBtn = h("button", { class: buyish ? "long" : "short", style: "width:100%" }, `Copy ${SIDE_TEXT[i.side].toLowerCase()}`) as HTMLButtonElement;
     let expired = false;
-    const lines = (built: Record<string, unknown> | null) => [
+    const lines = (view: BuiltView | null) => [
       h("div", { class: "rows2" }, h("div", null, h("span", null, "Action"), h("b", null, `${SIDE_TEXT[i.side]} ${i.kind === "perp" ? "perp" : "spot"}`)),
         h("div", null, h("span", null, "Token"), mintLink(i.mint)),
-        h("div", null, h("span", null, "Amount"), h("b", null, amountText(i))),
-        h("div", null, h("span", null, "Venue"), h("b", null, VENUE_TEXT[i.venue] ?? "Unknown venue")),
-        h("div", null, h("span", null, "Fee"), h("b", null, feeText(built))),
+        h("div", null, h("span", null, "Requested"), h("b", null, amountText(i))),
+        ...(view ? reviewRows(view) : [h("div", null, h("span", null, "Venue"), h("b", null, VENUE_TEXT[i.venue] ?? "Unknown venue")), h("div", null, h("span", null, "Fee"), h("b", null, "Shown after the transaction is built."))]),
         h("div", null, h("span", null, "Copying"), walletLink(i.leader))),
     ];
+    const unk = (v: string | null) => v ?? "unknown";
+    // What will be signed, from the build response and the decoded transaction (never the leader's cost basis).
+    const reviewRows = (v: BuiltView) => {
+      const sell = i.side === "sell";
+      const out = (x: bigint | null) => (x === null ? "unknown" : sell ? sol(Number(x)) : `${x} tokens (base units)`);
+      return [
+        h("div", null, h("span", null, "Venue (in the transaction)"), h("b", null, VENUE_TEXT[i.venue] ?? unk(v.venue))),
+        h("div", null, h("span", null, sell ? "Expected proceeds" : "Expected output"), h("b", null, out(v.expectedOut))),
+        h("div", null, h("span", null, "Minimum after slippage"), h("b", null, out(v.minOut))),
+        h("div", null, h("span", null, "Ringside fee"), h("b", null, v.feeLamports === null ? "unknown" : `${sol(v.feeLamports)}. Network fee is paid by the sponsor.`)),
+      ];
+    };
     const setBusy = (b: boolean) => { copyBtn.disabled = b || expired; };
-    const show = (built: Record<string, unknown> | null) => { clear(body); body.append(...lines(built)); };
+    const show = (view: BuiltView | null) => { clear(body); body.append(...lines(view)); };
     show(null);
     if (i.kind === "perp") body.append(h("div", { class: "warn" }, "Experimental devnet perp. Leverage can lose more than spot."));
+
+    let sponsorAddr = SPONSOR_ADDRESS;
+    async function expectedSponsor(): Promise<string | null> {
+      if (sponsorAddr) return sponsorAddr;
+      try {
+        const r = await fetch(`${SPONSOR}/health`, { signal: AbortSignal.timeout(10_000) });
+        const d = (await r.json()) as { feePayer?: unknown };
+        if (typeof d.feePayer === "string" && isAddr(d.feePayer)) return (sponsorAddr = d.feePayer);
+      } catch { /* no sponsor: only the user may pay */ }
+      return null;
+    }
 
     async function run() {
       setBusy(true); out.className = "muted"; out.textContent = "Building transaction…";
       try {
         const built = await copy.build(i.id);
         const refusal = refusalOf(built);
-        show(built);
-        if (refusal) { out.className = "err"; out.textContent = `Refused: ${refusal}`; return; }
-        // Review step: the exact details are on screen before the wallet is asked to sign.
+        if (refusal) { show(describeBuilt(i.side, built, undefined)); out.className = "err"; out.textContent = `Refused: ${refusal}`; return; }
+        // Decode and check what the wallet would sign BEFORE showing a confirm button.
+        let view = describeBuilt(i.side, built, undefined);
+        const claimedFee = view.feeLamports;
+        let checked;
+        try {
+          checked = await checkBuiltTransaction(built.transaction, { user: env.signer.address(), sponsor: await expectedSponsor(), mint: i.mint, venue: i.venue, feeWallet: FEE_WALLET || null, feeLamports: claimedFee });
+        } catch (e) {
+          show(null); out.className = "err";
+          out.textContent = e instanceof AppCheckError ? e.message : `Refusing to sign: this transaction failed the safety check (${errMsg(e)}).`;
+          setBusy(false); return;
+        }
+        view = { ...describeBuilt(i.side, built, i.slippageBps), venue: checked.venues[0] };
+        view.unknown = view.unknown.filter((u) => u !== "venue");
+        show(view);
         clear(out); out.className = "";
-        const confirm = h("button", { class: "primary", onclick: () => void sign(built.transaction, confirm as HTMLButtonElement) }, "Confirm and sign");
+        const confirm = h("button", { class: "primary", onclick: () => void sign(built.transaction, confirm as HTMLButtonElement) }, "Confirm and sign") as HTMLButtonElement;
         const cancel = h("button", { onclick: () => { clear(out); setBusy(false); show(null); } }, "Cancel");
-        out.append(h("p", { class: "muted" }, "Review the details above, then confirm."), h("div", { class: "two" }, cancel, confirm));
+        const parts: Node[] = [h("p", { class: "muted" }, "Review the details above, then confirm. The transaction passed the safety check (fee payer, programs, transfers, token and approvals).")];
+        if (checked.feeLamportsInTx > 0n) parts.push(h("p", { class: "muted" }, `The transaction pays ${sol(Number(checked.feeLamportsInTx))} to the Ringside fee wallet.`));
+        if (view.unknown.length) {
+          const ack = h("input", { type: "checkbox", id: `ack-${i.id}`, onchange: () => { confirm.disabled = !(ack as HTMLInputElement).checked; } });
+          confirm.disabled = true;
+          parts.push(h("div", { class: "warn" }, `Unknown: ${view.unknown.join(", ")}. The service did not report these, so the app cannot show what you will get.`),
+            h("label", { for: `ack-${i.id}` }, ack, " I understand and want to sign anyway."));
+        }
+        out.append(...parts, h("div", { class: "two" }, cancel, confirm));
       } catch (e) {
         out.className = "err"; out.textContent = errMsg(e); setBusy(false);
       }
