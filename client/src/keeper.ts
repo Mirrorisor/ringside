@@ -285,17 +285,20 @@ export class Keeper {
         const ix = await this.positionIx(IX.liquidate, p, m);
         if (await this.wouldSucceed(ix)) await this.guard(p.key, () => this.sendIx(ix));
       }
-      // ADL: most profitable first, by an estimate at the band anchor. The
-      // program re-checks profitability at the real mark.
+      // ADL: highest profit ratio (PnL / collateral) first, by an estimate at the band
+      // anchor, the order the program checks. The program re-checks profitability at
+      // the real mark; it can't list positions itself, so the keeper passes the next
+      // ones as evidence it picked the top (ADL_EVIDENCE of them), and retries
+      // without them if the estimate and the real mark disagree on the order.
       for (const m of [...this.markets.values()].filter((x) => x.adlMode)) {
-        const ranked = positions
-          .filter((p) => p.market === m.key)
-          .map((p) => ({ p, pnl: estPnl(p, m.bandAnchorQ64) }))
-          .filter((x) => x.pnl > 0n)
-          .sort((a, b) => (b.pnl > a.pnl ? 1 : -1));
-        for (const { p } of ranked) {
-          const ix = await this.positionIx(IX.autoDeleverage, p, m);
-          if (!(await this.wouldSucceed(ix))) break; // budget restored or nothing left in profit
+        const ranked = rankForAdl(positions.filter((p) => p.market === m.key), m.bandAnchorQ64);
+        for (let i = 0; i < ranked.length; i++) {
+          const p = ranked[i];
+          const evidence = ranked.slice(i + 1, i + 1 + ADL_EVIDENCE).map((x) => ro(x.key));
+          let ix = await this.positionIx(IX.autoDeleverage, p, m);
+          const withEvidence = { ...ix, accounts: [...(ix.accounts ?? []), ...evidence] };
+          if (evidence.length && (await this.wouldSucceed(withEvidence))) ix = withEvidence;
+          else if (!(await this.wouldSucceed(ix))) break; // budget restored or nothing left in profit
           await this.guard(p.key, () => this.sendIx(ix));
         }
       }
@@ -575,6 +578,18 @@ export class Keeper {
 }
 
 /** Quanto PnL estimate in USDC base units at a Q64 price. */
+/** Profitable positions, highest unrealised profit ratio (PnL / collateral) first: the order the program's ADL check uses. */
+export function rankForAdl(positions: Position[], priceQ64: bigint): Position[] {
+  return positions
+    .map((p) => ({ p, ratio: (estPnl(p, priceQ64) * 1_000_000n) / (p.collateral > 0n ? p.collateral : 1n), pnl: estPnl(p, priceQ64) }))
+    .filter((x) => x.pnl > 0n)
+    .sort((a, b) => (b.ratio > a.ratio ? 1 : b.ratio < a.ratio ? -1 : 0))
+    .map((x) => x.p);
+}
+
+/** How many lower-ranked positions the keeper passes with an ADL call. */
+const ADL_EVIDENCE = 8;
+
 export function estPnl(p: Position, priceQ64: bigint): bigint {
   if (p.entryQ64 === 0n) return 0n;
   const change = ((priceQ64 - p.entryQ64) * p.sizeUsd) / p.entryQ64;

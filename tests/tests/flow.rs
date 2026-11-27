@@ -637,7 +637,7 @@ async fn launch_trade_and_perps_end_to_end() {
     let half = lp_state.shares / 2;
     let req_ix = Instruction {
         program_id: perps::ID,
-        accounts: perps::accounts::RequestWithdrawal { owner: lp.pubkey(), lp: lp_acc, request, system_program: system_program::ID }.to_account_metas(None),
+        accounts: perps::accounts::RequestWithdrawal { owner: lp.pubkey(), vault, vault_usdc, lp: lp_acc, request, system_program: system_program::ID }.to_account_metas(None),
         data: perps::instruction::RequestWithdrawal { shares: half }.data(),
     };
     env.send(&[req_ix], &[&lp]).await.unwrap();
@@ -657,7 +657,7 @@ async fn launch_trade_and_perps_end_to_end() {
     env.advance_clock(perps::WITHDRAW_DELAY_SECONDS + 1).await;
     env.warp(2).await;
     let vault_bal = env.token_balance(vault_usdc).await;
-    let expected = (half as u128 * perps::lp_assets(&v_before, vault_bal) as u128 / v_before.total_shares as u128) as u64;
+    let expected = perps::assets_for_shares(half, perps::lp_assets(&v_before, vault_bal), v_before.total_shares).unwrap();
     let usdc_before = env.token_balance(lp_usdc).await;
     env.send(&[withdraw], &[&lp]).await.unwrap();
     assert_eq!(env.token_balance(lp_usdc).await - usdc_before, expected, "paid at the vault's value at completion");
@@ -1231,6 +1231,15 @@ struct PerpsFx {
     vault_usdc: Pubkey,
     market: Pubkey,
     creator_usdc: Pubkey,
+    keeper: Keypair,
+    lp: Keypair,
+    sponsor: Keypair,
+    trader_usdc: Pubkey,
+    keeper_usdc: Pubkey,
+    lp_usdc: Pubkey,
+    lp_acc: Pubkey,
+    position: Pubkey,
+    order: Pubkey,
 }
 
 /// On top of `launch_only`: USDC mint, perps vault with LP liquidity, a market for
@@ -1388,7 +1397,7 @@ async fn perps_with_accrued_fees(l: &mut Launched) -> PerpsFx {
     let creator_usdc = l.env.usdc_account(&creator, 0).await;
     let m: perps::Market = l.env.get(market).await;
     assert_eq!(m.creator_fees + m.creator_fees_locked, 2_400, "creator gets 10% of the 24_000 fee on an $8 open at 0.30%");
-    PerpsFx { vault, vault_usdc, market, creator_usdc }
+    PerpsFx { vault, vault_usdc, market, creator_usdc, keeper, lp, sponsor, trader_usdc, keeper_usdc, lp_usdc, lp_acc, position, order }
 }
 
 fn perps_claim_ix(creator: Pubkey, fx: &PerpsFx, curve: Pubkey) -> Instruction {
@@ -2241,4 +2250,583 @@ async fn initialize_global_refuses_fees_above_the_caps() {
     let e = env.send(&[ix], &[&authority]).await.unwrap_err();
     assert_eq!(custom_error(e), launch::LaunchError::GraduationFeeAboveCap as u32 + 6000);
     env.send(&[init_global_ix(&env, authority.pubkey(), program_data)], &[&authority]).await.unwrap();
+// ---------------------------------------------------------------------------
+// LP / pause / insurance / ADL fixes (docs/security-fixes.md F2, F9, F5, F10)
+// ---------------------------------------------------------------------------
+
+
+const PERPS_ERR: u32 = 6000;
+fn perr(e: perps::PerpsError) -> u32 {
+    PERPS_ERR + e as u32
+}
+
+/// Rewrites an account through `f` (same size), to put the vault or a position in a
+/// state that would otherwise need a long market simulation.
+async fn edit<T: AccountSerialize + AccountDeserialize>(env: &mut Env, key: Pubkey, f: impl FnOnce(&mut T)) {
+    let mut acc = env.ctx.banks_client.get_account(key).await.unwrap().unwrap();
+    let mut v = T::try_deserialize(&mut acc.data.as_slice()).unwrap();
+    f(&mut v);
+    let mut out = Vec::new();
+    v.try_serialize(&mut out).unwrap();
+    assert_eq!(out.len(), acc.data.len());
+    acc.data = out;
+    env.ctx.set_account(&key, &solana_sdk::account::AccountSharedData::from(acc));
+}
+
+/// Mints USDC straight into `to` (the test's mint authority is the admin).
+async fn mint_usdc(env: &mut Env, to: Pubkey, amount: u64) {
+    let auth = env.authority.insecure_clone();
+    let mint = env.usdc_mint.pubkey();
+    env.send(&[spl_token::instruction::mint_to(&spl_token::ID, &mint, &to, &auth.pubkey(), &[], amount).unwrap()], &[&auth]).await.unwrap();
+}
+
+fn pda_position(owner: &Pubkey, market: &Pubkey, side: u8) -> Pubkey {
+    Pubkey::find_program_address(&[perps::SEED_POSITION, owner.as_ref(), market.as_ref(), &[side]], &perps::ID).0
+}
+fn pda_order(owner: &Pubkey, market: &Pubkey, side: u8) -> Pubkey {
+    Pubkey::find_program_address(&[perps::SEED_ORDER, owner.as_ref(), market.as_ref(), &[side]], &perps::ID).0
+}
+fn pda_withdrawal(owner: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[perps::SEED_WITHDRAWAL, owner.as_ref()], &perps::ID).0
+}
+fn pda_lp(owner: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[perps::SEED_LP, owner.as_ref()], &perps::ID).0
+}
+
+fn deposit_ix(vault: Pubkey, vault_usdc: Pubkey, owner: Pubkey, owner_usdc: Pubkey, amount: u64) -> Instruction {
+    Instruction {
+        program_id: perps::ID,
+        accounts: perps::accounts::Liquidity {
+            owner, vault, vault_usdc, lp: pda_lp(&owner), owner_usdc, token_program: spl_token::ID, system_program: system_program::ID,
+        }
+        .to_account_metas(None),
+        data: perps::instruction::DepositLiquidity { amount }.data(),
+    }
+}
+
+fn request_withdrawal_ix(vault: Pubkey, vault_usdc: Pubkey, owner: Pubkey, shares: u64) -> Instruction {
+    Instruction {
+        program_id: perps::ID,
+        accounts: perps::accounts::RequestWithdrawal {
+            owner, vault, vault_usdc, lp: pda_lp(&owner), request: pda_withdrawal(&owner), system_program: system_program::ID,
+        }
+        .to_account_metas(None),
+        data: perps::instruction::RequestWithdrawal { shares }.data(),
+    }
+}
+
+fn complete_withdrawal_ix(vault: Pubkey, vault_usdc: Pubkey, owner: Pubkey, owner_usdc: Pubkey) -> Instruction {
+    Instruction {
+        program_id: perps::ID,
+        accounts: perps::accounts::CompleteWithdrawal { owner, vault, vault_usdc, request: pda_withdrawal(&owner), owner_usdc, token_program: spl_token::ID }
+            .to_account_metas(None),
+        data: perps::instruction::WithdrawLiquidity {}.data(),
+    }
+}
+
+fn set_paused_ix(vault: Pubkey, authority: Pubkey, paused: bool) -> Instruction {
+    Instruction {
+        program_id: perps::ID,
+        accounts: perps::accounts::AdminVault { authority, vault }.to_account_metas(None),
+        data: perps::instruction::SetPaused { paused }.data(),
+    }
+}
+
+/// The widest acceptable price for an order (a bound is required, not a limit these tests care about).
+fn loosest_bound(side: u8, kind: u8) -> u128 {
+    if (kind == perps::ORDER_INCREASE) == (side == perps::SIDE_LONG) { u128::MAX } else { 1 }
+}
+
+fn order_ix(l: &Launched, fx: &PerpsFx, owner: Pubkey, owner_usdc: Pubkey, side: u8, kind: u8, collateral: u64, size_usd: u64) -> Instruction {
+    Instruction {
+        program_id: perps::ID,
+        accounts: perps::accounts::RequestOrder {
+            owner,
+            payer: fx.sponsor.pubkey(),
+            vault: fx.vault,
+            vault_usdc: fx.vault_usdc,
+            market: fx.market,
+            position: pda_position(&owner, &fx.market, side),
+            order: pda_order(&owner, &fx.market, side),
+            owner_usdc,
+            token_program: spl_token::ID,
+            system_program: system_program::ID,
+        }
+        .to_account_metas(None),
+        data: perps::instruction::RequestOrder { args: perps::OrderArgs { side, kind, collateral, size_usd, acceptable_price_q64: loosest_bound(side, kind) } }.data(),
+    }
+    .tap(|_| { let _ = l; })
+}
+
+fn execute_ix(l: &Launched, fx: &PerpsFx, owner: Pubkey, owner_usdc: Pubkey, side: u8) -> Instruction {
+    Instruction {
+        program_id: perps::ID,
+        accounts: perps::accounts::ExecuteOrder {
+            keeper: fx.keeper.pubkey(),
+            vault: fx.vault,
+            vault_usdc: fx.vault_usdc,
+            market: fx.market,
+            curve: l.curve,
+            rent_payer: fx.sponsor.pubkey(),
+            order: pda_order(&owner, &fx.market, side),
+            position: pda_position(&owner, &fx.market, side),
+            owner_usdc,
+            keeper_usdc: fx.keeper_usdc,
+            token_program: spl_token::ID,
+        }
+        .to_account_metas(None),
+        data: perps::instruction::ExecuteOrder {}.data(),
+    }
+}
+
+fn position_ix(l: &Launched, fx: &PerpsFx, position: Pubkey, owner_usdc: Pubkey, liquidate: bool) -> Instruction {
+    Instruction {
+        program_id: perps::ID,
+        accounts: perps::accounts::Liquidate {
+            keeper: fx.keeper.pubkey(),
+            vault: fx.vault,
+            vault_usdc: fx.vault_usdc,
+            market: fx.market,
+            curve: l.curve,
+            position,
+            owner_usdc,
+            keeper_usdc: fx.keeper_usdc,
+            token_program: spl_token::ID,
+        }
+        .to_account_metas(None),
+        data: if liquidate { perps::instruction::Liquidate {}.data() } else { perps::instruction::AutoDeleverage {}.data() },
+    }
+}
+
+trait Tap: Sized {
+    fn tap(self, f: impl FnOnce(&Self)) -> Self {
+        f(&self);
+        self
+    }
+}
+impl Tap for Instruction {}
+
+/// The LP's USDC value of `shares` right now (what an immediate redemption would pay).
+async fn lp_value_of(l: &mut Launched, fx: &PerpsFx, shares: u64) -> u64 {
+    let v: perps::Vault = l.env.get(fx.vault).await;
+    let bal = l.env.token_balance(fx.vault_usdc).await;
+    perps::assets_for_shares(shares, perps::lp_assets(&v, bal), v.total_shares).unwrap()
+}
+
+// --- F2: the claim window and the lower-of price ------------------------------
+
+#[tokio::test]
+async fn f2_expired_withdrawal_cannot_complete_and_re_request_restarts_the_delay() {
+    let (mut l, fx) = perps_market().await;
+    let lp = fx.lp.insecure_clone();
+    let lp_state: perps::LpAccount = l.env.get(fx.lp_acc).await;
+    let (a, b) = (lp_state.shares / 4, lp_state.shares / 4);
+    let t0 = l.env.ctx.banks_client.get_sysvar::<solana_sdk::clock::Clock>().await.unwrap().unix_timestamp;
+    l.env.send(&[request_withdrawal_ix(fx.vault, fx.vault_usdc, lp.pubkey(), a)], &[&lp]).await.unwrap();
+    let unlock = t0 + perps::WITHDRAW_DELAY_SECONDS;
+    let done = complete_withdrawal_ix(fx.vault, fx.vault_usdc, lp.pubkey(), fx.lp_usdc);
+
+    // Last second of the window still pays; the second after it is expired.
+    l.env.set_time(unlock + perps::WITHDRAWAL_WINDOW_SECONDS + 1).await;
+    let err = l.env.send(&[done.clone()], &[&lp]).await.unwrap_err();
+    assert_eq!(custom_error(err), perr(perps::PerpsError::WithdrawalExpired), "expired request cannot be completed");
+    // The shares are still in the request: cancel is free and returns them.
+    let req: perps::WithdrawalRequest = l.env.get(pda_withdrawal(&lp.pubkey())).await;
+    assert_eq!(req.shares, a);
+
+    // Requesting again restarts the delay (and adds to the request).
+    let now = unlock + perps::WITHDRAWAL_WINDOW_SECONDS + 1;
+    l.env.send(&[request_withdrawal_ix(fx.vault, fx.vault_usdc, lp.pubkey(), b)], &[&lp]).await.unwrap();
+    let req: perps::WithdrawalRequest = l.env.get(pda_withdrawal(&lp.pubkey())).await;
+    assert_eq!((req.shares, req.unlock_ts), (a + b, now + perps::WITHDRAW_DELAY_SECONDS));
+    l.env.warp(1).await;
+    let err = l.env.send(&[done.clone()], &[&lp]).await.unwrap_err();
+    assert_eq!(custom_error(err), perr(perps::PerpsError::WithdrawalLocked), "locked again");
+    l.env.set_time(req.unlock_ts + perps::WITHDRAWAL_WINDOW_SECONDS).await; // last valid second
+    let usdc_before = l.env.token_balance(fx.lp_usdc).await;
+    let shares_before: perps::Vault = l.env.get(fx.vault).await;
+    l.env.send(&[done], &[&lp]).await.unwrap();
+    assert!(l.env.token_balance(fx.lp_usdc).await > usdc_before);
+    let v: perps::Vault = l.env.get(fx.vault).await;
+    assert_eq!(v.total_shares, shares_before.total_shares - (a + b), "exactly the request's shares were burned");
+}
+
+#[tokio::test]
+async fn f2_withdrawal_pays_the_lower_of_request_and_completion_price() {
+    // Price rises after the request: the leaver does not share the gain.
+    let (mut l, fx) = perps_market().await;
+    let lp = fx.lp.insecure_clone();
+    let shares = (l.env.get::<perps::LpAccount>(fx.lp_acc).await).shares / 2;
+    let v0: perps::Vault = l.env.get(fx.vault).await;
+    let bal0 = l.env.token_balance(fx.vault_usdc).await;
+    let at_request = perps::assets_for_shares(shares, perps::lp_assets(&v0, bal0), v0.total_shares).unwrap();
+    l.env.send(&[request_withdrawal_ix(fx.vault, fx.vault_usdc, lp.pubkey(), shares)], &[&lp]).await.unwrap();
+    mint_usdc(&mut l.env, fx.vault_usdc, 5_000 * USDC).await; // vault gains $5,000
+    let now_value = lp_value_of(&mut l, &fx, shares).await;
+    assert!(now_value > at_request + 1_000 * USDC, "completion price is much higher");
+    l.env.advance_clock(perps::WITHDRAW_DELAY_SECONDS + 1).await;
+    l.env.warp(2).await;
+    let before = l.env.token_balance(fx.lp_usdc).await;
+    l.env.send(&[complete_withdrawal_ix(fx.vault, fx.vault_usdc, lp.pubkey(), fx.lp_usdc)], &[&lp]).await.unwrap();
+    assert_eq!(l.env.token_balance(fx.lp_usdc).await - before, at_request, "paid at the request-time price");
+
+    // Price falls after the request: the leaver takes the loss.
+    let (mut l, fx) = perps_market().await;
+    let lp = fx.lp.insecure_clone();
+    let shares = (l.env.get::<perps::LpAccount>(fx.lp_acc).await).shares / 2;
+    let v0: perps::Vault = l.env.get(fx.vault).await;
+    let bal0 = l.env.token_balance(fx.vault_usdc).await;
+    let at_request = perps::assets_for_shares(shares, perps::lp_assets(&v0, bal0), v0.total_shares).unwrap();
+    l.env.send(&[request_withdrawal_ix(fx.vault, fx.vault_usdc, lp.pubkey(), shares)], &[&lp]).await.unwrap();
+    edit::<perps::Vault>(&mut l.env, fx.vault, |v| v.trader_collateral += 4_000 * USDC).await; // LP assets drop by $4,000
+    let now_value = lp_value_of(&mut l, &fx, shares).await;
+    assert!(now_value + 1_000 * USDC < at_request, "completion price is much lower");
+    l.env.advance_clock(perps::WITHDRAW_DELAY_SECONDS + 1).await;
+    l.env.warp(2).await;
+    let before = l.env.token_balance(fx.lp_usdc).await;
+    l.env.send(&[complete_withdrawal_ix(fx.vault, fx.vault_usdc, lp.pubkey(), fx.lp_usdc)], &[&lp]).await.unwrap();
+    assert_eq!(l.env.token_balance(fx.lp_usdc).await - before, now_value, "paid at the completion price");
+    let v: perps::Vault = l.env.get(fx.vault).await;
+    assert_eq!(v.total_shares, v0.total_shares - shares);
+}
+
+// --- F9: share inflation --------------------------------------------------------
+
+async fn empty_vault(env: &mut Env) -> (Pubkey, Pubkey) {
+    let authority = env.authority.insecure_clone();
+    let usdc = env.usdc_mint.insecure_clone();
+    let rent = env.ctx.banks_client.get_rent().await.unwrap();
+    let payer = env.ctx.payer.pubkey();
+    env.send(
+        &[
+            system_instruction::create_account(&payer, &usdc.pubkey(), rent.minimum_balance(82), 82, &spl_token::ID),
+            spl_token::instruction::initialize_mint(&spl_token::ID, &usdc.pubkey(), &authority.pubkey(), None, 6).unwrap(),
+        ],
+        &[&usdc],
+    )
+    .await
+    .unwrap();
+    let (vault, _) = Pubkey::find_program_address(&[perps::SEED_VAULT], &perps::ID);
+    let (vault_usdc, _) = Pubkey::find_program_address(&[perps::SEED_VAULT_USDC], &perps::ID);
+    env.send(&[init_vault_ix(authority.pubkey(), usdc.pubkey(), program_data_of(perps::ID))], &[&authority]).await.unwrap();
+    (vault, vault_usdc)
+}
+
+#[tokio::test]
+async fn f9_donation_to_an_empty_vault_does_not_steal_the_next_deposit() {
+    let mut env = setup().await;
+    let (vault, vault_usdc) = empty_vault(&mut env).await;
+    let (attacker, victim) = (Keypair::new(), Keypair::new());
+    env.fund(attacker.pubkey(), SOL).await;
+    env.fund(victim.pubkey(), SOL).await;
+    let a_usdc = env.usdc_account(&attacker.pubkey(), 1_000_001 * USDC).await;
+    let v_usdc = env.usdc_account(&victim.pubkey(), 1_000 * USDC).await;
+    // 1 unit in, then the rest donated straight to the vault's token account.
+    env.send(&[deposit_ix(vault, vault_usdc, attacker.pubkey(), a_usdc, 1)], &[&attacker]).await.unwrap();
+    env.send(
+        &[spl_token::instruction::transfer(&spl_token::ID, &a_usdc, &vault_usdc, &attacker.pubkey(), &[], 1_000_000 * USDC).unwrap()],
+        &[&attacker],
+    )
+    .await
+    .unwrap();
+    env.send(&[deposit_ix(vault, vault_usdc, victim.pubkey(), v_usdc, 1_000 * USDC)], &[&victim]).await.unwrap();
+
+    let v: perps::Vault = env.get(vault).await;
+    let bal = env.token_balance(vault_usdc).await;
+    let assets = perps::lp_assets(&v, bal);
+    let vs: perps::LpAccount = env.get(pda_lp(&victim.pubkey())).await;
+    let as_: perps::LpAccount = env.get(pda_lp(&attacker.pubkey())).await;
+    assert!(vs.shares > 0);
+    let victim_value = perps::assets_for_shares(vs.shares, assets, v.total_shares).unwrap();
+    let attacker_value = perps::assets_for_shares(as_.shares, assets, v.total_shares).unwrap();
+    // Within a couple of share-prices of rounding (one share is worth ~$0.5 here), and nowhere near the old outcome (victim ~0).
+    assert!(victim_value + 2 * USDC >= 1_000 * USDC, "victim keeps their deposit, got {victim_value}");
+    assert!(attacker_value < 1_000_001 * USDC, "attacker lost money: {attacker_value}");
+    assert!(victim_value + attacker_value <= assets, "never pays out more than the vault holds");
+}
+
+#[tokio::test]
+async fn f9_vault_with_shares_but_no_assets_refuses_deposits() {
+    let mut env = setup().await;
+    let (vault, vault_usdc) = empty_vault(&mut env).await;
+    let (lp, late) = (Keypair::new(), Keypair::new());
+    env.fund(lp.pubkey(), SOL).await;
+    env.fund(late.pubkey(), SOL).await;
+    let lp_usdc = env.usdc_account(&lp.pubkey(), 100 * USDC).await;
+    let late_usdc = env.usdc_account(&late.pubkey(), 100 * USDC).await;
+    env.send(&[deposit_ix(vault, vault_usdc, lp.pubkey(), lp_usdc, 100 * USDC)], &[&lp]).await.unwrap();
+    // Trader profit (modelled as collateral owed) leaves the LPs with nothing.
+    edit::<perps::Vault>(&mut env, vault, |v| v.trader_collateral = 100 * USDC).await;
+    let v: perps::Vault = env.get(vault).await;
+    assert_eq!(perps::lp_assets(&v, env.token_balance(vault_usdc).await), 0);
+    let err = env.send(&[deposit_ix(vault, vault_usdc, late.pubkey(), late_usdc, 10 * USDC)], &[&late]).await.unwrap_err();
+    assert_eq!(custom_error(err), perr(perps::PerpsError::VaultHasNoAssets));
+    assert_eq!(env.token_balance(late_usdc).await, 100 * USDC, "nothing moved");
+}
+
+// --- F5: pause and insurance -----------------------------------------------------
+
+#[tokio::test]
+async fn f5_pause_is_admin_only_blocks_opens_and_deposits_but_not_exits() {
+    let (mut l, fx) = perps_market().await;
+    let (admin, lp, trader) = (l.env.authority.insecure_clone(), fx.lp.insecure_clone(), l.trader.insecure_clone());
+    let sponsor = fx.sponsor.insecure_clone();
+    let keeper = fx.keeper.insecure_clone();
+
+    // Only the vault admin can pause.
+    let err = l.env.send(&[set_paused_ix(fx.vault, trader.pubkey(), true)], &[&trader]).await.unwrap_err();
+    assert_eq!(custom_error(err), 2001, "has_one authority");
+    assert!(!(l.env.get::<perps::Vault>(fx.vault).await).paused);
+
+    // An increase queued before the pause (short side, escrows collateral).
+    let before = l.env.token_balance(fx.trader_usdc).await;
+    l.env.send(&[order_ix(&l, &fx, trader.pubkey(), fx.trader_usdc, perps::SIDE_SHORT, perps::ORDER_INCREASE, 3 * USDC, 4 * USDC)], &[&trader, &sponsor]).await.unwrap();
+    assert_eq!(l.env.token_balance(fx.trader_usdc).await, before - 3 * USDC);
+
+    l.env.send(&[set_paused_ix(fx.vault, admin.pubkey(), true)], &[&admin]).await.unwrap();
+    assert!((l.env.get::<perps::Vault>(fx.vault).await).paused);
+
+    // New increase orders and LP deposits are refused.
+    l.env.warp(1).await;
+    let err = l.env.send(&[order_ix(&l, &fx, trader.pubkey(), fx.trader_usdc, perps::SIDE_LONG, perps::ORDER_INCREASE, 3 * USDC, 4 * USDC)], &[&trader, &sponsor]).await.unwrap_err();
+    assert_eq!(custom_error(err), perr(perps::PerpsError::Paused));
+    let err = l.env.send(&[deposit_ix(fx.vault, fx.vault_usdc, lp.pubkey(), fx.lp_usdc, USDC)], &[&lp]).await.unwrap_err();
+    assert_eq!(custom_error(err), perr(perps::PerpsError::Paused));
+
+    // The queued increase is refunded when the keeper reaches it, not filled.
+    l.env.warp(5).await;
+    l.env.send(&[execute_ix(&l, &fx, trader.pubkey(), fx.trader_usdc, perps::SIDE_SHORT)], &[&keeper]).await.unwrap();
+    assert_eq!(l.env.token_balance(fx.trader_usdc).await, before, "collateral refunded");
+    let p: perps::Position = l.env.get(pda_position(&trader.pubkey(), &fx.market, perps::SIDE_SHORT)).await;
+    assert_eq!(p.size_usd, 0);
+
+    // Closing still works: request and fill.
+    l.env.warp(1).await;
+    l.env.send(&[order_ix(&l, &fx, trader.pubkey(), fx.trader_usdc, perps::SIDE_LONG, perps::ORDER_CLOSE, 0, 0)], &[&trader, &sponsor]).await.unwrap();
+    l.env.warp(5).await;
+    l.env.send(&[execute_ix(&l, &fx, trader.pubkey(), fx.trader_usdc, perps::SIDE_LONG)], &[&keeper]).await.unwrap();
+    assert_eq!((l.env.get::<perps::Position>(fx.position).await).size_usd, 0, "closed while paused");
+
+    // LP withdrawal runs both steps while paused.
+    let shares = (l.env.get::<perps::LpAccount>(fx.lp_acc).await).shares / 10;
+    l.env.send(&[request_withdrawal_ix(fx.vault, fx.vault_usdc, lp.pubkey(), shares)], &[&lp]).await.unwrap();
+    l.env.advance_clock(perps::WITHDRAW_DELAY_SECONDS + 1).await;
+    l.env.warp(2).await;
+    let lp_before = l.env.token_balance(fx.lp_usdc).await;
+    l.env.send(&[complete_withdrawal_ix(fx.vault, fx.vault_usdc, lp.pubkey(), fx.lp_usdc)], &[&lp]).await.unwrap();
+    assert!(l.env.token_balance(fx.lp_usdc).await > lp_before);
+
+    // Liquidation runs while paused: open a position first (unpause), break it, pause, liquidate.
+    l.env.send(&[set_paused_ix(fx.vault, admin.pubkey(), false)], &[&admin]).await.unwrap();
+    // The withdrawal wait made the SOL price stale; push a fresh one (price authority = admin).
+    l.env.send(&[Instruction {
+        program_id: perps::ID,
+        accounts: perps::accounts::SetSolPrice { price_authority: admin.pubkey(), vault: fx.vault }.to_account_metas(None),
+        data: perps::instruction::SetSolPrice { price_e6: 150 * USDC }.data(),
+    }], &[&admin]).await.unwrap();
+    l.env.warp(1).await;
+    l.env.send(&[order_ix(&l, &fx, trader.pubkey(), fx.trader_usdc, perps::SIDE_LONG, perps::ORDER_INCREASE, 4_300_000, 8 * USDC)], &[&trader, &sponsor]).await.unwrap();
+    l.env.warp(5).await;
+    l.env.send(&[execute_ix(&l, &fx, trader.pubkey(), fx.trader_usdc, perps::SIDE_LONG)], &[&keeper]).await.unwrap();
+    edit::<perps::Position>(&mut l.env, fx.position, |p| p.entry_price_q64 *= 3).await; // deep underwater
+    l.env.send(&[set_paused_ix(fx.vault, admin.pubkey(), true)], &[&admin]).await.unwrap();
+    l.env.warp(1).await;
+    l.env.send(&[position_ix(&l, &fx, fx.position, fx.trader_usdc, true)], &[&keeper]).await.unwrap();
+    assert_eq!((l.env.get::<perps::Position>(fx.position).await).size_usd, 0, "liquidated while paused");
+
+    // Resuming reopens deposits.
+    l.env.send(&[set_paused_ix(fx.vault, admin.pubkey(), false)], &[&admin]).await.unwrap();
+    l.env.warp(1).await;
+    l.env.send(&[deposit_ix(fx.vault, fx.vault_usdc, lp.pubkey(), fx.lp_usdc, USDC)], &[&lp]).await.unwrap();
+}
+
+#[tokio::test]
+async fn f5_insurance_pays_a_profitable_close_before_lps_do() {
+    // Close the same winning position twice (fresh markets): once with $5 of
+    // insurance, once with none. LPs lose exactly the insurance spent less.
+    let mut lp_loss = Vec::new();
+    let mut spent_seen = 0;
+    for insurance in [0u64, 5 * USDC] {
+        let (mut l, fx) = perps_market().await;
+        let trader = l.trader.insecure_clone();
+        let (sponsor, keeper) = (fx.sponsor.insecure_clone(), fx.keeper.insecure_clone());
+        if insurance > 0 {
+            mint_usdc(&mut l.env, fx.vault_usdc, insurance).await;
+            edit::<perps::Market>(&mut l.env, fx.market, |m| m.insurance += insurance).await;
+            edit::<perps::Vault>(&mut l.env, fx.vault, |v| v.reserved += insurance).await;
+        }
+        assert_reserved_consistent(&mut l, &fx).await;
+        // Make the long a winner: entry at half the price, so about +$8 on $8.
+        edit::<perps::Position>(&mut l.env, fx.position, |p| p.entry_price_q64 /= 2).await;
+        l.env.warp(1).await;
+        l.env.send(&[order_ix(&l, &fx, trader.pubkey(), fx.trader_usdc, perps::SIDE_LONG, perps::ORDER_CLOSE, 0, 0)], &[&trader, &sponsor]).await.unwrap();
+        l.env.warp(5).await;
+        let (lp0, pos): (u64, perps::Position) = {
+            let v: perps::Vault = l.env.get(fx.vault).await;
+            let b = l.env.token_balance(fx.vault_usdc).await;
+            (perps::lp_assets(&v, b), l.env.get(fx.position).await)
+        };
+        let m0: perps::Market = l.env.get(fx.market).await;
+        let t0 = l.env.token_balance(fx.trader_usdc).await;
+        l.env.send(&[execute_ix(&l, &fx, trader.pubkey(), fx.trader_usdc, perps::SIDE_LONG)], &[&keeper]).await.unwrap();
+        let payout = l.env.token_balance(fx.trader_usdc).await - t0;
+        let fee = 24_000u64; // 0.30% of $8
+        let realized = payout as i128 + fee as i128 - pos.collateral as i128;
+        assert!(realized > 7 * USDC as i128, "a real win: {realized}");
+        let (lp1, m1) = {
+            let v: perps::Vault = l.env.get(fx.vault).await;
+            let b = l.env.token_balance(fx.vault_usdc).await;
+            (perps::lp_assets(&v, b), l.env.get::<perps::Market>(fx.market).await)
+        };
+        let spent = (m0.insurance + 2_400) as i128 - m1.insurance as i128; // 2,400 = the close fee's insurance cut
+        assert_eq!(m1.trader_net_pnl, m0.trader_net_pnl + realized - spent, "net profit is net of insurance spent");
+        if insurance > 0 {
+            assert_eq!(m1.insurance, 0, "all of it went before any LP money");
+            assert_eq!(spent, (insurance + 4_800) as i128);
+            spent_seen = spent;
+        } else {
+            assert_eq!(spent, 4_800, "the open fee's and the close fee's insurance cuts, applied at once");
+        }
+        // LP assets: +60% of the fee, minus the winnings, plus insurance spent.
+        assert_eq!(lp1 as i128 - lp0 as i128, 14_400 - (realized - spent));
+        assert_reserved_consistent(&mut l, &fx).await;
+        lp_loss.push((realized, spent));
+    }
+    assert!(spent_seen > 5 * USDC as i128 && lp_loss[1].1 > lp_loss[0].1);
+}
+
+// --- F10: ADL ---------------------------------------------------------------------
+
+async fn into_adl(l: &mut Launched, fx: &PerpsFx, net_pnl: i128) {
+    edit::<perps::Market>(&mut l.env, fx.market, |m| {
+        m.trader_net_pnl = net_pnl;
+        m.reduce_only = true;
+        m.adl_mode = true;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn f10_adl_mode_clears_once_the_market_recovers_and_not_before() {
+    let (mut l, fx) = perps_market().await;
+    let (admin, lp, keeper) = (l.env.authority.insecure_clone(), fx.lp.insecure_clone(), fx.keeper.insecure_clone());
+    // Budget is 0.25% of ~$10,000 = $25. Net trader profit of $24: still in ADL, above 80% of the budget.
+    into_adl(&mut l, &fx, 24 * USDC as i128).await;
+    // The position is profitable at the mark; with the budget spent that is what ADL closes. Make it not so
+    // here (loss), so a call that does nothing can't be mistaken for one that closes it.
+    edit::<perps::Position>(&mut l.env, fx.position, |p| p.entry_price_q64 *= 2).await;
+    let adl = position_ix(&l, &fx, fx.position, fx.trader_usdc, false);
+    l.env.warp(1).await;
+    let err = l.env.send(&[adl.clone()], &[&keeper]).await.unwrap_err();
+    assert_eq!(custom_error(err), perr(perps::PerpsError::NotProfitable), "no profitable target, still in ADL mode");
+    assert!((l.env.get::<perps::Market>(fx.market).await).adl_mode);
+
+    // LPs deposit: the budget grows ($40,000 more, budget $125), $24 is now under 80% of it.
+    let big = l.env.usdc_account(&admin.pubkey(), 40_000 * USDC).await;
+    l.env.send(&[deposit_ix(fx.vault, fx.vault_usdc, admin.pubkey(), big, 40_000 * USDC)], &[&admin]).await.unwrap();
+    l.env.warp(1).await;
+    l.env.send(&[adl.clone()], &[&keeper]).await.unwrap();
+    let m: perps::Market = l.env.get(fx.market).await;
+    assert!(!m.adl_mode, "ADL mode cleared");
+    assert!(m.reduce_only, "still reduce-only until the admin lifts it");
+    assert_eq!((l.env.get::<perps::Position>(fx.position).await).size_usd, 8 * USDC, "nobody was deleveraged by the clearing call");
+    l.env.warp(1).await;
+    let err = l.env.send(&[adl], &[&keeper]).await.unwrap_err();
+    assert_eq!(custom_error(err), perr(perps::PerpsError::NotAdl));
+
+    // The admin reopens the market.
+    l.env.send(&[Instruction {
+        program_id: perps::ID,
+        accounts: perps::accounts::AdminMarket { authority: admin.pubkey(), vault: fx.vault, market: fx.market, curve: l.curve }.to_account_metas(None),
+        data: perps::instruction::SetMarketLimits { oi_cap_override: 0, reduce_only: false }.data(),
+    }], &[&admin]).await.unwrap();
+    assert!(!(l.env.get::<perps::Market>(fx.market).await).reduce_only);
+
+    // Hysteresis: between 80% and 100% of the budget a market that is in ADL stays there.
+    let _ = lp;
+    into_adl(&mut l, &fx, 110 * USDC as i128).await; // budget is ~$125: 88%
+    edit::<perps::Position>(&mut l.env, fx.position, |p| p.entry_price_q64 /= 3).await; // winning again
+    l.env.warp(1).await;
+    // (ADL call itself closes the winner here; the mode stays on.)
+    let adl = position_ix(&l, &fx, fx.position, fx.trader_usdc, false);
+    l.env.send(&[adl], &[&keeper]).await.unwrap();
+    assert!((l.env.get::<perps::Market>(fx.market).await).adl_mode, "88% of budget: still ADL");
+}
+
+#[tokio::test]
+async fn f10_adl_rejects_a_target_when_a_higher_profit_ratio_position_is_passed() {
+    let (mut l, fx) = perps_market().await;
+    let (keeper, sponsor) = (fx.keeper.insecure_clone(), fx.sponsor.insecure_clone());
+    // A second trader opens a short in the same market (keeps the net exposure inside the skew cap).
+    let t2 = Keypair::new();
+    l.env.fund(t2.pubkey(), SOL).await;
+    let t2_usdc = l.env.usdc_account(&t2.pubkey(), 100 * USDC).await;
+    l.env.warp(1).await;
+    l.env.send(&[order_ix(&l, &fx, t2.pubkey(), t2_usdc, perps::SIDE_SHORT, perps::ORDER_INCREASE, 4 * USDC, 6 * USDC)], &[&t2, &sponsor]).await.unwrap();
+    l.env.warp(5).await;
+    l.env.send(&[execute_ix(&l, &fx, t2.pubkey(), t2_usdc, perps::SIDE_SHORT)], &[&keeper]).await.unwrap();
+    let p2 = pda_position(&t2.pubkey(), &fx.market, perps::SIDE_SHORT);
+    // Both winning: the first (trader) by far more per unit of collateral.
+    edit::<perps::Position>(&mut l.env, fx.position, |p| p.entry_price_q64 /= 2).await; // ~+$8 on ~$4.3
+    edit::<perps::Position>(&mut l.env, p2, |p| p.entry_price_q64 = p.entry_price_q64 * 125 / 100).await; // short, ~+$1.2 on ~$4
+    into_adl(&mut l, &fx, 30 * USDC as i128).await; // over the $25 budget
+
+    let mut low = position_ix(&l, &fx, p2, t2_usdc, false);
+    low.accounts.push(solana_sdk::instruction::AccountMeta::new_readonly(fx.position, false));
+    l.env.warp(1).await;
+    let err = l.env.send(&[low], &[&keeper]).await.unwrap_err();
+    assert_eq!(custom_error(err), perr(perps::PerpsError::AdlWrongTarget), "a better target was passed");
+    assert_eq!((l.env.get::<perps::Position>(p2).await).size_usd, 6 * USDC);
+
+    // The right order: highest ratio first, with the other passed as evidence.
+    let mut high = position_ix(&l, &fx, fx.position, fx.trader_usdc, false);
+    high.accounts.push(solana_sdk::instruction::AccountMeta::new_readonly(p2, false));
+    let before = l.env.token_balance(fx.trader_usdc).await;
+    l.env.warp(1).await;
+    l.env.send(&[high], &[&keeper]).await.unwrap();
+    assert_eq!((l.env.get::<perps::Position>(fx.position).await).size_usd, 0, "target deleveraged");
+    assert!(l.env.token_balance(fx.trader_usdc).await > before + 7 * USDC, "paid at the mark with its profit, no fee");
+    // A passed account that isn't a position of this program is refused.
+    let mut junk = position_ix(&l, &fx, p2, t2_usdc, false);
+    junk.accounts.push(solana_sdk::instruction::AccountMeta::new_readonly(fx.vault, false));
+    l.env.warp(1).await;
+    assert!(l.env.send(&[junk], &[&keeper]).await.is_err());
+}
+
+#[tokio::test]
+async fn resize_withdrawal_grows_an_old_request_and_it_is_paid_at_the_current_price() {
+    let (mut l, fx) = perps_market().await;
+    let lp = fx.lp.insecure_clone();
+    let shares = (l.env.get::<perps::LpAccount>(fx.lp_acc).await).shares / 2;
+    l.env.send(&[request_withdrawal_ix(fx.vault, fx.vault_usdc, lp.pubkey(), shares)], &[&lp]).await.unwrap();
+    let request = pda_withdrawal(&lp.pubkey());
+    let payer = l.env.ctx.payer.pubkey();
+    let resize = |key: Pubkey| Instruction {
+        program_id: perps::ID,
+        accounts: perps::accounts::ResizeWithdrawal { payer, request: key, system_program: system_program::ID }.to_account_metas(None),
+        data: perps::instruction::ResizeWithdrawal {}.data(),
+    };
+    // No-op on a current-size request.
+    let len = l.env.ctx.banks_client.get_account(request).await.unwrap().unwrap().data.len();
+    assert_eq!(len, 73);
+    l.env.send(&[resize(request)], &[]).await.unwrap();
+    // Old layout: 16 bytes shorter. It can't be read until resized. (No slot warps after the
+    // shrink: it destroys lamports, which a warp's bank hash check would trip over.)
+    l.env.advance_clock(perps::WITHDRAW_DELAY_SECONDS + 1).await;
+    l.env.warp(2).await;
+    l.env.shrink_account(request, 16).await;
+    let done = complete_withdrawal_ix(fx.vault, fx.vault_usdc, lp.pubkey(), fx.lp_usdc);
+    assert!(l.env.send(&[done.clone()], &[&lp]).await.is_err(), "old-size request fails to load");
+    // Only this program's withdrawal requests can be resized.
+    assert!(l.env.send(&[resize(fx.market)], &[]).await.is_err());
+    l.env.send(&[resize(request)], &[]).await.unwrap();
+    let r: perps::WithdrawalRequest = l.env.get(request).await;
+    assert_eq!((r.shares, r.request_assets, r.request_total_shares), (shares, 0, 0), "no recorded price");
+    mint_usdc(&mut l.env, fx.vault_usdc, 5_000 * USDC).await; // a gain after the request still counts: there is no recorded price
+    let now_value = lp_value_of(&mut l, &fx, shares).await;
+    let before = l.env.token_balance(fx.lp_usdc).await;
+    // A different message (extra 1-lamport transfer) so the bank doesn't see the failed attempt again.
+    let tweak = system_instruction::transfer(&payer, &lp.pubkey(), 1);
+    l.env.send(&[done, tweak], &[&lp]).await.unwrap();
+    assert_eq!(l.env.token_balance(fx.lp_usdc).await - before, now_value);
 }

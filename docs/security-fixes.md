@@ -66,7 +66,7 @@ Findings from the pre-audit review and what changed. Each entry: what, fix, test
 
 **Fix.**
 - `request_order` refuses a zero `acceptable_price_q64` for every order, open or close (new error `AcceptablePriceRequired`). `execute_order` always checks the bound; the fill logic is unchanged (worst of mark and spot, caps for an increase long or a close short, floors for the others).
-- `execute_order` never fills an order at or after `request_slot + ORDER_EXPIRY_SLOTS`. It refunds the escrow to the owner and closes the order instead (`OrderRejected`, reason 1), so anyone can clear an expired order and the keeper's queue cannot stick. `cancel_order` (owner, same slot threshold) still works. `OrderRejected.reason`: 0 price outside the bound, 1 expired, 2 new open on a pool with no history (F6).
+- `execute_order` never fills an order at or after `request_slot + ORDER_EXPIRY_SLOTS`. It refunds the escrow to the owner and closes the order instead (`OrderRejected`, reason 3), so anyone can clear an expired order and the keeper's queue cannot stick. `cancel_order` (owner, same slot threshold) still works. `OrderRejected.reason`: 0 price outside the bound, 1 expired, 2 new open on a pool with no history (F6).
 - App: the order ticket has a slippage setting (default 1%, at most 5%, `DEFAULT_SLIPPAGE_BPS` / `MAX_SLIPPAGE_BPS` in `client/src/perps/math.ts`). The acceptable price is the current fill price (worse of mark and spot) moved by it, for opens and closes, and the ticket shows the limit. `buildOrderInstruction` refuses an order with no non-zero bound and slippage above 5%. The copy engine bounds perp orders the same way (slippage capped at 5%) and refuses to build one with no reference price. The devnet scripts bound at 50% around the market's band anchor.
 
 **Upgrade.** None. An order placed before the upgrade with a zero bound is refunded at fill if it is an open, and is filled as a close with no floor only inside its 150 slots.
@@ -115,3 +115,48 @@ Findings from the pre-audit review and what changed. Each entry: what, fix, test
 **Fix.** The anchor is the curve's TWAP over the 750-slot window (`curve.twap_q64`, the same read Tier 0 pricing uses).
 
 **Tests.** `tests/tests/flow.rs`: `market_anchor_is_the_curve_twap_not_its_instantaneous_price`.
+
+## F2 (high): an unlocked LP withdrawal request was a permanent, free exit
+
+**What.** `withdraw_liquidity` only required `now >= unlock_ts`. A request never expired, its shares kept earning, and cancelling was free, so after one request and the 24 h wait an LP could leave instantly at any later moment, for example ahead of a large trader profit or ADL (LP assets exclude unrealised trader PnL).
+
+**Fix.**
+- Claim window: a request can be completed from `unlock_ts` to `unlock_ts + WITHDRAWAL_WINDOW_SECONDS` (24 h; 600 s with the `devnet` feature). After that it is expired: completing fails with `WithdrawalExpired`, and requesting again restarts the delay (the shares stay in the request until completed or cancelled).
+- Lower-of price: `request_withdrawal` records the vault's LP assets and total shares (`request_assets`, `request_total_shares`, appended to `WithdrawalRequest`). `withdraw_liquidity` pays the lower of the value of the shares at that recorded price and at the current one. A gain after the request stays with the remaining LPs; a loss is borne by the leaver. Any later `request_withdrawal` on the same request refreshes the recorded price and restarts the delay, so it can only be re-recorded at a cost of another wait.
+- `request_withdrawal` now takes `vault` and `vault_usdc` (read-only) to read the price.
+
+**Upgrade.** `WithdrawalRequest` grew by 16 bytes (73 bytes with the discriminator). Existing requests must be grown with the permissionless `resize_withdrawal` (`client/scripts/resize-accounts.ts` does it, run by `scripts/upgrade.sh`); a stored `request_total_shares` of zero means "no recorded price" and is paid at the current price. Requests made before the upgrade have normally passed their window and need a new request anyway; they can be cancelled after the resize.
+
+**Tests.** `tests/tests/flow.rs`: `f2_expired_withdrawal_cannot_complete_and_re_request_restarts_the_delay` (last second of the window pays, the next is refused, re-request is locked again and burns exactly the request's shares) and `f2_withdrawal_pays_the_lower_of_request_and_completion_price` (price up and price down).
+
+## F9 (medium): first-depositor and empty-vault share inflation
+
+**What.** `shares_for` minted 1:1 into an empty vault and whenever LP assets were zero. An attacker could deposit one unit, donate USDC straight to the vault's token account, and leave the next depositor with about one share; and a vault with shares but no assets minted new deposits against worthless old shares.
+
+**Fix.** Every share/asset conversion adds `VIRTUAL_SHARES = 1_000` and `VIRTUAL_ASSETS = 1` to the pool (`shares_for` on deposit, `assets_for_shares` on redeem), both rounding down so the vault keeps the remainder. Donated USDC is mostly absorbed by the virtual shares, so the attack loses money and a victim's rounding loss is under one share. Deposits (`deposit_liquidity`, `deposit_to_treasury`) and `compound_protocol_fees` are refused with `VaultHasNoAssets` while shares exist but LP assets are zero. Share counts are `u64`, so a vault's shares are checked against overflow (about 18 billion USDC at the initial price of 1 unit per thousand shares).
+
+**Upgrade.** None for accounts. On a vault whose shares were minted 1:1, the virtual shares own `VIRTUAL_SHARES / (total_shares + VIRTUAL_SHARES)` of the pool (0.0001% of a $1,000 vault), so share values drop by that much on upgrade.
+
+**Tests.** Unit: donation attack, zero-asset refusal, rounding in the vault's favour (`programs/ringside_perps`). `tests/tests/flow.rs`: `f9_donation_to_an_empty_vault_does_not_steal_the_next_deposit`, `f9_vault_with_shares_but_no_assets_refuses_deposits`.
+
+## F5 (medium): perps could never be paused, and insurance was never spent
+
+**What.** `vault.paused` was only ever written to false. `market.insurance` only grew, was excluded from LP assets, yet `check_budget` counted it as offsetting trader profit.
+
+**Fix.**
+- `set_paused(paused)` (vault admin). While paused: `request_order` increases and `deposit_liquidity` / `deposit_to_treasury` fail with `Paused`, and `execute_order` refunds an increase queued before the pause (`OrderRejected`, reason 3). Still allowed: close and reduce orders (request and fill), `cancel_order`, `liquidate`, `auto_deleverage`, all three LP withdrawal steps, `crank_funding`, `refresh_sol_price`, `compound_protocol_fees`, fee claims, market admin calls and `graduate_market`. (`request_order` used to refuse closes too once paused.)
+- Insurance rule: after every settlement (close, liquidation, ADL) the market's insurance is applied to its net trader profit `trader_net_pnl` (what LPs have lost on that market, including losses beyond a trader's collateral): `spend = min(insurance, trader_net_pnl)` leaves `market.insurance` and `vault.reserved` and reduces `trader_net_pnl` by the same amount. The USDC stays in the vault and becomes LP assets, so LPs bear a payout only after the market's insurance is used up. Afterwards a market has no insurance or no net profit, so `trader_net_pnl` is net of insurance, `check_budget` compares it directly with the budget, and unspent insurance never offsets anything. `vault.reserved` stays equal to protocol fees + creator fees + insurance. New events `PausedSet`, `InsuranceSpent`.
+
+**Upgrade.** No layout change. Existing markets' `trader_net_pnl` is gross of insurance until their next settlement, when the rule applies to all of it.
+
+**Tests.** `f5_pause_is_admin_only_blocks_opens_and_deposits_but_not_exits` (non-admin refused; opens, deposits blocked; queued increase refunded; close, withdrawal, liquidation allowed; resume) and `f5_insurance_pays_a_profitable_close_before_lps_do` (LP assets change by exactly the insurance spent, with and without insurance). Unit tests cover the sweep and budget.
+
+## F10 (low): ADL mode never cleared, and anyone could ADL any winner
+
+**What.** The budget compares lifetime net trader profit with the current LP value, so LP withdrawals alone could tip a market into ADL for good, and in ADL anyone could force-close any profitable position at the mark.
+
+**Fix.**
+- `check_budget` clears `adl_mode` when `trader_net_pnl` is at or under 80% of the budget (`ADL_CLEAR_BPS`), wherever it runs (fills, liquidations) and at the start of `auto_deleverage`, which then returns without closing anything. `reduce_only` stays set (it can also be set by hand); the admin lifts it with `set_market_limits(…, false)`.
+- ADL ordering cannot be enforced on chain: the program cannot list a market's positions, and a caller can always omit a better one. What is enforced: remaining accounts after the price accounts (Tier 1+: after the 4 pool accounts) are other positions of the same market, and each must have a profit ratio (PnL net of funding / collateral) no higher than the target's, else `AdlWrongTarget`. The keeper passes the next-ranked positions and retries without them if its estimate disagrees with the real mark. There is no keeper role on chain to restrict the call to. ADL still pays at the mark (better than the worst-of fill of a voluntary close) and charges no fee, so a forced close costs the target only its future upside.
+
+**Tests.** `f10_adl_mode_clears_once_the_market_recovers_and_not_before` (hysteresis, clearing call closes nobody, admin reopens) and `f10_adl_rejects_a_target_when_a_higher_profit_ratio_position_is_passed`. Unit test for the budget and hysteresis. `client/test/adl-rank.test.mjs` for the keeper's order.

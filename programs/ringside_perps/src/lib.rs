@@ -105,6 +105,21 @@ pub const SEED_TREASURY: &[u8] = b"treasury";
 pub const WITHDRAW_DELAY_SECONDS: i64 = 24 * 3_600;
 #[cfg(feature = "devnet")]
 pub const WITHDRAW_DELAY_SECONDS: i64 = 120;
+/// An unlocked withdrawal request can be completed only this long after it
+/// unlocks. After that it has expired: it must be requested again (which
+/// restarts the delay), so an LP can't keep an always-open exit.
+#[cfg(not(feature = "devnet"))]
+pub const WITHDRAWAL_WINDOW_SECONDS: i64 = 24 * 3_600;
+#[cfg(feature = "devnet")]
+pub const WITHDRAWAL_WINDOW_SECONDS: i64 = 600;
+/// Virtual shares and assets in every share/asset conversion (ERC-4626 style
+/// offset): the first share is never worth more than a sliver, so donating USDC
+/// to an empty or tiny vault cannot make later deposits round to nothing.
+pub const VIRTUAL_SHARES: u128 = 1_000_000;
+pub const VIRTUAL_ASSETS: u128 = 1;
+/// A market in ADL mode leaves it once its net trader profit is back under this
+/// share of its budget (the budget itself flips it on, so this is hysteresis).
+pub const ADL_CLEAR_BPS: i128 = 8_000;
 /// At most this many Tier 0 markets live at once: 40 x 0.25% budget = 10% of the vault.
 pub const DEFAULT_MAX_LIVE_TIER0: u32 = 40;
 /// Length of the volume window (~7 days) a Tier 0 market must stay quiet for to be retired.
@@ -214,7 +229,20 @@ pub mod ringside_perps {
         Ok(())
     }
 
+    /// Admin: pauses or resumes new risk. While paused: no new or larger
+    /// positions (`request_order` increase, and `execute_order` refunds queued
+    /// increases), no LP deposits (`deposit_liquidity`, `deposit_to_treasury`).
+    /// Still allowed: close and reduce orders, cancel_order, liquidations, ADL,
+    /// every LP withdrawal step, funding and band cranks, price refreshes,
+    /// fee claims and compounding, market admin and graduation.
+    pub fn set_paused(ctx: Context<AdminVault>, paused: bool) -> Result<()> {
+        ctx.accounts.vault.paused = paused;
+        emit!(PausedSet { paused });
+        Ok(())
+    }
+
     pub fn deposit_liquidity(ctx: Context<Liquidity>, amount: u64) -> Result<()> {
+        require!(!ctx.accounts.vault.paused, PerpsError::Paused);
         require!(amount > 0, PerpsError::ZeroAmount);
         let assets = lp_assets(&ctx.accounts.vault, ctx.accounts.vault_usdc.amount);
         let v = &mut ctx.accounts.vault;
@@ -241,15 +269,21 @@ pub mod ringside_perps {
     /// Step 1 of a withdrawal: moves shares out of the LP account into a
     /// request that unlocks after WITHDRAW_DELAY_SECONDS. The shares stay in
     /// total_shares, so they keep sharing the vault's PnL until paid out.
-    /// Adding to an open request restarts its timer.
+    /// Adding to an open request, or requesting again after one expired,
+    /// restarts its timer and re-records the share price: the whole request is
+    /// then paid at the lower of that price and the price at completion.
     pub fn request_withdrawal(ctx: Context<RequestWithdrawal>, shares: u64) -> Result<()> {
         require!(shares > 0 && shares <= ctx.accounts.lp.shares, PerpsError::ZeroAmount);
         let now = Clock::get()?.unix_timestamp;
+        let assets = lp_assets(&ctx.accounts.vault, ctx.accounts.vault_usdc.amount);
+        let total_shares = ctx.accounts.vault.total_shares;
         ctx.accounts.lp.shares -= shares;
         let r = &mut ctx.accounts.request;
         r.owner = ctx.accounts.owner.key();
         r.shares += shares;
         r.unlock_ts = now + WITHDRAW_DELAY_SECONDS;
+        r.request_assets = assets;
+        r.request_total_shares = total_shares;
         r.bump = ctx.bumps.request;
         emit!(WithdrawalRequested { owner: r.owner, shares: r.shares, unlock_ts: r.unlock_ts });
         Ok(())
@@ -261,14 +295,23 @@ pub mod ringside_perps {
         Ok(())
     }
 
-    /// Step 2: once unlocked, pays the request's shares at the vault's value now.
+    /// Step 2: once unlocked, and for WITHDRAWAL_WINDOW_SECONDS after that,
+    /// pays the request's shares at the LOWER of the vault's value per share
+    /// when requested and now. A later gain stays with the remaining LPs, a
+    /// later loss is borne by the leaver. Requests resized from the old layout
+    /// have no recorded price and are paid at the current one.
     pub fn withdraw_liquidity(ctx: Context<CompleteWithdrawal>) -> Result<()> {
         let now = Clock::get()?.unix_timestamp;
-        let shares = ctx.accounts.request.shares;
-        require!(now >= ctx.accounts.request.unlock_ts, PerpsError::WithdrawalLocked);
+        let r = &ctx.accounts.request;
+        let shares = r.shares;
+        require!(now >= r.unlock_ts, PerpsError::WithdrawalLocked);
+        require!(now <= r.unlock_ts.saturating_add(WITHDRAWAL_WINDOW_SECONDS), PerpsError::WithdrawalExpired);
         require!(shares > 0, PerpsError::ZeroAmount);
         let assets = lp_assets(&ctx.accounts.vault, ctx.accounts.vault_usdc.amount);
-        let amount = ((shares as u128) * (assets as u128) / (ctx.accounts.vault.total_shares as u128)) as u64;
+        let mut amount = assets_for_shares(shares, assets, ctx.accounts.vault.total_shares)?;
+        if r.request_total_shares > 0 {
+            amount = amount.min(assets_for_shares(shares, r.request_assets, r.request_total_shares)?);
+        }
         ctx.accounts.vault.total_shares -= shares;
         pay_from_vault(&ctx.accounts.vault, &ctx.accounts.vault_usdc, &ctx.accounts.owner_usdc, &ctx.accounts.token_program, amount)?;
         Ok(())
@@ -319,7 +362,6 @@ pub mod ringside_perps {
     /// Step 1 of a trade: escrow collateral and record the request.
     /// A keeper fills it at the first mark at least FILL_DELAY_SLOTS later.
     pub fn request_order(ctx: Context<RequestOrder>, args: OrderArgs) -> Result<()> {
-        require!(!ctx.accounts.vault.paused, PerpsError::Paused);
         require!(args.side <= 1 && args.kind <= 1, PerpsError::BadArgs);
         // Every order carries a price bound: an unbounded order could be filled
         // by anyone at whatever price the market shows at that moment.
@@ -327,6 +369,7 @@ pub mod ringside_perps {
         let slot = Clock::get()?.slot;
 
         if args.kind == ORDER_INCREASE {
+            require!(!ctx.accounts.vault.paused, PerpsError::Paused);
             require!(args.size_usd > 0 && args.collateral > 0, PerpsError::ZeroAmount);
             require!(!ctx.accounts.market.reduce_only, PerpsError::ReduceOnly);
             token::transfer(
@@ -395,6 +438,14 @@ pub mod ringside_perps {
         }
         let vault_balance = ctx.accounts.vault_usdc.amount;
         let lp_value = lp_assets(&ctx.accounts.vault, vault_balance);
+
+        // Paused (after the expiry check above, so an expired order still reports as
+        // expired): an increase queued before the pause is refunded, not filled.
+        if order.kind == ORDER_INCREASE && ctx.accounts.vault.paused {
+            let vault = &mut ctx.accounts.vault;
+            refund_order(vault, order, &ctx.accounts.vault_usdc, &ctx.accounts.owner_usdc, &ctx.accounts.token_program, REJECT_PAUSED)?;
+            return Ok(());
+        }
 
         let market = &mut ctx.accounts.market;
         let view = price_view(market, &ctx.accounts.curve, ctx.remaining_accounts, clock.slot, clock.unix_timestamp)?;
@@ -475,6 +526,7 @@ pub mod ringside_perps {
             reset_position(pos);
         }
 
+        cover_with_insurance(vault, market);
         check_budget(market, lp_value);
         Ok(())
     }
@@ -509,30 +561,57 @@ pub mod ringside_perps {
         pay_from_vault(vault, &ctx.accounts.vault_usdc, &ctx.accounts.keeper_usdc, &ctx.accounts.token_program, reward)?;
         emit!(PositionClosed { owner: pos.owner, market: pos.market, side: pos.side, realized_pnl: -(pos.collateral as i64), payout: 0, mark_q64: mark, reason: 1 });
         reset_position(pos);
+        cover_with_insurance(vault, market);
         check_budget(market, lp_value);
         Ok(())
     }
 
-    /// Auto-deleverage a profitable position once the market's budget is spent.
-    /// Keepers rank by unrealised PnL off-chain and close the most profitable first.
+    /// Auto-deleverage a profitable position at the mark, with no fee, while the
+    /// market is in ADL mode. Anyone may call it, and the program cannot list a
+    /// market's positions, so it cannot force the most profitable one first.
+    /// What it enforces: the call first re-checks the budget (a recovered market
+    /// leaves ADL mode and the call returns without closing anything), and any
+    /// other positions the caller passes after the price accounts (remaining
+    /// accounts; Tier 1+ markets put the 4 pool accounts first) must have a
+    /// profit ratio (PnL net of funding / collateral) no higher than the target's.
+    /// The keeper passes the next-ranked positions. A caller who omits them is
+    /// still limited to profitable positions, at the mark, in ADL mode only.
     pub fn auto_deleverage(ctx: Context<Liquidate>) -> Result<()> {
         let clock = Clock::get()?;
+        let lp_value = lp_assets(&ctx.accounts.vault, ctx.accounts.vault_usdc.amount);
         let market = &mut ctx.accounts.market;
         require!(market.adl_mode, PerpsError::NotAdl);
+        let vault = &mut ctx.accounts.vault;
+        cover_with_insurance(vault, market);
+        check_budget(market, lp_value);
+        if !market.adl_mode {
+            return Ok(()); // recovered: mode cleared, nobody is deleveraged
+        }
         let view = price_view(market, &ctx.accounts.curve, ctx.remaining_accounts, clock.slot, clock.unix_timestamp)?;
-        accrue_funding(market, &ctx.accounts.vault, view.sol_reserve, clock.unix_timestamp)?;
+        accrue_funding(market, vault, view.sol_reserve, clock.unix_timestamp)?;
         let (mark, _) = mark_price(market, &view, clock.slot);
         let pos = &mut ctx.accounts.position;
         require!(pos.size_usd > 0 && pnl(pos, mark) > 0, PerpsError::NotProfitable);
 
+        let target = profit_ratio(pos, mark, market.funding_index);
+        let skip = if market.tier == 0 { 0 } else { 4 };
+        for info in ctx.remaining_accounts.iter().skip(skip) {
+            require_keys_eq!(*info.owner, crate::ID, PerpsError::AdlWrongTarget);
+            let other = Position::try_deserialize(&mut &info.try_borrow_data()?[..])?;
+            require!(other.market == market.key(), PerpsError::AdlWrongTarget);
+            if other.size_usd > 0 {
+                require!(profit_ratio(&other, mark, market.funding_index) <= target, PerpsError::AdlWrongTarget);
+            }
+        }
+
         let (payout, realized) = settle_close(pos, market, mark, 0)?;
-        let vault = &mut ctx.accounts.vault;
         vault.trader_collateral -= pos.collateral;
         market.trader_net_pnl += realized;
         if pos.side == SIDE_LONG { market.oi_long -= pos.size_usd } else { market.oi_short -= pos.size_usd }
         pay_from_vault(vault, &ctx.accounts.vault_usdc, &ctx.accounts.owner_usdc, &ctx.accounts.token_program, payout)?;
         emit!(PositionClosed { owner: pos.owner, market: pos.market, side: pos.side, realized_pnl: realized as i64, payout, mark_q64: mark, reason: 2 });
         reset_position(pos);
+        cover_with_insurance(vault, market);
         Ok(())
     }
 
@@ -689,6 +768,7 @@ pub mod ringside_perps {
     /// Anyone (the treasury sweep's hot key) deposits USDC whose shares go to
     /// the treasury's LP account, never the depositor's.
     pub fn deposit_to_treasury(ctx: Context<DepositToTreasury>, amount: u64) -> Result<()> {
+        require!(!ctx.accounts.vault.paused, PerpsError::Paused);
         require!(amount > 0, PerpsError::ZeroAmount);
         let assets = lp_assets(&ctx.accounts.vault, ctx.accounts.vault_usdc.amount);
         let v = &mut ctx.accounts.vault;
@@ -784,6 +864,39 @@ pub mod ringside_perps {
         }
         // Rent for the extra bytes only: the account also holds real SOL / fee balances,
         // so comparing the new minimum with its total lamports would charge nothing.
+        let rent = Rent::get()?;
+        let needed = rent.minimum_balance(new_len).saturating_sub(rent.minimum_balance(info.data_len()));
+        if needed > 0 {
+            anchor_lang::system_program::transfer(
+                CpiContext::new(
+                    ctx.accounts.system_program.to_account_info(),
+                    anchor_lang::system_program::Transfer { from: ctx.accounts.payer.to_account_info(), to: info.clone() },
+                ),
+                needed,
+            )?;
+        }
+        info.resize(new_len)?;
+        Ok(())
+    }
+
+    /// Permissionless migration helper: grows a `WithdrawalRequest` made before
+    /// the request-time price fields existed. New bytes are zero, which reads as
+    /// "no recorded price" (paid at the current one). No-op if already large enough.
+    pub fn resize_withdrawal(ctx: Context<ResizeWithdrawal>) -> Result<()> {
+        let info = ctx.accounts.request.to_account_info();
+        require_keys_eq!(*info.owner, crate::ID, anchor_lang::error::ErrorCode::AccountOwnedByWrongProgram);
+        let owner = {
+            let data = info.try_borrow_data()?;
+            require!(data.len() >= 8 + 32, anchor_lang::error::ErrorCode::AccountDiscriminatorNotFound);
+            require!(data[..8] == *WithdrawalRequest::DISCRIMINATOR, anchor_lang::error::ErrorCode::AccountDiscriminatorMismatch);
+            Pubkey::new_from_array(data[8..40].try_into().unwrap())
+        };
+        let (expected, _) = Pubkey::find_program_address(&[SEED_WITHDRAWAL, owner.as_ref()], &crate::ID);
+        require_keys_eq!(expected, info.key(), anchor_lang::error::ErrorCode::ConstraintSeeds);
+        let new_len = 8 + WithdrawalRequest::INIT_SPACE;
+        if info.data_len() >= new_len {
+            return Ok(());
+        }
         let rent = Rent::get()?;
         let needed = rent.minimum_balance(new_len).saturating_sub(rent.minimum_balance(info.data_len()));
         if needed > 0 {
@@ -1038,13 +1151,47 @@ pub fn oi_cap(m: &Market, v: &Vault, sol_reserve: u64, now: i64) -> Result<u64> 
     Ok(if m.oi_cap_override > 0 { cap.min(m.oi_cap_override) } else { cap })
 }
 
+/// Insurance is spent as soon as the market has a net loss to cover: after every
+/// settlement (close, liquidation, ADL) the market's insurance is applied to its
+/// net trader profit (`trader_net_pnl`, what LPs have lost on this market), and
+/// that profit falls by the same amount. The USDC stays in the vault but leaves
+/// `reserved`, so it becomes LP assets: LPs bear a payout, or a bad-debt gap,
+/// only once the market's insurance is used up. Afterwards a market has either no
+/// insurance or no net trader profit, so `trader_net_pnl` is net of insurance
+/// and `check_budget` never counts money that has not been spent.
+fn cover_with_insurance(v: &mut Vault, m: &mut Market) {
+    if m.trader_net_pnl <= 0 || m.insurance == 0 {
+        return;
+    }
+    let spend = (m.insurance as u128).min(m.trader_net_pnl as u128) as u64;
+    m.insurance -= spend;
+    v.reserved -= spend;
+    m.trader_net_pnl -= spend as i128;
+    emit!(InsuranceSpent { mint: m.mint, amount: spend });
+}
+
+/// Past its budget (a share of LP value) a market goes reduce-only and into ADL.
+/// ADL mode ends when net trader profit is back under ADL_CLEAR_BPS of the budget
+/// (checked wherever the budget is: fills, liquidations and ADL calls). The
+/// reduce-only flag stays until the admin lifts it with `set_market_limits`,
+/// because it may also have been set by hand.
 fn check_budget(m: &mut Market, lp_value: u64) {
     let budget = (lp_value as u128 * tier_params(m.tier).budget_bps / BPS) as i128;
-    if m.trader_net_pnl - m.insurance as i128 > budget {
+    if m.trader_net_pnl > budget {
         m.reduce_only = true;
-        m.adl_mode = true;
-        emit!(BudgetExhausted { mint: m.mint, trader_net_pnl: m.trader_net_pnl as i64 });
+        if !m.adl_mode {
+            m.adl_mode = true;
+            emit!(BudgetExhausted { mint: m.mint, trader_net_pnl: m.trader_net_pnl as i64 });
+        }
+    } else if m.adl_mode && m.trader_net_pnl * (BPS as i128) <= budget * ADL_CLEAR_BPS {
+        m.adl_mode = false;
+        emit!(AdlCleared { mint: m.mint, trader_net_pnl: m.trader_net_pnl as i64 });
     }
+}
+
+/// Unrealised profit net of funding per unit of collateral (x1e6), for ADL ordering.
+fn profit_ratio(p: &Position, mark: u128, funding_index: i128) -> i128 {
+    (pnl(p, mark) - funding_owed(p, funding_index)) * 1_000_000 / (p.collateral.max(1) as i128)
 }
 
 /// Returns (payout to trader, realised PnL to trader net of funding, floored
@@ -1062,6 +1209,8 @@ pub const REJECT_PRICE: u8 = 0;
 pub const REJECT_EXPIRED: u8 = 1;
 /// A new open or increase on a pool with no price history yet.
 pub const REJECT_WARMUP: u8 = 2;
+/// An increase queued before the vault was paused.
+pub const REJECT_PAUSED: u8 = 3;
 
 /// Returns an order's escrowed collateral to its owner and reports the rejection.
 fn refund_order<'info>(
@@ -1113,15 +1262,23 @@ fn distribute_fee<'info>(
     pay_from_vault(v, vault_usdc, keeper_usdc, token_program, keeper)
 }
 
-/// Shares minted for `amount` USDC at the vault's current share price.
+/// Shares minted for `amount` USDC at the vault's current share price, with
+/// VIRTUAL_SHARES / VIRTUAL_ASSETS added to the pool (rounds down: the vault
+/// keeps the remainder). Refused while shares exist but no assets back them:
+/// a new depositor would be minted against worthless old shares.
 fn shares_for(v: &Vault, assets: u64, amount: u64) -> Result<u64> {
-    let shares = if v.total_shares == 0 || assets == 0 {
-        amount
-    } else {
-        ((amount as u128) * (v.total_shares as u128) / (assets as u128)) as u64
-    };
+    require!(v.total_shares == 0 || assets > 0, PerpsError::VaultHasNoAssets);
+    let shares = (amount as u128) * (v.total_shares as u128 + VIRTUAL_SHARES) / (assets as u128 + VIRTUAL_ASSETS);
+    let shares = u64::try_from(shares).map_err(|_| ProgramError::ArithmeticOverflow)?;
     require!(shares > 0, PerpsError::ZeroAmount);
     Ok(shares)
+}
+
+/// USDC paid for `shares` out of a pool of `assets` and `total_shares`, with the
+/// same virtual offset as `shares_for` (rounds down: the vault keeps the remainder).
+pub fn assets_for_shares(shares: u64, assets: u64, total_shares: u64) -> Result<u64> {
+    let amount = (shares as u128) * (assets as u128 + VIRTUAL_ASSETS) / (total_shares as u128 + VIRTUAL_SHARES);
+    Ok(u64::try_from(amount).map_err(|_| ProgramError::ArithmeticOverflow)?)
 }
 
 /// USDC that belongs to LPs: balance minus trader collateral and reserved
@@ -1192,6 +1349,11 @@ pub struct WithdrawalRequest {
     pub shares: u64,
     pub unlock_ts: i64,
     pub bump: u8,
+    /// LP assets and total shares when the request was made (the share price it
+    /// can't be paid above). APPENDED after `bump`: requests made before these
+    /// existed need `resize_withdrawal`, and read as zero = no recorded price.
+    pub request_assets: u64,
+    pub request_total_shares: u64,
 }
 
 #[account]
@@ -1433,6 +1595,10 @@ pub struct SetMarketLimit<'info> {
 pub struct RequestWithdrawal<'info> {
     #[account(mut)]
     pub owner: Signer<'info>,
+    #[account(seeds = [SEED_VAULT], bump = vault.bump)]
+    pub vault: Box<Account<'info, Vault>>,
+    #[account(seeds = [SEED_VAULT_USDC], bump)]
+    pub vault_usdc: Box<Account<'info, TokenAccount>>,
     #[account(mut, seeds = [SEED_LP, owner.key().as_ref()], bump = lp.bump, has_one = owner)]
     pub lp: Box<Account<'info, LpAccount>>,
     #[account(init_if_needed, payer = owner, space = 8 + WithdrawalRequest::INIT_SPACE, seeds = [SEED_WITHDRAWAL, owner.key().as_ref()], bump)]
@@ -1700,6 +1866,17 @@ pub struct ForfeitCreator<'info> {
 }
 
 #[derive(Accounts)]
+pub struct ResizeWithdrawal<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    /// CHECK: owner, discriminator and PDA seeds are verified in the handler,
+    /// because an account too small for `WithdrawalRequest` cannot be deserialized.
+    #[account(mut)]
+    pub request: UncheckedAccount<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
 pub struct ResizeMarket<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
@@ -1805,6 +1982,23 @@ pub struct MarketGraduated {
 }
 
 #[event]
+pub struct PausedSet {
+    pub paused: bool,
+}
+
+#[event]
+pub struct InsuranceSpent {
+    pub mint: Pubkey,
+    pub amount: u64,
+}
+
+#[event]
+pub struct AdlCleared {
+    pub mint: Pubkey,
+    pub trader_net_pnl: i64,
+}
+
+#[event]
 pub struct BudgetExhausted {
     pub mint: Pubkey,
     pub trader_net_pnl: i64,
@@ -1870,6 +2064,12 @@ pub enum PerpsError {
     NotUpgradeAuthority,
     #[msg("Every order needs a non-zero acceptable price")]
     AcceptablePriceRequired,
+    #[msg("The withdrawal request expired; request again")]
+    WithdrawalExpired,
+    #[msg("The vault has shares but no LP assets; deposits are refused")]
+    VaultHasNoAssets,
+    #[msg("A passed position has a higher profit ratio than the ADL target")]
+    AdlWrongTarget,
 }
 
 #[cfg(test)]
@@ -1911,6 +2111,102 @@ mod tests {
         // 30 virtual SOL at $150 = $4,500 -> 1% = $45.
         let vsol_usd: u128 = 30_000_000_000u128 * 150_000_000 / 1_000_000_000;
         assert_eq!((vsol_usd * DEFAULT_TIER0_CAP_BPS as u128 / BPS) as u64, 45_000_000);
+    }
+
+    fn vault(total_shares: u64) -> Vault {
+        Vault {
+            authority: Pubkey::default(), price_authority: Pubkey::default(), usdc_mint: Pubkey::default(), total_shares,
+            trader_collateral: 0, reserved: 0, protocol_fees: 0, sol_usd_e6: 0, sol_usd_ts: 0, tier0_cap_bps: 0, skew_cap_bps: 0,
+            paused: false, bump: 0,
+        }
+    }
+
+    fn market(tier: u8) -> Market {
+        Market {
+            mint: Pubkey::default(), curve: Pubkey::default(), creator: Pubkey::default(), tier, created_slot: 0,
+            oi_long: 0, oi_short: 0, oi_cap_override: 0, funding_index: 0, last_funding_ts: 0,
+            band_anchor_q64: 0, band_anchor_slot: 0, trader_net_pnl: 0, insurance: 0, creator_fees: 0,
+            reduce_only: false, adl_mode: false, bump: 0, creator_fees_locked: 0, pool: Pubkey::default(), grad_price_q64: 0, vol_snap_slot: 0, vol_snap_fees: 0,
+        }
+    }
+
+    #[test]
+    fn donation_to_a_tiny_vault_cannot_round_a_victim_to_nothing() {
+        // Attacker: 1 unit in, then $1,000,000 donated straight to the vault.
+        let mut v = vault(0);
+        let attacker = shares_for(&v, 0, 1).unwrap();
+        v.total_shares = attacker;
+        let donated_assets = 1 + 1_000_000 * 1_000_000;
+        // Victim deposits $1,000: fair share of the pool, within one share of rounding.
+        let victim = shares_for(&v, donated_assets, 1_000 * 1_000_000).unwrap();
+        v.total_shares += victim;
+        let after = donated_assets + 1_000 * 1_000_000;
+        let victim_value = assets_for_shares(victim, after, v.total_shares).unwrap();
+        assert!(victim_value >= 1_000 * 1_000_000 - 2_000_000, "victim keeps ~all of it, got {victim_value}");
+        let attacker_value = assets_for_shares(attacker, after, v.total_shares).unwrap();
+        // The virtual shares absorb about half of what the attacker donated, so the attack loses money.
+        let cost = 1 + 1_000_000 * 1_000_000u64;
+        assert!(attacker_value < cost, "attacker ends with {attacker_value} of the {cost} it put in");
+    }
+
+    #[test]
+    fn deposits_are_refused_when_shares_have_no_assets_behind_them() {
+        assert!(shares_for(&vault(5_000), 0, 1_000_000).is_err());
+        assert!(shares_for(&vault(0), 0, 1_000_000).is_ok(), "an empty vault takes its first deposit");
+    }
+
+    #[test]
+    fn share_conversions_round_in_the_vaults_favour() {
+        let v = vault(1_234_567);
+        let (assets, amount) = (7_654_321u64, 333_333u64);
+        let shares = shares_for(&v, assets, amount).unwrap();
+        // Redeeming what a deposit minted never returns more than was put in.
+        let back = assets_for_shares(shares, assets + amount, v.total_shares + shares).unwrap();
+        assert!(back <= amount, "{back} > {amount}");
+        // A full redemption leaves a remainder behind rather than overdrawing.
+        assert!(assets_for_shares(1_234_567, assets, 1_234_567).unwrap() <= assets);
+    }
+
+    #[test]
+    fn insurance_is_spent_on_net_profit_before_lps_and_budget_ignores_unspent_cash() {
+        let mut v = vault(0);
+        let mut m = market(0);
+        m.insurance = 300;
+        v.reserved = 300;
+        m.trader_net_pnl = 1_000;
+        cover_with_insurance(&mut v, &mut m);
+        assert_eq!((m.insurance, v.reserved, m.trader_net_pnl), (0, 0, 700), "all 300 spent, LPs bear the other 700");
+        // Insurance larger than the loss: only the loss is covered.
+        m.insurance = 900;
+        v.reserved = 900;
+        m.trader_net_pnl = 200;
+        cover_with_insurance(&mut v, &mut m);
+        assert_eq!((m.insurance, v.reserved, m.trader_net_pnl), (700, 700, 0));
+        // Nothing to cover when traders are net losers: insurance stays.
+        m.trader_net_pnl = -50;
+        cover_with_insurance(&mut v, &mut m);
+        assert_eq!((m.insurance, m.trader_net_pnl), (700, -50));
+    }
+
+    #[test]
+    fn adl_mode_sets_at_the_budget_and_clears_below_eighty_percent_of_it() {
+        let mut m = market(0); // budget 0.25% of LP value
+        let lp = 1_000_000_000u64; // budget 2_500_000
+        m.trader_net_pnl = 2_500_001;
+        check_budget(&mut m, lp);
+        assert!(m.adl_mode && m.reduce_only);
+        m.trader_net_pnl = 2_400_000; // under budget, above 80%
+        check_budget(&mut m, lp);
+        assert!(m.adl_mode, "hysteresis: still in ADL");
+        m.trader_net_pnl = 2_000_000; // exactly 80%
+        check_budget(&mut m, lp);
+        assert!(!m.adl_mode, "cleared");
+        assert!(m.reduce_only, "the market stays reduce-only until the admin lifts it");
+        // LPs leaving can push a market over its budget again; refilling clears it.
+        check_budget(&mut m, lp / 2);
+        assert!(m.adl_mode);
+        check_budget(&mut m, lp * 2);
+        assert!(!m.adl_mode);
     }
 
     #[test]
@@ -2124,6 +2420,11 @@ mod layout_fixture {
     #[test]
     fn market_account_size_matches_resize_script() {
         assert_eq!(8 + Market::INIT_SPACE, 292);
+    }
+    /// Same for `WITHDRAWAL_LEN` in `client/scripts/resize-accounts.ts`.
+    #[test]
+    fn withdrawal_request_size_matches_resize_script() {
+        assert_eq!(8 + WithdrawalRequest::INIT_SPACE, 73);
     }
 
 }
