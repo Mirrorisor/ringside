@@ -27,9 +27,9 @@ jobs:
       - run: cargo test
         working-directory: tests-graduation
 
-  # SBF build with the devnet feature. Fails on any SBF stack-frame warning (the
-  # same rule upgrade.sh and mainnet.sh enforce before deploying), and on IDLs
-  # that no longer match the source.
+  # SBF builds, mainnet and devnet. Fails on any SBF stack-frame warning (the same
+  # rule upgrade.sh and mainnet.sh enforce before deploying), and on committed
+  # (mainnet) IDLs that no longer match the source.
   build:
     runs-on: ubuntu-latest
     steps:
@@ -48,14 +48,22 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup toolchain install nightly --profile minimal   # Anchor's IDL step
       - run: anchor --version && solana --version
-      - name: anchor build (devnet feature)
+      # Mainnet build first: the committed IDLs are the mainnet ones (the devnet
+      # feature swaps in Raydium's devnet addresses, which end up in the IDL).
+      - name: anchor build (mainnet)
         run: |
           set -o pipefail
-          anchor build -- --features devnet 2>&1 | tee build.log
+          anchor build 2>&1 | tee build-mainnet.log
+      - name: anchor build (devnet feature, programs only)
+        run: |
+          set -o pipefail
+          cp -r target/idl "$RUNNER_TEMP/idl-mainnet"
+          anchor build --no-idl -- --features devnet 2>&1 | tee build-devnet.log
+          rm -rf target/idl && cp -r "$RUNNER_TEMP/idl-mainnet" target/idl
       - name: No SBF stack-frame warnings
         run: |
-          if grep -qi "stack offset" build.log; then
-            grep -i "stack offset" build.log | sort -u
+          if grep -qi "stack offset" build-mainnet.log build-devnet.log; then
+            grep -i "stack offset" build-mainnet.log build-devnet.log | sort -u
             echo "::error::A program function overflows the 4 KB SBF stack frame"
             exit 1
           fi
