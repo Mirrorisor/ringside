@@ -13,6 +13,7 @@ import { mountSocial } from "./social/screens";
 import { backendBase, devOverride } from "./social/config";
 import launchIdl from "../../target/idl/ringside_launch.json";
 import perpsIdl from "../../target/idl/ringside_perps.json";
+import { feeView, type FeeInput } from "../src/creatorfees";
 import {
   GROSS_CAP_MULT, buildOrderInstruction, decodeMarket, decodePosition, decodeVault, marketPda, oiCap, orderPda as perpsOrderPda,
   perpsCoders, positionPda as perpsPositionPda, tierParams, vaultPda, vaultUsdcPda,
@@ -106,6 +107,7 @@ async function connectWallet() {
   log(`Connected ${w.name}: ${short(wallet.publicKey)}. Launches and trades are now signed in your wallet.`);
   ($("connect") as HTMLButtonElement).textContent = w.name;
   void tick();
+  void loadMine().catch(() => {});
 }
 const trader = loadKey("ringside.devnet.trading");
 
@@ -153,8 +155,10 @@ const st: {
   hist: { spot: number; mark: number; lo: number; hi: number }[]; mode: "perp" | "spot"; side: 0 | 1; busy: boolean;
   /** Raydium pool of a graduated token: vault balances and the raw ObservationState. */
   pool: { tokens: bigint; sol: bigint; obs: Buffer } | null;
+  /** Curves this wallet created, with each one's perp market (null when it has none). */
+  mine: { curve: any; market: any | null }[];
 } = {
-  pool: null,
+  pool: null, mine: [],
   curves: [], selected: null, global: null, vault: null, usdcMint: null, curve: null, market: null,
   positions: { 0: null, 1: null }, orders: { 0: false, 1: false }, slot: 0n, vaultUsdc: 0, walletSol: 0, traderSol: 0, traderUsdc: 0,
   walletTokens: 0, hist: [], mode: "perp", side: 0, busy: false,
@@ -277,6 +281,21 @@ async function loadCurves() {
   st.curves = all;
   if (!st.selected && all.length) st.selected = all[0].acc.mint;
   renderMarkets();
+  await loadMine();
+}
+
+/** The wallet's own launches and their perp markets (for the creator-fee numbers and claim buttons). */
+async function loadMine() {
+  const me = wallet.publicKey;
+  const mine = st.curves.filter((r) => r.acc.creator.equals(me)).map((r) => r.acc);
+  const out: { curve: any; market: any | null }[] = [];
+  for (let i = 0; i < mine.length; i += 100) {
+    const chunk = mine.slice(i, i + 100);
+    const infos = await connection.getMultipleAccountsInfo(chunk.map((c) => marketPda(perps.programId, c.mint)));
+    chunk.forEach((c, j) => out.push({ curve: c, market: infos[j] ? decodeMarket(perpsCoder, infos[j]!.data) : null }));
+  }
+  st.mine = out;
+  renderMine();
 }
 
 async function tick() {
@@ -360,7 +379,44 @@ function renderMarkets() {
     : `<span class="muted">No tokens yet. Launch the first one.</span>`);
 }
 
+// ---------------------------------------------------------------------------
+// Creator fees (docs/creator-fee-lock.md): 20% claimable now, 80% at graduation, forfeited after 30 days.
+// ---------------------------------------------------------------------------
+const bn = (x: any): bigint => (x === undefined || x === null ? 0n : BigInt(x.toString()));
+/** Old accounts decode without the locked field (reads as 0). */
+function feeInput(c: any, m: any | null): FeeInput {
+  return {
+    complete: !!c.complete, createdTs: bn(c.createdTs),
+    sol: { early: bn(c.creatorFeesOwed), locked: bn(c.creatorFeesLocked) },
+    usdc: m ? { early: bn(m.creatorFees), locked: bn(m.creatorFeesLocked) } : null,
+  };
+}
+const nowS = () => BigInt(Math.floor(Date.now() / 1000));
+/** The panel body: numbers for everyone, claim buttons only when this wallet created the curve. */
+function feesHtml(c: any, m: any | null, buttons: boolean): string {
+  const v = feeView(feeInput(c, m), nowS());
+  const mine = buttons && c.creator.equals(wallet.publicKey);
+  const mint = esc(c.mint.toBase58());
+  const rows = v.streams.map((s) => `<div class="rows" style="margin:0"><div><span>${esc(s.label)} · claimable now</span><span>${esc(s.claimable)}</span></div>
+      <div><span>Locked until graduation</span><span>${esc(s.locked)}</span></div></div>`).join("");
+  const btns = mine ? `<div class="btns">${v.streams.map((s) =>
+    `<button class="primary" data-claim="${s.key}" data-mint="${mint}" ${s.canClaim && !st.busy ? "" : "disabled"} title="${esc(s.payNote)}">${esc(s.button)}</button>
+     <span class="muted" style="margin:-2px 0 2px">${esc(s.payNote)}${s.key === "usdc" ? "; your USDC account is created if missing" : ""}</span>`).join("")}</div>` : "";
+  return `${rows}<div class="${v.status === "overdue" || v.status === "forfeited" ? "warn" : "muted"}" style="margin:0">${esc(v.line)}</div>
+    <p class="note" style="margin:0">${esc(v.note)}</p>${btns}`;
+}
+function renderFees() {
+  setHtml($("feesBody"), st.curve ? feesHtml(st.curve, st.market, true) : `<span class="muted">Pick a market.</span>`);
+}
+function renderMine() {
+  ($("mineCard") as HTMLElement).hidden = st.mine.length === 0;
+  setHtml($("mine"), st.mine.map(({ curve: c, market: m }) =>
+    `<div class="ml"><div style="display:flex;justify-content:space-between;gap:8px;margin-bottom:6px"><button class="lnk" data-pick="${esc(c.mint.toBase58())}">${esc(c.name)} <span class="muted">$${esc(c.symbol)}</span></button></div>
+     <div class="fees">${feesHtml(c, m, true)}</div></div>`).join(""));
+}
+
 function render() {
+  renderMine();
   $("wAddr").textContent = short(wallet.publicKey);
   $("wSol").textContent = `${st.walletSol.toFixed(3)} SOL`;
   $("tAddr").textContent = short(trader.publicKey);
@@ -401,6 +457,7 @@ function render() {
     }
   }
   drawChart();
+  renderFees();
   renderTicket(mk);
   renderPositions(mk);
   $("sHeld").textContent = `${st.walletTokens.toLocaleString()} ${c.symbol}`;
@@ -735,6 +792,35 @@ async function openPosition() {
   await guarded("Open", () => sponsoredOrder(st.side, 0, col, Math.floor(size * 100) / 100));
 }
 
+/** Claims one creator-fee stream with the connected wallet, signed like launches and buys. Amounts are re-read first. */
+async function claimFees(mint: PublicKey, stream: "sol" | "usdc") {
+  await guarded(`Claim ${stream === "sol" ? "SOL" : "USDC"} fees`, async () => {
+    const curve = pda([enc("curve"), mint.toBuffer()], launch.programId);
+    const market = marketPda(perps.programId, mint);
+    const [cI, mI] = await connection.getMultipleAccountsInfo([curve, market]);
+    if (!cI) throw new Error("Curve not found.");
+    const c = launch.coder.accounts.decode("curve", cI.data);
+    if (!c.creator.equals(wallet.publicKey)) throw new Error("Only the creator's wallet can claim.");
+    const m = mI ? decodeMarket(perpsCoder, mI.data) : null;
+    const v = feeView(feeInput(c, m), nowS()).streams.find((s) => s.key === stream);
+    if (!v) throw new Error("This token has no perp market.");
+    if (!v.canClaim) throw new Error("Nothing to claim yet.");
+    let sig: string;
+    if (stream === "sol") {
+      sig = await launch.methods.claimCreatorFees().accountsPartial({ creator: wallet.publicKey, curve }).rpc();
+    } else {
+      if (!st.usdcMint) throw new Error("USDC mint not loaded yet. Try again in a moment.");
+      const creatorUsdc = getAssociatedTokenAddressSync(st.usdcMint, wallet.publicKey);
+      sig = await perps.methods.claimCreatorFees()
+        .accountsPartial({ creator: wallet.publicKey, vault: VAULT, vaultUsdc: VAULT_USDC, market, creatorUsdc, tokenProgram: TOKEN_PROGRAM_ID, curve })
+        .preInstructions([createAssociatedTokenAccountIdempotentInstruction(wallet.publicKey, creatorUsdc, wallet.publicKey, st.usdcMint)])
+        .rpc();
+    }
+    log(`Claimed ${v.claimable} of creator fees from $${c.symbol}`, sig);
+    await loadCurves();
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Wiring
 // ---------------------------------------------------------------------------
@@ -746,6 +832,21 @@ $("open").addEventListener("click", openPosition);
 $("pos").addEventListener("click", (e) => {
   const side = (e.target as HTMLElement).closest("[data-close]")?.getAttribute("data-close");
   if (side !== null && side !== undefined) guarded("Close", () => sponsoredOrder(Number(side), 1, 0, 0));
+});
+const onClaim = (e: Event) => {
+  const b = (e.target as HTMLElement).closest<HTMLElement>("[data-claim]");
+  if (b) void claimFees(new PublicKey(b.dataset.mint!), b.dataset.claim as "sol" | "usdc");
+};
+$("feesBody").addEventListener("click", onClaim);
+$("mine").addEventListener("click", (e) => {
+  onClaim(e);
+  const mint = (e.target as HTMLElement).closest("[data-pick]")?.getAttribute("data-pick");
+  if (!mint) return;
+  st.selected = new PublicKey(mint);
+  st.hist = [];
+  $("pos").innerHTML = "";
+  renderMarkets();
+  tick().catch(() => {});
 });
 $("markets").addEventListener("click", (e) => {
   const mint = (e.target as HTMLElement).closest("[data-mint]")?.getAttribute("data-mint");
@@ -796,6 +897,17 @@ loop();
 // ---------------------------------------------------------------------------
 const social = mountSocial($("social"), $("tabs"), {
   mainnet: MAINNET,
+  /** Read-only creator-fee card on the token risk page. */
+  async tokenExtra(mint) {
+    const key = new PublicKey(mint);
+    const [cI, mI] = await connection.getMultipleAccountsInfo([pda([enc("curve"), key.toBuffer()], launch.programId), marketPda(perps.programId, key)]);
+    if (!cI) return null;
+    const c = launch.coder.accounts.decode("curve", cI.data);
+    const card = document.createElement("div");
+    card.className = "card";
+    card.innerHTML = `<h3>Creator fees</h3><div class="fees" style="margin-top:8px">${feesHtml(c, mI ? decodeMarket(perpsCoder, mI.data) : null, false)}</div>`;
+    return card;
+  },
   explorer: (sig) => `https://explorer.solana.com/tx/${encodeURIComponent(sig)}${NET.cluster}`,
   signer: {
     address: () => wallet.publicKey.toBase58(),

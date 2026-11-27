@@ -5,7 +5,7 @@ import { AppCheckError, checkBuiltTransaction, describeBuilt, type BuiltView } f
 import { FEE_WALLET, JUPITER_FEE_ACCOUNTS, SPONSOR, SPONSOR_ADDRESS } from "./config";
 import type { CopyIntent, CopySettings, LeaderRow, RiskFlag, TokenFlags, Trade, Window } from "./types";
 
-export interface Env { signer: Signer; mainnet: boolean; explorer: (sig: string) => string }
+export interface Env { signer: Signer; mainnet: boolean; explorer: (sig: string) => string; /** Read-only extra card for a token (creator fees), or null when the token is not found. */ tokenExtra?: (mint: string) => Promise<HTMLElement | null> }
 
 type View =
   | { t: "feed" } | { t: "leaders" } | { t: "inbox" }
@@ -188,6 +188,9 @@ export function mountSocial(root: HTMLElement, tabs: HTMLElement, env: Env, onTa
     if (!isAddr(mint)) return void box.append(note("Not a valid token address.", "err"));
     const f: TokenFlags = await indexer.flags(mint);
     if (!live()) return;
+    const extra = env.tokenExtra ? await env.tokenExtra(mint).catch(() => null) : null;
+    if (!live()) return;
+    if (extra) box.append(extra);
     box.append(h("div", { class: "card" }, h("div", { class: "muted" }, mint), h("p", { class: "muted" }, `Based on ${f.trades} indexed trades. Flags are warnings, not proof; a clear result does not make a token safe.`)));
     const nS = f.snipers?.length ?? 0, nB = f.bundles?.length ?? 0, nI = f.insiders?.length ?? 0;
     box.append(h("div", { class: "card flags" },

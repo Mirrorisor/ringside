@@ -72,6 +72,8 @@ select{width:100%;min-height:42px;font-size:16px;border:1px solid var(--line);bo
 .warn{border:1px solid var(--short);background:var(--tint);border-radius:10px;padding:10px;font-size:14px;margin:8px 0}
 .intent{display:grid;gap:10px}.ihead{display:flex;justify-content:space-between}.cd{color:var(--rope)}
 .rows2{display:grid;gap:6px;font-size:14px}.rows2>div{display:flex;justify-content:space-between;gap:12px}.rows2 span{color:var(--soft)}.rows2 b{text-align:right}
+.ml{border-top:1px solid var(--line);padding:10px 0}.ml:first-child{border-top:0}
+.fees{display:grid;gap:8px}.fees .btns{display:grid;gap:6px}.fees .btns button{width:100%}
 @media(max-width:1100px){main{grid-template-columns:minmax(0,1fr)}}
 </style>
 </head>
@@ -105,6 +107,10 @@ select{width:100%;min-height:42px;font-size:16px;border:1px solid var(--line);bo
       <h3>Markets</h3>
       <div class="list" id="markets" style="margin-top:10px"><span class="muted">Loading from devnet…</span></div>
     </div>
+    <div class="card" id="mineCard" hidden>
+      <h3>My launches</h3>
+      <div id="mine" style="margin-top:6px"></div>
+    </div>
   </div>
 
   <div class="stack">
@@ -118,6 +124,10 @@ select{width:100%;min-height:42px;font-size:16px;border:1px solid var(--line);bo
       <div class="fig" id="chart"></div>
       <p class="muted" style="margin:6px 0 0">Grey = curve spot · dark = mark · red = ±15% band. Plotted from when you opened this page.</p>
       <div style="margin-top:12px"><div class="rows" style="margin:0 0 6px"><div><span>Bonding curve → graduation</span><span id="sProg">–</span></div></div><div class="bar"><i id="sProgBar" style="width:0"></i></div></div>
+    </div>
+    <div class="card">
+      <h3>Creator fees</h3>
+      <div class="fees" id="feesBody" style="margin-top:8px"><span class="muted">Pick a market.</span></div>
     </div>
     <div class="card">
       <h3>Your positions <span class="muted">(trading account)</span></h3>
