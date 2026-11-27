@@ -181,8 +181,16 @@
     {
       "name": "auto_deleverage",
       "docs": [
-        "Auto-deleverage a profitable position once the market's budget is spent.",
-        "Keepers rank by unrealised PnL off-chain and close the most profitable first."
+        "Auto-deleverage a profitable position at the mark, with no fee, while the",
+        "market is in ADL mode. Anyone may call it, and the program cannot list a",
+        "market's positions, so it cannot force the most profitable one first.",
+        "What it enforces: the call first re-checks the budget (a recovered market",
+        "leaves ADL mode and the call returns without closing anything), and any",
+        "other positions the caller passes after the price accounts (remaining",
+        "accounts; Tier 1+ markets put the 4 pool accounts first) must have a",
+        "profit ratio (PnL net of funding / collateral) no higher than the target's.",
+        "The keeper passes the next-ranked positions. A caller who omits them is",
+        "still limited to profitable positions, at the mark, in ADL mode only."
       ],
       "discriminator": [
         210,
@@ -1948,7 +1956,9 @@
         "Step 1 of a withdrawal: moves shares out of the LP account into a",
         "request that unlocks after WITHDRAW_DELAY_SECONDS. The shares stay in",
         "total_shares, so they keep sharing the vault's PnL until paid out.",
-        "Adding to an open request restarts its timer."
+        "Adding to an open request, or requesting again after one expired,",
+        "restarts its timer and re-records the share price: the whole request is",
+        "then paid at the lower of that price and the price at completion."
       ],
       "discriminator": [
         251,
@@ -1968,6 +1978,45 @@
           "relations": [
             "lp"
           ]
+        },
+        {
+          "name": "vault",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault_usdc",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  117,
+                  115,
+                  100,
+                  99
+                ]
+              }
+            ]
+          }
         },
         {
           "name": "lp",
@@ -2054,6 +2103,43 @@
           "name": "market",
           "docs": [
             "because an account too small for `Market` cannot be deserialized."
+          ],
+          "writable": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "resize_withdrawal",
+      "docs": [
+        "Permissionless migration helper: grows a `WithdrawalRequest` made before",
+        "the request-time price fields existed. New bytes are zero, which reads as",
+        "\"no recorded price\" (paid at the current one). No-op if already large enough."
+      ],
+      "discriminator": [
+        120,
+        24,
+        37,
+        5,
+        177,
+        29,
+        132,
+        242
+      ],
+      "accounts": [
+        {
+          "name": "payer",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "request",
+          "docs": [
+            "because an account too small for `WithdrawalRequest` cannot be deserialized."
           ],
           "writable": true
         },
@@ -2348,6 +2434,60 @@
       ]
     },
     {
+      "name": "set_paused",
+      "docs": [
+        "Admin: pauses or resumes new risk. While paused: no new or larger",
+        "positions (`request_order` increase, and `execute_order` refunds queued",
+        "increases), no LP deposits (`deposit_liquidity`, `deposit_to_treasury`).",
+        "Still allowed: close and reduce orders, cancel_order, liquidations, ADL,",
+        "every LP withdrawal step, funding and band cranks, price refreshes,",
+        "fee claims and compounding, market admin and graduation."
+      ],
+      "discriminator": [
+        91,
+        60,
+        125,
+        192,
+        176,
+        225,
+        166,
+        218
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "signer": true,
+          "relations": [
+            "vault"
+          ]
+        },
+        {
+          "name": "vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "paused",
+          "type": "bool"
+        }
+      ]
+    },
+    {
       "name": "set_price_authority",
       "discriminator": [
         51,
@@ -2572,7 +2712,11 @@
     {
       "name": "withdraw_liquidity",
       "docs": [
-        "Step 2: once unlocked, pays the request's shares at the vault's value now."
+        "Step 2: once unlocked, and for WITHDRAWAL_WINDOW_SECONDS after that,",
+        "pays the request's shares at the LOWER of the vault's value per share",
+        "when requested and now. A later gain stays with the remaining LPs, a",
+        "later loss is borne by the leaver. Requests resized from the old layout",
+        "have no recorded price and are paid at the current one."
       ],
       "discriminator": [
         149,
@@ -2820,6 +2964,19 @@
   ],
   "events": [
     {
+      "name": "AdlCleared",
+      "discriminator": [
+        54,
+        70,
+        14,
+        15,
+        11,
+        64,
+        40,
+        13
+      ]
+    },
+    {
       "name": "AuthorityAccepted",
       "discriminator": [
         166,
@@ -2872,6 +3029,19 @@
       ]
     },
     {
+      "name": "InsuranceSpent",
+      "discriminator": [
+        127,
+        1,
+        190,
+        54,
+        81,
+        125,
+        197,
+        66
+      ]
+    },
+    {
       "name": "MarketCreated",
       "discriminator": [
         88,
@@ -2921,6 +3091,19 @@
         17,
         195,
         208
+      ]
+    },
+    {
+      "name": "PausedSet",
+      "discriminator": [
+        171,
+        125,
+        127,
+        156,
+        233,
+        81,
+        68,
+        66
       ]
     },
     {
@@ -3147,9 +3330,40 @@
       "code": 6028,
       "name": "AcceptablePriceRequired",
       "msg": "Every order needs a non-zero acceptable price"
+    },
+    {
+      "code": 6029,
+      "name": "WithdrawalExpired",
+      "msg": "The withdrawal request expired; request again"
+    },
+    {
+      "code": 6030,
+      "name": "VaultHasNoAssets",
+      "msg": "The vault has shares but no LP assets; deposits are refused"
+    },
+    {
+      "code": 6031,
+      "name": "AdlWrongTarget",
+      "msg": "A passed position has a higher profit ratio than the ADL target"
     }
   ],
   "types": [
+    {
+      "name": "AdlCleared",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "trader_net_pnl",
+            "type": "i64"
+          }
+        ]
+      }
+    },
     {
       "name": "AuthorityAccepted",
       "type": {
@@ -3321,6 +3535,22 @@
               "The 80% of creator fees held until graduation. APPENDED after `bump`:",
               "curves created before this field existed need `resize_curve`."
             ],
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "InsuranceSpent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
             "type": "u64"
           }
         ]
@@ -3635,6 +3865,18 @@
           {
             "name": "rent_payer",
             "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PausedSet",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "paused",
+            "type": "bool"
           }
         ]
       }
@@ -3962,6 +4204,19 @@
           {
             "name": "bump",
             "type": "u8"
+          },
+          {
+            "name": "request_assets",
+            "docs": [
+              "LP assets and total shares when the request was made (the share price it",
+              "can't be paid above). APPENDED after `bump`: requests made before these",
+              "existed need `resize_withdrawal`, and read as zero = no recorded price."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "request_total_shares",
+            "type": "u64"
           }
         ]
       }
