@@ -134,7 +134,9 @@ async function main() {
   check(Math.abs(poolPx / curvePx - 1) < 0.0005, `Raydium pool ${pool.toBase58().slice(0, 8)}… opened at the curve's final price (${(Number(sol) / LAMPORTS_PER_SOL).toFixed(3)} SOL + ${(Number(tokens) / 1e6 / 1e6).toFixed(1)}M tokens)`);
   const lpMint = await getMint(connection, pda([enc("pool_lp_mint"), pool.toBuffer()], CPMM));
   check(lpMint.supply <= 100n, "all LP tokens burned (only Raydium's locked 100 units remain)");
-  const m = await until("graduate_market", 120, async () => {
+  // The keeper refreshes its market list once a minute and cranks every market each loop,
+  // so graduate_market can land a few minutes after the migrate.
+  const m = await until("graduate_market", 300, async () => {
     const x = await perps.account.market.fetch(market);
     return x.tier >= 1 ? x : null;
   });
