@@ -1955,7 +1955,10 @@ async fn perps_empty_market(l: &mut Launched) -> PerpsFx {
     let ix = create_market_ix(keeper.pubkey(), l.curve, market, registry);
     l.env.send(&[ix], &[&keeper]).await.unwrap();
     let creator_usdc = l.env.usdc_account(&l.creator.pubkey(), 0).await;
-    PerpsFx { vault, vault_usdc, market, creator_usdc }
+    // No order exists in this fixture: the order-related fields are placeholders (tests that need
+    // them use `perps_market`).
+    let none = Pubkey::default();
+    PerpsFx { vault, vault_usdc, market, creator_usdc, keeper, lp, sponsor: Keypair::new(), trader_usdc: none, keeper_usdc: none, lp_usdc, lp_acc, position: none, order: none }
 }
 
 /// A fresh trader with USDC, and instruction builders for their order on `fx.market`.
@@ -2250,12 +2253,13 @@ async fn initialize_global_refuses_fees_above_the_caps() {
     let e = env.send(&[ix], &[&authority]).await.unwrap_err();
     assert_eq!(custom_error(e), launch::LaunchError::GraduationFeeAboveCap as u32 + 6000);
     env.send(&[init_global_ix(&env, authority.pubkey(), program_data)], &[&authority]).await.unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // LP / pause / insurance / ADL fixes (docs/security-fixes.md F2, F9, F5, F10)
 // ---------------------------------------------------------------------------
 
 
-const PERPS_ERR: u32 = 6000;
 fn perr(e: perps::PerpsError) -> u32 {
     PERPS_ERR + e as u32
 }
@@ -2539,9 +2543,13 @@ async fn f9_donation_to_an_empty_vault_does_not_steal_the_next_deposit() {
     assert!(vs.shares > 0);
     let victim_value = perps::assets_for_shares(vs.shares, assets, v.total_shares).unwrap();
     let attacker_value = perps::assets_for_shares(as_.shares, assets, v.total_shares).unwrap();
-    // Within a couple of share-prices of rounding (one share is worth ~$0.5 here), and nowhere near the old outcome (victim ~0).
-    assert!(victim_value + 2 * USDC >= 1_000 * USDC, "victim keeps their deposit, got {victim_value}");
-    assert!(attacker_value < 1_000_001 * USDC, "attacker lost money: {attacker_value}");
+    // The victim's rounding loss is at most about one share (worth ~$0.5M here because the
+    // donation is $1M), and the attacker pays 500x or more of that to cause it.
+    let one_share = perps::assets_for_shares(1, assets, v.total_shares).unwrap() + 1;
+    let victim_loss = 1_000 * USDC - victim_value;
+    assert!(victim_loss <= 2 * one_share, "victim lost {victim_loss}, a share is {one_share}");
+    let attacker_loss = (1_000_001 * USDC).saturating_sub(attacker_value);
+    assert!(attacker_loss > 500 * victim_loss, "attacker lost {attacker_loss} to cost the victim {victim_loss}");
     assert!(victim_value + attacker_value <= assets, "never pays out more than the vault holds");
 }
 

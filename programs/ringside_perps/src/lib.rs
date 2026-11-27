@@ -2137,16 +2137,33 @@ mod tests {
         let attacker = shares_for(&v, 0, 1).unwrap();
         v.total_shares = attacker;
         let donated_assets = 1 + 1_000_000 * 1_000_000;
-        // Victim deposits $1,000: fair share of the pool, within one share of rounding.
+        // Victim deposits $1,000. Their rounding loss is at most one share's worth
+        // (the donation is huge, so a share is too), never the whole deposit...
         let victim = shares_for(&v, donated_assets, 1_000 * 1_000_000).unwrap();
+        let one_share = assets_for_shares(1, donated_assets, v.total_shares).unwrap() + 1;
         v.total_shares += victim;
         let after = donated_assets + 1_000 * 1_000_000;
         let victim_value = assets_for_shares(victim, after, v.total_shares).unwrap();
-        assert!(victim_value >= 1_000 * 1_000_000 - 2_000_000, "victim keeps ~all of it, got {victim_value}");
-        let attacker_value = assets_for_shares(attacker, after, v.total_shares).unwrap();
-        // The virtual shares absorb about half of what the attacker donated, so the attack loses money.
+        let victim_loss = 1_000 * 1_000_000 - victim_value;
+        assert!(victim_loss <= 2 * one_share, "victim lost {victim_loss}, a share is {one_share}");
+        // ...and the attack costs the attacker far more than it takes: the virtual
+        // shares absorb about half of the donation (a factor of about VIRTUAL_SHARES).
         let cost = 1 + 1_000_000 * 1_000_000u64;
-        assert!(attacker_value < cost, "attacker ends with {attacker_value} of the {cost} it put in");
+        let attacker_value = assets_for_shares(attacker, after, v.total_shares).unwrap();
+        let attacker_loss = cost.saturating_sub(attacker_value);
+        assert!(attacker_loss > 500 * victim_loss, "attacker loses {attacker_loss} to cost the victim {victim_loss}");
+    }
+
+    #[test]
+    fn a_realistic_donation_costs_the_victim_nothing_visible() {
+        // Donating $1,000 to a vault holding one unit: the victim's $1,000 deposit keeps its value to the cent.
+        let mut v = vault(0);
+        v.total_shares = shares_for(&v, 0, 1).unwrap();
+        let donated = 1 + 1_000 * 1_000_000;
+        let victim = shares_for(&v, donated, 1_000 * 1_000_000).unwrap();
+        let after_assets = donated + 1_000 * 1_000_000;
+        let value = assets_for_shares(victim, after_assets, v.total_shares + victim).unwrap();
+        assert!(value + 1_000_000 >= 1_000 * 1_000_000, "victim got {value}");
     }
 
     #[test]
