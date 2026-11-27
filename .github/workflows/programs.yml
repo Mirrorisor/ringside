@@ -4,6 +4,7 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch: # run on any branch, e.g. to take its regenerated IDLs from the artifact
 
 permissions:
   contents: read
