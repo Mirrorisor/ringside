@@ -1,0 +1,80 @@
+name: programs
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  AGAVE_VERSION: v2.3.13
+  ANCHOR_VERSION: 0.31.1
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Unit tests, the end-to-end perps flow and the Raydium graduation test. All run
+  # natively (processor entry points), so no Solana toolchain is needed here.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - run: cargo test -p ringside_perps -p ringside_launch
+      - run: cargo test
+        working-directory: tests
+      - run: cargo test
+        working-directory: tests-graduation
+
+  # SBF build with the devnet feature. Fails on any SBF stack-frame warning (the
+  # same rule upgrade.sh and mainnet.sh enforce before deploying), and on IDLs
+  # that no longer match the source.
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install Agave and Anchor
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/agave" "$HOME/.local/bin"
+          curl -sSfL "https://github.com/anza-xyz/agave/releases/download/$AGAVE_VERSION/solana-release-x86_64-unknown-linux-gnu.tar.bz2" \
+            | tar -xj -C "$RUNNER_TEMP/agave"
+          echo "$RUNNER_TEMP/agave/solana-release/bin" >> "$GITHUB_PATH"
+          curl -sSfL -o "$HOME/.local/bin/anchor" \
+            "https://github.com/solana-foundation/anchor/releases/download/v$ANCHOR_VERSION/anchor-$ANCHOR_VERSION-x86_64-unknown-linux-gnu"
+          chmod +x "$HOME/.local/bin/anchor"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          rustup toolchain install stable --profile minimal
+          rustup toolchain install nightly --profile minimal   # Anchor's IDL step
+      - run: anchor --version && solana --version
+      - name: anchor build (devnet feature)
+        run: |
+          set -o pipefail
+          anchor build -- --features devnet 2>&1 | tee build.log
+      - name: No SBF stack-frame warnings
+        run: |
+          if grep -qi "stack offset" build.log; then
+            grep -i "stack offset" build.log | sort -u
+            echo "::error::A program function overflows the 4 KB SBF stack frame"
+            exit 1
+          fi
+      - name: Committed IDLs match the source
+        run: |
+          if ! git diff --exit-code --stat -- target/idl; then
+            echo "::error::target/idl is stale: run anchor build and commit target/idl"
+            exit 1
+          fi
+
+  scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: for f in scripts/*.sh; do bash -n "$f"; done
+      # A Solana CLI config file missing fields is silently ignored and the CLI falls
+      # back to mainnet-beta (the services.sh relayer top-up bug). Any script that
+      # writes one must write websocket_url too.
+      - name: Solana CLI config files are complete
+        run: |
+          bad=$(grep -n "json_rpc_url:" scripts/*.sh | grep -v "^[^:]*:[0-9]*:\s*#" | grep -v "websocket_url" || true)
+          if [ -n "$bad" ]; then echo "$bad"; echo "::error::incomplete Solana CLI config (add websocket_url, address_labels, commitment)"; exit 1; fi
