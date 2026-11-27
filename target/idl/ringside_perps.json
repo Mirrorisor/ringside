@@ -367,7 +367,9 @@
     {
       "name": "cancel_withdrawal",
       "docs": [
-        "Puts a pending request's shares back in the LP account."
+        "Puts a pending request's shares back in the LP account. The request",
+        "account stays (empty) to remember when it was cancelled: the next",
+        "request must wait WITHDRAWAL_RECANCEL_COOLDOWN."
       ],
       "discriminator": [
         183,
@@ -3345,6 +3347,11 @@
       "code": 6031,
       "name": "AdlWrongTarget",
       "msg": "A passed position has a higher profit ratio than the ADL target"
+    },
+    {
+      "code": 6032,
+      "name": "WithdrawalCooldown",
+      "msg": "Withdrawal re-request is on cooldown after a cancel or an expired request"
     }
   ],
   "types": [
@@ -4217,6 +4224,14 @@
           {
             "name": "request_total_shares",
             "type": "u64"
+          },
+          {
+            "name": "cancel_ts",
+            "docs": [
+              "When the request was last cancelled (0 = never). APPENDED: requests",
+              "from before need `resize_withdrawal`, and read as never cancelled."
+            ],
+            "type": "i64"
           }
         ]
       }
