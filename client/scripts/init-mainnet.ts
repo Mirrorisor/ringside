@@ -5,7 +5,13 @@
  *      0.5% protocol / 0.3% creator / 0.2% insurance on curve trades;
  *   2. perps vault on Circle USDC, with the manual SOL price authority set to a
  *      key nobody holds (11111111111111111111111111111111), so only Pyth moves SOL/USD;
- *   3. risk params: OI cap 1.5% of the SOL behind the price (the program's default is 1%; this script sets 1.5%),
+ *   3. a seed deposit: this wallet pays SEED_DEPOSIT_USDC (default 1000) into the vault with
+ *      deposit_to_treasury, so the vault is never empty for outsiders (first-depositor donation attack,
+ *      docs/security-fixes.md F9). The LP shares go to the treasury (the multisig), not to this key, so
+ *      they are protocol-owned and only a multisig vote can withdraw them. Runs right after set_treasury
+ *      and before the admin handover; skipped when the vault already has shares. The wallet must hold
+ *      the USDC (checked before anything is sent, also in the dry run);
+ *   4. risk params: OI cap 1.5% of the SOL behind the price (the program's default is 1%; this script sets 1.5%),
  *      net exposure 25% of that.
  *
  * Who may run it: `initialize_global` and `initialize_vault` accept only the
@@ -24,14 +30,16 @@
  *   - prints everything and waits for CONFIRM=yes before sending.
  *
  * Env: ANCHOR_PROVIDER_URL, ANCHOR_WALLET, FEE_RECIPIENT, INSURANCE_RECIPIENT,
- *      MIGRATION_AUTHORITY (optional, defaults to FEE_RECIPIENT), MULTISIG, CONFIRM=yes.
+ *      MIGRATION_AUTHORITY (optional, defaults to FEE_RECIPIENT), MULTISIG,
+ *      SEED_DEPOSIT_USDC (optional, default 1000), CONFIRM=yes.
  * Idempotent: steps already done on chain are skipped.
  */
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import anchor from "@coral-xyz/anchor";
 import { Connection, Keypair, PublicKey, SystemProgram } from "@solana/web3.js";
-import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
+import { TOKEN_PROGRAM_ID, getAccount, getAssociatedTokenAddressSync } from "@solana/spl-token";
+import { decideSeed, formatUsdc, parseSeedAmount } from "../src/seeddeposit.js";
 
 const { AnchorProvider, Program, Wallet, BN } = anchor;
 const ROOT = resolve(import.meta.dirname, "../..");
@@ -97,6 +105,8 @@ async function main() {
     if (key.equals(NOBODY)) die(`${name} is the system program address: SOL sent there is lost, and it cannot be changed later`);
   }
   // The Squads vault: owns protocol-owned liquidity now, and is proposed as admin of both programs at the end.
+  let seedAmount: bigint;
+  try { seedAmount = parseSeedAmount(process.env.SEED_DEPOSIT_USDC); } catch (e: any) { return die(e.message); }
   const multisig = new PublicKey(process.env.MULTISIG ?? die("set MULTISIG to the Squads vault address (not the multisig account)"));
   const walletPath = process.env.ANCHOR_WALLET ?? `${process.env.HOME}/.config/solana/id.json`;
   const payer = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(readFileSync(walletPath, "utf8"))));
@@ -127,9 +137,21 @@ async function main() {
   const launchProgramData = pda([launch.programId.toBuffer()], BPF_UPGRADEABLE);
   const perpsProgramData = pda([perps.programId.toBuffer()], BPF_UPGRADEABLE);
   const p = MAINNET_PARAMS;
+  // Seed deposit preflight: needs the USDC in this wallet before ANYTHING is sent, so a short wallet
+  // cannot leave a half-initialized, empty vault behind.
+  const myUsdc = getAssociatedTokenAddressSync(USDC_MAINNET, payer.publicKey);
+  const usdcBalance = await getAccount(connection, myUsdc).then((a) => a.amount, () => 0n);
+  const vaultInfo = await connection.getAccountInfo(vault);
+  const sharesNow = vaultInfo ? BigInt((await perps.account.vault.fetch(vault)).totalShares.toString()) : null;
+  const seed = decideSeed(sharesNow, usdcBalance, seedAmount);
+  if (seed.action === "insufficient") {
+    die(`seed deposit: this wallet (${payer.publicKey.toBase58()}) holds ${formatUsdc(seed.have)} USDC in ${myUsdc.toBase58()} but ` +
+      `needs ${formatUsdc(seed.need)} (SEED_DEPOSIT_USDC). Fund it with USDC, or set a smaller SEED_DEPOSIT_USDC, and re-run. Nothing was sent.`);
+  }
   console.log(`
 Admin (this key):   ${payer.publicKey.toBase58()}
-Fee recipient:      ${fee.toBase58()}   (fixed for the life of the program: no setter)
+Seed deposit:       ${seed.action === "skip" ? `skipped (${seed.reason})` : `${formatUsdc(seedAmount)} USDC from this wallet (has ${formatUsdc(usdcBalance)}), shares owned by the multisig`}`);
+  console.log(`Fee recipient:      ${fee.toBase58()}   (fixed for the life of the program: no setter)
 Insurance:          ${insurance.toBase58()}   (fixed: no setter)
 Migration auth:     ${migration.toBase58()}   (stored, unused by the program)
 Multisig (Squads):  ${multisig.toBase58()} (treasury now; admin once it accepts)
@@ -192,6 +214,24 @@ Risk:               OI cap ${p.tier0CapBps / 100}% of SOL behind the price, net 
     await perps.methods.setTreasury(multisig).accountsPartial({ authority: payer.publicKey, vault, treasuryConfig, systemProgram: SystemProgram.programId }).rpc();
     console.log("✓ treasury (owner of protocol-owned LP shares) = multisig");
   }
+  // Seed deposit: before the handover below and before anyone is told the vault exists. deposit_to_treasury
+  // mints the shares to the treasury (set to the multisig just above), never to this key.
+  const seedNow = decideSeed(BigInt((await perps.account.vault.fetch(vault)).totalShares.toString()), usdcBalance, seedAmount);
+  if (seedNow.action === "skip") {
+    console.log(`• seed deposit skipped: ${seedNow.reason}`);
+  } else if (seedNow.action === "insufficient") {
+    die(`seed deposit: wallet holds ${formatUsdc(seedNow.have)} USDC, needs ${formatUsdc(seedNow.need)}`);
+  } else {
+    const sig = await perps.methods
+      .depositToTreasury(new BN(seedAmount.toString()))
+      .accountsPartial({
+        depositor: payer.publicKey, vault, vaultUsdc, treasuryConfig,
+        treasuryLp: pda([Buffer.from("lp"), multisig.toBuffer()], perps.programId),
+        depositorUsdc: myUsdc, tokenProgram: TOKEN_PROGRAM_ID, systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+    console.log(`✓ seed deposit ${formatUsdc(seedAmount)} USDC, shares owned by the multisig ${sig}`);
+  }
   for (const [program, admin, name] of [[perps, vault, "perps vault"], [launch, global, "launch global config"]] as const) {
     const current = program === perps ? (await perps.account.vault.fetch(vault)).authority : (await launch.account.global.fetch(global)).authority;
     if (!current.equals(payer.publicKey)) { console.log(`• ${name} admin is already ${current.toBase58()}`); continue; }
@@ -205,7 +245,7 @@ Risk:               OI cap ${p.tier0CapBps / 100}% of SOL behind the price, net 
       console.log(`\n! ${name}'s upgrade authority is still this key. Move it to the multisig now:\n    solana program set-upgrade-authority ${id.toBase58()} --new-upgrade-authority ${multisig.toBase58()} -u mainnet-beta`);
     }
   }
-  console.log("\nDone. Next: seed the vault (deposit_liquidity), start two keepers with PYTH_API_KEY and NETWORK=mainnet, then the relayer.");
+  console.log("\nDone (the vault is already seeded). Next: start two keepers with PYTH_API_KEY and NETWORK=mainnet, then the relayer.");
 }
 
 main().then(() => process.exit(0), (e) => die(e.message ?? String(e)));

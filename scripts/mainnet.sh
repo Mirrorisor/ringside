@@ -43,10 +43,13 @@ cat <<'MSG'
        solana program deploy target/deploy/ringside_perps.so  --program-id target/deploy/ringside_perps-keypair.json  -u mainnet-beta
   3. Configure FIRST (dry run, then CONFIRM=yes), with the deployer key: initialize_global and
      initialize_vault accept only the programs' upgrade authority, and the script checks every field
-     of anything that already exists:
+     of anything that already exists. The same run makes the SEED DEPOSIT (deposit_to_treasury,
+     SEED_DEPOSIT_USDC, default 1000; LP shares owned by the multisig) right after the vault and
+     treasury exist and before the admin handover, so fund the deployer wallet's USDC account first
+     (the script refuses to start otherwise). Do not announce the vault before it prints "seed deposit":
        cd client && ANCHOR_PROVIDER_URL=<mainnet RPC> FEE_RECIPIENT=<treasury> INSURANCE_RECIPIENT=<insurance> \
-         MULTISIG=<SQUADS_VAULT> npx tsx scripts/init-mainnet.ts
+         MULTISIG=<SQUADS_VAULT> [SEED_DEPOSIT_USDC=1000] npx tsx scripts/init-mainnet.ts
   4. Then move both upgrade authorities to the Squads multisig:
        solana program set-upgrade-authority <PROGRAM_ID> --new-upgrade-authority <SQUADS_VAULT> -u mainnet-beta
-  5. Seed the vault, start two keepers (PYTH_API_KEY, NETWORK=mainnet) and the relayer, then open the beta.
+  5. Start two keepers (PYTH_API_KEY, NETWORK=mainnet) and the relayer, then open the beta.
 MSG
