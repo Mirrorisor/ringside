@@ -249,7 +249,18 @@ export class SqliteStore implements Store {
   private db: DatabaseSync;
   private stmts = new Map<string, StatementSync>();
 
-  constructor(path = ":memory:") {
+  /**
+   * `readOnly` is for a second process (the copy service) reading a file the indexer owns: it opens the
+   * file read-only, runs no schema, pragma or aggregate rebuild, and waits up to 5 s on a busy database.
+   * The file must already exist (the indexer creates it, in WAL mode, so readers never block its writes
+   * nor see half a transaction). Any write method then throws.
+   */
+  constructor(path = ":memory:", opts: { readOnly?: boolean } = {}) {
+    if (opts.readOnly) {
+      this.db = new DatabaseSync(path, { readOnly: true });
+      this.db.exec("PRAGMA busy_timeout = 5000");
+      return;
+    }
     this.db = new DatabaseSync(path);
     this.db.exec(SCHEMA);
     const v = this.db.prepare("SELECT value FROM meta WHERE key = 'agg_version'").get() as Row | undefined;

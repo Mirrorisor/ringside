@@ -122,6 +122,7 @@ Run: `SESSION_SECRET=... SOCIAL_DOMAIN=... node dist/social/main.js`. Binds to `
 | `SOCIAL_NONCE_BIND_IP` | on | no | `0` stops binding sign-in nonces to the requesting IP |
 | `SOCIAL_MAX_STREAMS` / `SOCIAL_MAX_STREAMS_PER_IP` | `2000` / `20` | no | Open notification streams, total and per IP |
 | `SOCIAL_TRUST_PROXY` | off | no | `1` keys clients by the last `X-Forwarded-For` entry |
+| `SOCIAL_INTERNAL_SECRET` | unset (routes answer 404) | for the copy service (32+ bytes) | Enables `/internal/copy/*` for the separate copy process: loopback peers only, bearer secret, no CORS, refused with `Origin` or `X-Forwarded-For` |
 
 ### Gas sponsor (`client/src/sponsor.ts`)
 
@@ -161,7 +162,9 @@ A library, not a process. `createSessionToken` mints `v1.<payload>.<mac>`, an HM
 
 Turns a leader's indexed trade into one-tap copy intents for followers: it checks their settings and risk flags, then builds the unsigned transaction on the right venue (Pump.fun, Meteora, Jupiter, or Ringside perps) for the follower to sign. The indexer reports trades to `POST /ingest/trade`. Follower routes need a `copy` token; `GET /health` is unauthenticated.
 
-Run: **not yet runnable on its own.** `main.ts` exports `startCopyService(social, indexerStore)` and has no entry point; the social port is not wired (see the TODO in the file). It listens on `127.0.0.1:8793`.
+Run (its own process, `127.0.0.1:8793`): `bash scripts/services.sh start indexer social copy`, or by hand `SESSION_SECRET=... COPY_INGEST_SECRET=... SOCIAL_INTERNAL_SECRET=... COPY_RPC_URL=... COPY_FEE_WALLET=... node dist/copy/main.js`. Start the indexer first (the copy process opens its database) and give the social service the same `SOCIAL_INTERNAL_SECRET`.
+
+How it reaches the other two: the **social port** is HTTP to the social backend's loopback-only `/internal/copy/settings` and `/internal/copy/notify` routes (`copy/socialport.ts`), authenticated with `SOCIAL_INTERNAL_SECRET` (32+ bytes, different from `SESSION_SECRET`, never sent with CORS headers, a session token is not accepted). The copy process never opens the social database, so it cannot see nonces or revocations, and notifications still reach the live streams because the social process does the write. The **indexer** is its SQLite file (`INDEXER_DB`), opened read-only; the indexer runs in WAL mode, so the two processes do not block each other.
 
 | Variable | Default | Required | Purpose |
 | --- | --- | --- | --- |
@@ -169,6 +172,9 @@ Run: **not yet runnable on its own.** `main.ts` exports `startCopyService(social
 | `COPY_INGEST_SECRET` | none | yes | Secret for `POST /ingest/trade` |
 | `COPY_RPC_URL` | none | yes | Solana RPC for building and confirming |
 | `COPY_FEE_WALLET` | none | yes | Receives the Pump.fun and Meteora trade fee |
+| `SOCIAL_INTERNAL_SECRET` | none | yes (32+ bytes) | Shared with the social service; authenticates the copy process to its internal routes |
+| `SOCIAL_INTERNAL_URL` | `http://127.0.0.1:$SOCIAL_PORT` (8791) | no | Social backend base URL; must be http on a loopback host |
+| `INDEXER_DB` | `./indexer.db` | no | Indexer SQLite file, opened read-only; must already exist |
 | `COPY_PORT` | `8793` | no | HTTP port |
 | `COPY_HOST` | `127.0.0.1` | no | Bind address |
 | `COPY_DB` | `copy.sqlite` | no | SQLite file |

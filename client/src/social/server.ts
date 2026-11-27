@@ -16,10 +16,16 @@
  *   GET /notifications?limit&before                -> {notifications, next}
  *   GET /notifications/stream                      Server-Sent Events (Authorization: Bearer)
  *   GET /health
+ *
+ * Internal, for the separate copy process (only when SOCIAL_INTERNAL_SECRET is set; otherwise 404):
+ *   GET  /internal/copy/settings?leader=<wallet>   -> {settings: CopySettings[]}   enabled settings of current followers
+ *   POST /internal/copy/notify {follower, intent}  -> {ok: true}                    stores the notification and feeds the SSE streams
+ * Loopback peers only, `Authorization: Bearer <secret>` (32+ bytes, constant-time compare), refused when an Origin or
+ * X-Forwarded-For header is present, and never given CORS headers. A session token is not accepted here.
  */
 import { createHmac } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { RateLimiter, clientKey } from "../indexer/server.js";
+import { RateLimiter, clientKey, secretMatches } from "../indexer/server.js";
 import { hmacSessionAuth, createSessionToken, MIN_SECRET_BYTES, type Authenticator } from "../session.js";
 import type { CopySettings, RiskFlag } from "./ports.js";
 import { buildMessage, decodeSignature, isWallet, newNonce, nonceOf, verifyEd25519 } from "./siws.js";
@@ -67,6 +73,8 @@ export interface SocialOptions {
   /** Open notification streams: global and per client IP. */
   maxStreams?: number;
   maxStreamsPerIp?: number;
+  /** SOCIAL_INTERNAL_SECRET: enables the /internal/copy/* routes for the copy process. At least 32 bytes; must differ from `secret`. */
+  internalSecret?: string;
 }
 
 class HttpError extends Error {
@@ -100,6 +108,11 @@ export function createSocialServer(opts: SocialOptions): Server {
   const { store, domain } = opts;
   if (Buffer.byteLength(opts.secret ?? "", "utf8") < MIN_SECRET_BYTES) throw new Error(`SESSION_SECRET must be at least ${MIN_SECRET_BYTES} bytes`);
   if (!domain || /[\s/]/.test(domain)) throw new Error("SOCIAL_DOMAIN must be a bare domain such as app.example.com");
+  const internalSecret = opts.internalSecret ?? "";
+  if (internalSecret) {
+    if (Buffer.byteLength(internalSecret, "utf8") < MIN_SECRET_BYTES) throw new Error(`SOCIAL_INTERNAL_SECRET must be at least ${MIN_SECRET_BYTES} bytes`);
+    if (internalSecret === opts.secret) throw new Error("SOCIAL_INTERNAL_SECRET must differ from SESSION_SECRET");
+  }
   const origins = new Set(opts.corsOrigins ?? []);
   for (const o of origins) if (o === "*" || !/^https?:\/\/[^\s/*]+$/.test(o)) throw new Error("SOCIAL_CORS_ORIGIN must list exact origins, never *");
   const authenticate = opts.authenticate ?? hmacSessionAuth(opts.secret, { aud: "social", revocation: store });
@@ -316,9 +329,39 @@ export function createSocialServer(opts: SocialOptions): Server {
     });
   }
 
+  // ---- internal (copy process) ----
+  const LOOPBACK = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
+  async function internal(req: IncomingMessage, res: ServerResponse, path: string, method: string, url: URL) {
+    if (!internalSecret) throw new HttpError(404, "not_found", "Not found.");
+    // No CORS, ever: a browser must not reach this. No proxy hop either: a forwarded request is not the local copy process.
+    if (req.headers.origin !== undefined || req.headers["x-forwarded-for"] !== undefined || !LOOPBACK.has(req.socket.remoteAddress ?? ""))
+      throw new HttpError(403, "forbidden", "Forbidden.");
+    const h = req.headers.authorization;
+    const given = typeof h === "string" ? /^Bearer\s+(\S+)$/i.exec(h)?.[1] : undefined;
+    if (!secretMatches(given, internalSecret)) throw new HttpError(401, "unauthorized", "Unauthorized.");
+    if (path === "/internal/copy/settings") {
+      if (method !== "GET") throw new HttpError(405, "method_not_allowed", "Method not allowed.");
+      return send(res, 200, { settings: await store.copySettingsForLeader(walletParam(url.searchParams.get("leader") ?? "")) });
+    }
+    if (path === "/internal/copy/notify") {
+      if (method !== "POST") throw new HttpError(405, "method_not_allowed", "Method not allowed.");
+      const b = await readJson(req);
+      const intent = b.intent as Record<string, unknown> | undefined;
+      if (!isWallet(b.follower) || !intent || typeof intent !== "object" || intent.follower !== b.follower || typeof intent.id !== "string" || !intent.id || intent.id.length > 128)
+        throw bad("invalid_intent", "Invalid notification.");
+      await store.notify(b.follower, intent as never);
+      return send(res, 200, { ok: true });
+    }
+    throw new HttpError(404, "not_found", "Not found.");
+  }
+
   // ---- routing ----
   async function route(req: IncomingMessage, res: ServerResponse) {
     const origin = req.headers.origin;
+    if (typeof req.url === "string" && req.url.startsWith("/internal/")) {
+      const u = new URL(req.url, "http://social.local");
+      return internal(req, res, u.pathname, req.method ?? "GET", u);
+    }
     if (typeof origin === "string" && origins.has(origin)) {
       res.setHeader("access-control-allow-origin", origin);
       res.setHeader("vary", "Origin");

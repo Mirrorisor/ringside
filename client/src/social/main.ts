@@ -13,6 +13,8 @@
  *   SOCIAL_SESSION_TTL_SECONDS  default 43200 (12 h)
  *   SOCIAL_NONCE_BIND_IP=0    do not bind sign-in nonces to the requesting IP (mobile networks that change IP)
  *   SOCIAL_MAX_STREAMS / _PER_IP   open notification streams, global and per IP (defaults 2000 / 20)
+ *   SOCIAL_INTERNAL_SECRET    at least 32 bytes, different from SESSION_SECRET; enables the loopback-only /internal/copy/* routes
+ *                             that the separate copy process uses as its SocialPort (unset: those routes answer 404)
  *   SOCIAL_TRUST_PROXY=1      key clients by the last X-Forwarded-For entry
  */
 import { MIN_SECRET_BYTES } from "../session.js";
@@ -53,6 +55,7 @@ const server = createSocialServer({
   maxStreams: num("SOCIAL_MAX_STREAMS", 2000),
   maxStreamsPerIp: num("SOCIAL_MAX_STREAMS_PER_IP", 20),
   trustProxy: process.env.SOCIAL_TRUST_PROXY === "1",
+  internalSecret: process.env.SOCIAL_INTERNAL_SECRET || undefined,
 });
 server.listen(port, process.env.SOCIAL_HOST ?? "127.0.0.1", () => console.log(`[social] listening on :${port}, db ${dbPath}`));
 

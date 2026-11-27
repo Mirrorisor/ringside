@@ -10,7 +10,11 @@
 # Ports: relayer 8787, keeper health 8789, indexer 8790, social 8791, sponsor 8792, copy 8793 (override with
 # INDEXER_PORT, SOCIAL_PORT, SPONSOR_PORT, COPY_PORT). Secrets are read from the environment and never printed.
 # Required env: indexer HELIUS_WEBHOOK_SECRET; social SESSION_SECRET and SOCIAL_DOMAIN; sponsor
-# SPONSOR_SESSION_SECRET (or SESSION_SECRET) and SPONSOR_KEYPAIR_PATH. Everything else keeps the service's own defaults.
+# SPONSOR_SESSION_SECRET (or SESSION_SECRET) and SPONSOR_KEYPAIR_PATH; copy SESSION_SECRET, COPY_INGEST_SECRET,
+# SOCIAL_INTERNAL_SECRET (32+ bytes, the same value in the social service's environment; it is how the separate copy
+# process reaches the social backend over loopback), COPY_FEE_WALLET, and COPY_RPC_URL (defaults to the RPC below).
+# The copy service also needs the indexer's database file (INDEXER_DB, default client/indexer.db), which it opens
+# read-only, so start the indexer first. Everything else keeps the service's own defaults.
 set -euo pipefail
 . "$HOME/.cargo/env" 2>/dev/null || true
 export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"
@@ -62,15 +66,18 @@ start_svc() {
   if [ -n "$(svc_pid "$svc")" ]; then echo "  $svc already running (pid $(svc_pid "$svc"))"; return 0; fi
   case $svc in
     indexer) need_env HELIUS_WEBHOOK_SECRET:16 || { echo "indexer: missing required env" >&2; return 1; };;
-    social)  need_env SESSION_SECRET:32 SOCIAL_DOMAIN || { echo "social: missing required env" >&2; return 1; };;
+    social)
+      need_env SESSION_SECRET:32 SOCIAL_DOMAIN || { echo "social: missing required env" >&2; return 1; }
+      # Optional: turns on the loopback-only internal routes the copy process uses. Set but too short is an error.
+      [ -z "${SOCIAL_INTERNAL_SECRET:-}" ] || need_env SOCIAL_INTERNAL_SECRET:32 || { echo "social: missing required env" >&2; return 1; };;
     sponsor)
       [ -n "${SPONSOR_SESSION_SECRET:-}" ] || export SPONSOR_SESSION_SECRET=${SESSION_SECRET:-}   # the service accepts either name
       need_env SPONSOR_SESSION_SECRET:32 SPONSOR_KEYPAIR_PATH || { echo "sponsor: missing required env (SPONSOR_SESSION_SECRET or SESSION_SECRET, SPONSOR_KEYPAIR_PATH)" >&2; return 1; }
       [ -f "$SPONSOR_KEYPAIR_PATH" ] || { echo "sponsor: SPONSOR_KEYPAIR_PATH does not point to a file" >&2; return 1; };;
     copy)
-      echo "copy: cannot be started on its own yet: client/src/copy/main.ts exports startCopyService() and has no entry point" >&2
-      echo "      (the social port is not wired; see the TODO there). Status and stop work once it runs on :$COPY_PORT." >&2
-      return 1;;
+      [ -n "${COPY_RPC_URL:-}" ] || export COPY_RPC_URL=$RPC   # the RPC may carry an API key: it travels in the environment, never argv
+      need_env SESSION_SECRET:32 COPY_INGEST_SECRET:32 SOCIAL_INTERNAL_SECRET:32 COPY_RPC_URL COPY_FEE_WALLET || { echo "copy: missing required env" >&2; return 1; }
+      [ -f "client/${INDEXER_DB:-./indexer.db}" ] || [ -f "${INDEXER_DB:-}" ] || { echo "copy: the indexer database was not found (INDEXER_DB, default client/indexer.db); start the indexer first" >&2; return 1; };;
   esac
   ( cd client && npm run build --silent )
   echo "▸ Starting $svc on :$(svc_port "$svc") (logs: $LOG/$svc.log)"
@@ -78,6 +85,7 @@ start_svc() {
     indexer) (cd client; INDEXER_PORT=$INDEXER_PORT nohup node "$(svc_entry indexer)" > "$LOG/indexer.log" 2>&1 & echo $! > "$LOG/indexer.pid");;
     social)  (cd client; SOCIAL_PORT=$SOCIAL_PORT nohup node "$(svc_entry social)" > "$LOG/social.log" 2>&1 & echo $! > "$LOG/social.pid");;
     sponsor) (cd client; RPC_URL=$RPC SPONSOR_PORT=$SPONSOR_PORT nohup node "$(svc_entry sponsor)" > "$LOG/sponsor.log" 2>&1 & echo $! > "$LOG/sponsor.pid");;
+    copy)    (cd client; COPY_PORT=$COPY_PORT SOCIAL_PORT=$SOCIAL_PORT nohup node "$(svc_entry copy)" > "$LOG/copy.log" 2>&1 & echo $! > "$LOG/copy.pid");;
   esac
   local i; for i in $(seq 1 20); do svc_ok "$svc" && { echo "  $svc is up"; return 0; }; sleep 1; done
   echo "$svc did not become healthy; last log lines:" >&2; tail -n 15 "$LOG/$svc.log" >&2
