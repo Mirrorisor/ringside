@@ -358,6 +358,10 @@
     },
     {
       "name": "claim_creator_fees",
+      "docs": [
+        "Pays the creator `creator_fees_owed` (the early 20%) at any time, plus",
+        "`creator_fees_locked` once the curve has graduated."
+      ],
       "discriminator": [
         0,
         23,
@@ -719,6 +723,72 @@
           }
         }
       ]
+    },
+    {
+      "name": "forfeit_creator_fees",
+      "docs": [
+        "Permissionless. Once the curve is `CREATOR_FEE_FORFEIT_SECONDS` old and",
+        "has not graduated, moves the locked creator fees to the protocol's",
+        "`fee_recipient` and zeroes them. The early share stays claimable."
+      ],
+      "discriminator": [
+        209,
+        158,
+        142,
+        212,
+        116,
+        83,
+        163,
+        116
+      ],
+      "accounts": [
+        {
+          "name": "global",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  103,
+                  108,
+                  111,
+                  98,
+                  97,
+                  108
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "curve",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  117,
+                  114,
+                  118,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "curve.mint",
+                "account": "Curve"
+              }
+            ]
+          }
+        },
+        {
+          "name": "fee_recipient",
+          "writable": true
+        }
+      ],
+      "args": []
     },
     {
       "name": "initialize_global",
@@ -1354,6 +1424,44 @@
       "args": []
     },
     {
+      "name": "resize_curve",
+      "docs": [
+        "Permissionless migration helper: grows a `Curve` created before",
+        "`creator_fees_locked` existed to the current size (the payer funds the",
+        "extra rent; new bytes are zero, so the new field reads 0). No-op if the",
+        "account is already large enough."
+      ],
+      "discriminator": [
+        217,
+        219,
+        141,
+        228,
+        198,
+        97,
+        45,
+        188
+      ],
+      "accounts": [
+        {
+          "name": "payer",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "curve",
+          "docs": [
+            "because an account too small for `Curve` cannot be deserialized."
+          ],
+          "writable": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "sell",
       "discriminator": [
         51,
@@ -1797,6 +1905,19 @@
       ]
     },
     {
+      "name": "CreatorFeesForfeited",
+      "discriminator": [
+        89,
+        98,
+        201,
+        15,
+        249,
+        156,
+        67,
+        126
+      ]
+    },
+    {
       "name": "CurveCompleted",
       "discriminator": [
         1,
@@ -1923,7 +2044,12 @@
     {
       "code": 6014,
       "name": "CreatorFeesLocked",
-      "msg": "Creator fees are locked until the curve completes or 7 days after launch"
+      "msg": "Deprecated, unused: the 7-day creator fee lock was replaced by the 20/80 split"
+    },
+    {
+      "code": 6015,
+      "name": "NotForfeitable",
+      "msg": "Creator fees can be forfeited only 30 days after launch, if the curve has not graduated"
     }
   ],
   "types": [
@@ -1970,6 +2096,22 @@
           },
           {
             "name": "dev_buy_lamports",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "CreatorFeesForfeited",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
             "type": "u64"
           }
         ]
@@ -2083,6 +2225,14 @@
           {
             "name": "bump",
             "type": "u8"
+          },
+          {
+            "name": "creator_fees_locked",
+            "docs": [
+              "The 80% of creator fees held until graduation. APPENDED after `bump`:",
+              "curves created before this field existed need `resize_curve`."
+            ],
+            "type": "u64"
           }
         ]
       }

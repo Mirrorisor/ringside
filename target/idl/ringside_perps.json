@@ -333,6 +333,10 @@
     },
     {
       "name": "claim_creator_fees",
+      "docs": [
+        "Pays the creator `creator_fees` (the early 20%) at any time, plus",
+        "`creator_fees_locked` once the market's curve has graduated."
+      ],
       "discriminator": [
         0,
         23,
@@ -403,6 +407,68 @@
         {
           "name": "token_program",
           "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        },
+        {
+          "name": "curve",
+          "docs": [
+            "The market's launch curve; read for graduation. Appended last."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  117,
+                  114,
+                  118,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "curve.mint",
+                "account": "Curve"
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                143,
+                154,
+                1,
+                58,
+                154,
+                160,
+                155,
+                182,
+                239,
+                18,
+                68,
+                180,
+                195,
+                105,
+                126,
+                22,
+                216,
+                227,
+                158,
+                4,
+                18,
+                131,
+                34,
+                134,
+                246,
+                99,
+                18,
+                41,
+                77,
+                116,
+                179,
+                32
+              ]
+            }
+          }
         }
       ],
       "args": []
@@ -1103,6 +1169,112 @@
       "args": []
     },
     {
+      "name": "forfeit_creator_fees",
+      "docs": [
+        "Permissionless. Once the market's curve is `CREATOR_FEE_FORFEIT_SECONDS`",
+        "old and has not graduated, moves the market's locked creator fees into",
+        "`vault.protocol_fees` (compoundable into treasury LP shares). No USDC",
+        "moves and `vault.reserved` is unchanged: both buckets are part of it."
+      ],
+      "discriminator": [
+        209,
+        158,
+        142,
+        212,
+        116,
+        83,
+        163,
+        116
+      ],
+      "accounts": [
+        {
+          "name": "vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "market",
+          "writable": true
+        },
+        {
+          "name": "curve",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  117,
+                  114,
+                  118,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "curve.mint",
+                "account": "Curve"
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                143,
+                154,
+                1,
+                58,
+                154,
+                160,
+                155,
+                182,
+                239,
+                18,
+                68,
+                180,
+                195,
+                105,
+                126,
+                22,
+                216,
+                227,
+                158,
+                4,
+                18,
+                131,
+                34,
+                134,
+                246,
+                99,
+                18,
+                41,
+                77,
+                116,
+                179,
+                32
+              ]
+            }
+          },
+          "relations": [
+            "market"
+          ]
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "graduate_market",
       "docs": [
         "Permissionless: once the token's curve has migrated to Raydium, move its",
@@ -1668,6 +1840,43 @@
           "type": "u64"
         }
       ]
+    },
+    {
+      "name": "resize_market",
+      "docs": [
+        "Permissionless migration helper: grows a `Market` created before",
+        "`creator_fees_locked` existed to the current size (the payer funds the",
+        "extra rent; new bytes are zero). No-op if already large enough."
+      ],
+      "discriminator": [
+        173,
+        141,
+        122,
+        135,
+        233,
+        45,
+        38,
+        214
+      ],
+      "accounts": [
+        {
+          "name": "payer",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "docs": [
+            "because an account too small for `Market` cannot be deserialized."
+          ],
+          "writable": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
     },
     {
       "name": "retire_market",
@@ -2461,6 +2670,19 @@
       ]
     },
     {
+      "name": "CreatorFeesForfeited",
+      "discriminator": [
+        89,
+        98,
+        201,
+        15,
+        249,
+        156,
+        67,
+        126
+      ]
+    },
+    {
       "name": "MarketCreated",
       "discriminator": [
         88,
@@ -2716,6 +2938,16 @@
       "code": 6024,
       "name": "NotRetirable",
       "msg": "Market can't be retired: it has open interest, its curve sold out, or it traded in the last 7 days"
+    },
+    {
+      "code": 6025,
+      "name": "CreatorFeesLocked",
+      "msg": "Deprecated, unused: the 7-day creator fee lock was replaced by the 20/80 split"
+    },
+    {
+      "code": 6026,
+      "name": "NotForfeitable",
+      "msg": "Creator fees can be forfeited only 30 days after launch, if the curve has not graduated"
     }
   ],
   "types": [
@@ -2755,6 +2987,22 @@
           {
             "name": "trader_net_pnl",
             "type": "i64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "CreatorFeesForfeited",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
           }
         ]
       }
@@ -2867,6 +3115,14 @@
           {
             "name": "bump",
             "type": "u8"
+          },
+          {
+            "name": "creator_fees_locked",
+            "docs": [
+              "The 80% of creator fees held until graduation. APPENDED after `bump`:",
+              "curves created before this field existed need `resize_curve`."
+            ],
+            "type": "u64"
           }
         ]
       }
@@ -2970,6 +3226,14 @@
           {
             "name": "bump",
             "type": "u8"
+          },
+          {
+            "name": "creator_fees_locked",
+            "docs": [
+              "Locked 80% of creator fees. APPENDED after `bump`: markets created",
+              "before this field existed need `resize_market`."
+            ],
+            "type": "u64"
           }
         ]
       }
