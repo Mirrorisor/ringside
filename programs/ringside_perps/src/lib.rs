@@ -115,7 +115,7 @@ pub const WITHDRAWAL_WINDOW_SECONDS: i64 = 600;
 /// Virtual shares and assets in every share/asset conversion (ERC-4626 style
 /// offset): the first share is never worth more than a sliver, so donating USDC
 /// to an empty or tiny vault cannot make later deposits round to nothing.
-pub const VIRTUAL_SHARES: u128 = 1_000_000;
+pub const VIRTUAL_SHARES: u128 = 1_000;
 pub const VIRTUAL_ASSETS: u128 = 1;
 /// A market in ADL mode leaves it once its net trader profit is back under this
 /// share of its budget (the budget itself flips it on, so this is hysteresis).
