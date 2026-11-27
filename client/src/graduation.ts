@@ -126,9 +126,25 @@ export async function retireMarketIx(payer: Address, market: Address, curve: Add
 
 // --- Curve decoding -----------------------------------------------------------
 
-export interface CurveState { key: Address; mint: Address; complete: boolean; migrated: boolean; virtualSol: bigint; virtualTokens: bigint; realSol: bigint }
+export interface CurveState {
+  key: Address; mint: Address; complete: boolean; migrated: boolean; virtualSol: bigint; virtualTokens: bigint; realSol: bigint;
+  /** Unix seconds the curve was created (the forfeit clock starts here). */
+  createdTs: bigint;
+  /** The locked 80% of creator fees (lamports). 0 for an account too short to hold it. */
+  creatorFeesLocked: bigint;
+}
 
-/** Curve: disc | mint | creator | name | symbol | uri (borsh strings) | virtual_sol | virtual_tokens | real_sol | real_tokens | fees | dev_locked | dev_unlock_ts | complete | migrated … */
+/**
+ * Mirrors CREATOR_FEE_FORFEIT_SECONDS in programs/ringside_launch/src/lib.rs (30 days). After this long,
+ * a curve that has not graduated lets anyone forfeit its locked creator fees. Keep the two in step.
+ */
+export const CREATOR_FEE_FORFEIT_SECONDS = 30n * 24n * 3600n;
+
+/**
+ * Curve: disc | mint | creator | name | symbol | uri (borsh strings) | virtual_sol | virtual_tokens | real_sol | real_tokens |
+ * fees_owed | dev_locked | dev_unlock_ts | complete | migrated | created_slot | created_ts | price_cumulative u128 |
+ * last_price u128 | last_slot | observations 32 x (u64 + u128) | obs_index | obs_count | bump | creator_fees_locked.
+ */
 export function decodeCurve(key: Address, d: Uint8Array): CurveState {
   const v = new DataView(d.buffer, d.byteOffset, d.byteLength);
   const mint = addressAt(d, 8);
@@ -136,7 +152,12 @@ export function decodeCurve(key: Address, d: Uint8Array): CurveState {
   for (let i = 0; i < 3; i++) o += 4 + v.getUint32(o, true);
   const virtualSol = v.getBigUint64(o, true), virtualTokens = v.getBigUint64(o + 8, true), realSol = v.getBigUint64(o + 16, true);
   o += 8 * 7;
-  return { key, mint, virtualSol, virtualTokens, realSol, complete: d[o] !== 0, migrated: d[o + 1] !== 0 };
+  const createdTs = v.getBigInt64(o + 2 + 8, true);
+  // complete, migrated, created_slot, created_ts, price_cumulative, last_price, last_slot, observations, obs_index, obs_count, bump
+  const lockedAt = o + 2 + 8 + 8 + 16 + 16 + 8 + 32 * 24 + 3;
+  // An account too short to hold the field (not yet resized) reads as 0.
+  const creatorFeesLocked = lockedAt + 8 <= d.byteLength ? v.getBigUint64(lockedAt, true) : 0n;
+  return { key, mint, virtualSol, virtualTokens, realSol, complete: d[o] !== 0, migrated: d[o + 1] !== 0, createdTs, creatorFeesLocked };
 }
 
 /** Global: disc | authority | fee_recipient | … */

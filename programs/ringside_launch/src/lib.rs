@@ -1369,6 +1369,25 @@ mod tests {
         }
     }
 
+    /// Prints a serialized Curve so the TypeScript decoder can be checked against the real
+    /// layout (client/test/layout.mjs, line `CURVE <hex>`).
+    #[test]
+    fn print_curve_fixture() {
+        use anchor_lang::AccountSerialize;
+        let mut c = fresh_curve();
+        c.mint = Pubkey::new_from_array([1; 32]);
+        c.name = "Name".into();
+        c.symbol = "SYM".into();
+        c.uri = "https://example.com/m.json".into();
+        c.complete = false;
+        c.migrated = true;
+        c.created_ts = 1_700_000_000;
+        c.creator_fees_locked = 424_242;
+        let mut out = Vec::new();
+        c.try_serialize(&mut out).unwrap();
+        println!("CURVE {}", out.iter().map(|b| format!("{b:02x}")).collect::<String>());
+    }
+
     #[test]
     fn creator_fee_split_floors_early_and_sums_exactly() {
         for fee in [0u64, 1, 4, 5, 6, 9, 10, 1_234_567, u64::MAX] {

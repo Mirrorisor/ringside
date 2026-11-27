@@ -30,7 +30,7 @@ This code is public and **unaudited**. Treat it as a reference for review, not s
 | --- | --- |
 | `programs/ringside_launch` | Token creation, 800M-token constant-product bonding curve, TWAP accumulator, 7-day dev-buy lock, permissionless `migrate` into Raydium CPMM |
 | `programs/ringside_perps` | USDC vault, per-token markets, two-step orders, funding, liquidation, risk budget, ADL, `graduate_market` (pool TWAP pricing), `refresh_sol_price` (Pyth) |
-| `client/src/keeper.ts` | Fills orders, liquidates, cranks funding and the band, runs ADL, refreshes Pyth, migrates sold-out curves and graduates their markets |
+| `client/src/keeper.ts` | Fills orders, liquidates, cranks funding and the band, runs ADL, refreshes Pyth, migrates sold-out curves and graduates their markets, forfeits non-graduated creator fees after 30 days |
 | `client/src/relayer.ts` | Fee relayer: co-signs for trading accounts after policy checks and a simulated spend cap |
 | `client/src/rings.ts` | Rings privacy rails: shield in, fund a trading account, shield out, private payouts |
 | `client/src/graduation.ts`, `client/src/pyth.ts` | Raydium addresses and migrate/graduate instructions; Pyth poster |
@@ -66,6 +66,7 @@ The `devnet` feature gives curves 0.5 virtual SOL (so a curve sells out for ~1.5
 ## Operations
 
 - **Alerts.** The keeper posts to `ALERT_WEBHOOK_URL` (Slack or Discord) when the SOL price is over 90 s old, an order sits 30+ slots past its fill delay, a market goes reduce-only or into ADL, the keeper or relayer drops below 0.2 SOL, or the loop fails 5 times in a row. Each alert fires once and again when it clears (repeated hourly while open). `GET :8789/health` returns 503 when the loop hasn't succeeded for a minute.
+- **Creator-fee forfeit.** The keeper forfeits the locked 80% of creator fees on curves that have not graduated 30 days after launch (every 10 minutes at most, `FORFEIT_EVERY_MS`; `FORFEIT_CRANK=0` turns it off).
 - **Sponsorship fee.** With `FEE_RECOVERY_TREASURY` set, the relayer requires a small USDC transfer to that treasury in each sponsored order; the app adds it automatically from `/v1/info`.
 - **Protocol-owned liquidity ($RING).** The keeper compounds protocol fees into treasury LP shares hourly (`COMPOUND_PROTOCOL_FEES=0` turns it off). `npx tsx scripts/treasury.ts sweep` (treasury key as `ANCHOR_WALLET`, `RING_MINT` set) claims $RING's creator fees and deposits them; `treasury.ts limits <mint> 0 1` keeps $RING's market reduce-only. See the spec's $RING section.
 

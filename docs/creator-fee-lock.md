@@ -112,9 +112,12 @@ catches up.
 - Launch: the forfeited SOL is paid to `global.fee_recipient`. It becomes protocol-owned liquidity ONLY if
   the treasury sweep (`client/scripts/treasury.ts`) later swaps that SOL to USDC (`SWAP_SOL=1`) and calls
   `deposit_to_treasury`. That step is off chain and needs a running job and Jupiter; no program does it.
-- Nothing calls `forfeit_creator_fees` automatically yet. It is permissionless, but a keeper or the sweep has to
-  be taught to scan for markets and curves past 30 days. Until then forfeits only happen if someone sends the
-  transaction.
+- The keeper calls `forfeit_creator_fees` automatically (`forfeit()` in `client/src/keeper.ts`, at most every
+  `FORFEIT_EVERY_MS`, default 10 minutes; `FORFEIT_CRANK=0` turns it off). It scans all curves and markets and
+  sends the launch forfeit for each curve that is not complete, is past `created_ts` + 30 days (plus a 60 s margin on
+  the keeper's own clock) and holds locked lamports, and the perps forfeit for each market with locked USDC whose
+  curve meets the same condition. The 30 days are mirrored in `client/src/graduation.ts`
+  (`CREATOR_FEE_FORFEIT_SECONDS`). The program still decides; a refusal is logged and retried later.
 
 ## Audit notes
 - Rounding: early is floored, so the creator never gets more than 20% and the remainder is locked; a fee of 0..4

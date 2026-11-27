@@ -11,7 +11,9 @@
  *   - keeps SOL/USD fresh from Pyth (posting its own verified update when the
  *     sponsored feed is stale),
  *   - graduates sold-out curves: migrate to a Raydium pool, then move the perp
- *     market to the pool's price.
+ *     market to the pool's price,
+ *   - forfeits the locked creator fees of curves that have not graduated 30 days
+ *     after launch (FORFEIT_CRANK=0 turns this off).
  *
  * Liquidation and ADL eligibility is decided by the program, so the keeper
  * simulates each candidate and sends only what would succeed.
@@ -46,7 +48,7 @@ import { createHash } from "node:crypto";
 import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import { PythPoster } from "./pyth.js";
 import { Monitor, FILL_LAG_SLOTS, LOW_SOL_LAMPORTS, STALE_PRICE_S, type Condition } from "./monitor.js";
-import { LAUNCH_PROGRAM, decodeCurve, decodeFeeRecipient, graduateMarketIx, migrateIx, priceAccounts, retireMarketIx } from "./graduation.js";
+import { CREATOR_FEE_FORFEIT_SECONDS, LAUNCH_PROGRAM, type CurveState, decodeCurve, decodeFeeRecipient, graduateMarketIx, migrateIx, priceAccounts, retireMarketIx } from "./graduation.js";
 import { installLogRedaction } from "./logredact.js";
 
 export const PERPS_PROGRAM = address(process.env.PERPS_PROGRAM_ID ?? "DsZ69w3q25nRmAzJCRBMLbwZWN6NyVbYipTWsCAUsg1F");
@@ -60,6 +62,9 @@ const GRADUATION_SCAN_EVERY_MS = 20_000;
 const RETIRE_SCAN_EVERY_MS = 3_600_000;
 const MONITOR_EVERY_MS = 30_000;
 const COMPOUND_EVERY_MS = 3_600_000;
+const FORFEIT_EVERY_MS = Number(process.env.FORFEIT_EVERY_MS ?? 600_000);
+/** The keeper uses its own clock, so it waits this long past the 30 days to never send before the chain agrees. */
+export const FORFEIT_SAFETY_MARGIN_S = 60n;
 /** Compound protocol fees once at least this much (USDC, 6 dp) has accrued. */
 const COMPOUND_MIN = BigInt(process.env.COMPOUND_MIN_USDC_E6 ?? "1000000");
 /** After a fill fails for a reason other than timing, leave that order alone this long. */
@@ -79,6 +84,7 @@ const IX = {
   crankFunding: disc("global", "crank_funding"),
   setSolPrice: disc("global", "set_sol_price"),
   compoundProtocolFees: disc("global", "compound_protocol_fees"),
+  forfeitCreatorFees: disc("global", "forfeit_creator_fees"), // same name and 8 bytes in both programs
 };
 const ACC = {
   order: disc("account", "OrderRequest"),
@@ -99,13 +105,15 @@ class Reader {
   bool() { return this.u8() !== 0; }
   u64() { const v = this.view().getBigUint64(this.o, true); this.o += 8; return v; }
   i64() { const v = this.view().getBigInt64(this.o, true); this.o += 8; return v; }
+  /** Reads a u64, or 0 when the account is too short to hold it (not yet resized). */
+  u64OrZero() { return this.o + 8 <= this.d.byteLength ? this.u64() : 0n; }
   u128() { const lo = this.u64(); const hi = this.u64(); return (hi << 64n) | lo; }
   i128() { const lo = this.u64(); const hi = this.i64(); return (hi << 64n) + lo; }
 }
 
 export interface OrderRequest { key: Address; owner: Address; market: Address; side: number; kind: number; requestSlot: bigint; rentPayer: Address }
 export interface Position { key: Address; owner: Address; market: Address; side: number; collateral: bigint; sizeUsd: bigint; entryQ64: bigint }
-export interface Market { key: Address; mint: Address; curve: Address; tier: number; reduceOnly: boolean; adlMode: boolean; bandAnchorQ64: bigint }
+export interface Market { key: Address; mint: Address; curve: Address; tier: number; reduceOnly: boolean; adlMode: boolean; bandAnchorQ64: bigint; creatorFeesLocked: bigint }
 
 export function decodeOrder(key: Address, d: Uint8Array): OrderRequest {
   const r = new Reader(d);
@@ -131,7 +139,24 @@ export function decodeMarket(key: Address, d: Uint8Array): Market {
   r.i128(); r.i64(); // funding_index, last_funding_ts
   const bandAnchorQ64 = r.u128();
   r.u64(); r.i128(); r.u64(); r.u64(); // band_anchor_slot, trader_net_pnl, insurance, creator_fees
-  return { key, mint, curve, tier, reduceOnly: r.bool(), adlMode: r.bool(), bandAnchorQ64 };
+  const reduceOnly = r.bool(), adlMode = r.bool();
+  r.u8(); // bump
+  return { key, mint, curve, tier, reduceOnly, adlMode, bandAnchorQ64, creatorFeesLocked: r.u64OrZero() };
+}
+
+/**
+ * Which curves and markets may have their locked creator fees forfeited at `nowSec` (unix seconds).
+ * A curve qualifies when it has not graduated, is at least 30 days old (plus a safety margin) and holds
+ * locked fees. A market qualifies when its own curve is past that time and not complete, and the market
+ * holds locked fees. Pure: no RPC.
+ */
+export function forfeitTargets(curves: CurveState[], markets: Market[], nowSec: bigint): { curves: CurveState[]; markets: Market[] } {
+  const due = (c: CurveState) => !c.complete && nowSec >= c.createdTs + CREATOR_FEE_FORFEIT_SECONDS + FORFEIT_SAFETY_MARGIN_S;
+  const dueCurves = new Map(curves.filter(due).map((c) => [c.key as string, c]));
+  return {
+    curves: [...dueCurves.values()].filter((c) => c.creatorFeesLocked > 0n),
+    markets: markets.filter((m) => m.creatorFeesLocked > 0n && dueCurves.has(m.curve)),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -154,6 +179,7 @@ export class Keeper {
   private lastRetireScan = 0;
   private lastMonitor = 0;
   private lastCompound = 0;
+  private lastForfeit = 0;
   private warnedNoTreasury = false;
   monitor = new Monitor(process.env.ALERT_WEBHOOK_URL);
   /** Markets deliberately limited by the admin (e.g. the protocol's own token): no reduce-only alerts. */
@@ -264,6 +290,12 @@ export class Keeper {
     if (Date.now() - this.lastGradScan > GRADUATION_SCAN_EVERY_MS) {
       this.lastGradScan = Date.now();
       await this.graduate();
+    }
+
+    // 3b. Forfeit the locked creator fees of curves that never graduated (30 days; the program decides).
+    if (process.env.FORFEIT_CRANK !== "0" && Date.now() - this.lastForfeit > FORFEIT_EVERY_MS) {
+      this.lastForfeit = Date.now();
+      await this.forfeit();
     }
 
     // 4. Retire dead launches so their Tier 0 slots free up (hourly; the program decides).
@@ -393,16 +425,47 @@ export class Keeper {
     return m.tier >= 1 ? priceAccounts(m.mint) : [];
   }
 
-  private async graduate() {
+  private async launchCurves(): Promise<CurveState[]> {
     const curves = await this.rpc
       .getProgramAccounts(LAUNCH_PROGRAM, {
         encoding: "base64",
         filters: [{ memcmp: { offset: 0n, bytes: base58(disc("account", "Curve")), encoding: "base58" } }],
       })
       .send();
-    const decoded = (curves as unknown as { pubkey: Address; account: { data: [string, string] } }[]).map((a) =>
+    return (curves as unknown as { pubkey: Address; account: { data: [string, string] } }[]).map((a) =>
       decodeCurve(a.pubkey, new Uint8Array(Buffer.from(a.account.data[0], "base64"))),
     );
+  }
+
+  /** Permissionless: curves still open 30 days after launch lose their locked creator fees (launch: to the fee recipient; perps: to protocol fees). */
+  private async forfeit() {
+    // Keeper's clock, with a margin in forfeitTargets so it never sends early.
+    const now = BigInt(Math.floor(Date.now() / 1000));
+    const curves = await this.launchCurves();
+    await this.refreshMarkets();
+    const targets = forfeitTargets(curves, [...this.markets.values()], now);
+    if (targets.curves.length === 0 && targets.markets.length === 0) return;
+    const [global] = await getProgramDerivedAddress({ programAddress: LAUNCH_PROGRAM, seeds: [new TextEncoder().encode("global")] });
+    for (const c of targets.curves) {
+      await this.guard(`forfeit:${c.key}`, async () => {
+        const g = await this.rpc.getAccountInfo(global, { encoding: "base64" }).send();
+        const feeRecipient = decodeFeeRecipient(new Uint8Array(Buffer.from(g.value!.data[0], "base64")));
+        // launch ForfeitCreatorFees: global, curve (mut), fee_recipient (mut). No signer.
+        await this.sendIx({ programAddress: LAUNCH_PROGRAM, accounts: [ro(global), w(c.key), w(feeRecipient)], data: IX.forfeitCreatorFees });
+        console.log(`[keeper] forfeited ${c.creatorFeesLocked} lamports (creator fees) on ${c.mint}`);
+      });
+    }
+    for (const m of targets.markets) {
+      await this.guard(`forfeit:${m.key}`, async () => {
+        // perps ForfeitCreator: vault (mut), market (mut), curve. No signer.
+        await this.sendIx({ programAddress: PERPS_PROGRAM, accounts: [w(this.vault), w(m.key), ro(m.curve)], data: IX.forfeitCreatorFees });
+        console.log(`[keeper] forfeited ${Number(m.creatorFeesLocked) / 1e6} USDC (creator fees) on ${m.mint}`);
+      });
+    }
+  }
+
+  private async graduate() {
+    const decoded = await this.launchCurves();
     for (const c of decoded.filter((c) => c.complete && !c.migrated)) {
       await this.guard(`migrate:${c.mint}`, async () => {
         const [global] = await getProgramDerivedAddress({ programAddress: LAUNCH_PROGRAM, seeds: [new TextEncoder().encode("global")] });
