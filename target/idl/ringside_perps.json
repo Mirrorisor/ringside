@@ -1389,6 +1389,93 @@
           "name": "usdc_mint"
         },
         {
+          "name": "program_data",
+          "docs": [
+            "This program's ProgramData account, which the upgradeable loader keeps at",
+            "the PDA of the program id and which names the upgrade authority. Only that",
+            "authority may initialize: whoever calls first becomes vault admin and",
+            "picks the USDC mint."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  191,
+                  63,
+                  145,
+                  10,
+                  52,
+                  63,
+                  39,
+                  86,
+                  160,
+                  45,
+                  35,
+                  247,
+                  83,
+                  162,
+                  124,
+                  148,
+                  6,
+                  18,
+                  173,
+                  21,
+                  201,
+                  252,
+                  158,
+                  85,
+                  49,
+                  79,
+                  110,
+                  28,
+                  105,
+                  32,
+                  70,
+                  106
+                ]
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                2,
+                168,
+                246,
+                145,
+                78,
+                136,
+                161,
+                176,
+                226,
+                16,
+                21,
+                62,
+                247,
+                99,
+                174,
+                43,
+                0,
+                194,
+                185,
+                61,
+                22,
+                193,
+                36,
+                210,
+                192,
+                83,
+                122,
+                16,
+                4,
+                128,
+                0,
+                0
+              ]
+            }
+          }
+        },
+        {
           "name": "vault_usdc",
           "writable": true,
           "pda": {
@@ -2948,6 +3035,11 @@
       "code": 6026,
       "name": "NotForfeitable",
       "msg": "Creator fees can be forfeited only 30 days after launch, if the curve has not graduated"
+    },
+    {
+      "code": 6027,
+      "name": "NotUpgradeAuthority",
+      "msg": "Only the program's upgrade authority can initialize it"
     }
   ],
   "types": [
@@ -3234,6 +3326,17 @@
               "before this field existed need `resize_market`."
             ],
             "type": "u64"
+          },
+          {
+            "name": "pool",
+            "docs": [
+              "The Raydium pool this market prices from, fixed once at `graduate_market`.",
+              "APPENDED after `creator_fees_locked` (`resize_market` grows older",
+              "markets). All zero = no stored pool: a Tier 0 market, or one that",
+              "graduated before this field existed, whose pool is Raydium's",
+              "canonical address for the mint (see `expected_pool`)."
+            ],
+            "type": "pubkey"
           }
         ]
       }

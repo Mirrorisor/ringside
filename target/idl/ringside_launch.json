@@ -828,6 +828,93 @@
           }
         },
         {
+          "name": "program_data",
+          "docs": [
+            "This program's ProgramData account, which the upgradeable loader keeps at",
+            "the PDA of the program id and which names the upgrade authority. Only that",
+            "authority may initialize: whoever calls first sets the fee recipients and",
+            "becomes admin."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  143,
+                  154,
+                  1,
+                  58,
+                  154,
+                  160,
+                  155,
+                  182,
+                  239,
+                  18,
+                  68,
+                  180,
+                  195,
+                  105,
+                  126,
+                  22,
+                  216,
+                  227,
+                  158,
+                  4,
+                  18,
+                  131,
+                  34,
+                  134,
+                  246,
+                  99,
+                  18,
+                  41,
+                  77,
+                  116,
+                  179,
+                  32
+                ]
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                2,
+                168,
+                246,
+                145,
+                78,
+                136,
+                161,
+                176,
+                226,
+                16,
+                21,
+                62,
+                247,
+                99,
+                174,
+                43,
+                0,
+                194,
+                185,
+                61,
+                22,
+                193,
+                36,
+                210,
+                192,
+                83,
+                122,
+                16,
+                4,
+                128,
+                0,
+                0
+              ]
+            }
+          }
+        },
+        {
           "name": "system_program",
           "address": "11111111111111111111111111111111"
         }
@@ -1149,7 +1236,35 @@
         },
         {
           "name": "pool_state",
-          "writable": true
+          "docs": [
+            "signs Raydium's initialize, so nobody else can create the pool first."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  114,
+                  97,
+                  121,
+                  100,
+                  105,
+                  117,
+                  109,
+                  95,
+                  112,
+                  111,
+                  111,
+                  108
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "mint"
+              }
+            ]
+          }
         },
         {
           "name": "lp_mint",
@@ -2050,6 +2165,11 @@
       "code": 6015,
       "name": "NotForfeitable",
       "msg": "Creator fees can be forfeited only 30 days after launch, if the curve has not graduated"
+    },
+    {
+      "code": 6016,
+      "name": "NotUpgradeAuthority",
+      "msg": "Only the program's upgrade authority can initialize it"
     }
   ],
   "types": [
