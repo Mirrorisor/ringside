@@ -6,7 +6,7 @@
  * `vol_snap_slot` and `vol_snap_fees`, 32 bytes more, which read as zero: no stored graduation price,
  * volume window not started until the keeper's next crank) and every perps
  * `WithdrawalRequest` made before it recorded its request-time share price (16 bytes; zero reads as
- * "no recorded price", paid at the current one), with the programs'
+ * "no recorded price", paid at the current one; then `cancel_ts`, 8 bytes, zero = never cancelled), with the programs'
  * permissionless `resize_curve` / `resize_market` / `resize_withdrawal`. The payer
  * (ANCHOR_WALLET) funds the extra rent, about 0.00006 SOL per account. Safe to re-run:
  * accounts that are already full size are skipped, and the instructions are no-ops on them.
@@ -31,7 +31,7 @@ const PERPS = new PublicKey("DsZ69w3q25nRmAzJCRBMLbwZWN6NyVbYipTWsCAUsg1F");
 /** 8 + INIT_SPACE (Curve with creator_fees_locked, Market with pool, grad_price_q64, vol_snap_slot, vol_snap_fees). Rust unit tests pin these numbers: keep them in step. */
 const CURVE_LEN = 1219;
 const MARKET_LEN = 292;
-const WITHDRAWAL_LEN = 73;
+const WITHDRAWAL_LEN = 81;
 const PER_TX = 4;
 
 const RPC_URL = process.env.ANCHOR_PROVIDER_URL ?? "https://api.devnet.solana.com";

@@ -16,7 +16,7 @@ import perpsIdl from "../../target/idl/ringside_perps.json";
 import { feeView, type FeeInput } from "../src/creatorfees";
 import {
   DEFAULT_SLIPPAGE_BPS, GROSS_CAP_MULT, MAX_SLIPPAGE_BPS, acceptablePrice, buildOrderInstruction, decodeMarket, decodePosition, decodeVault, marketPda, netOfFees,
-  oiCap, orderPda as perpsOrderPda, perpsCoders, poolFeeTotal, poolTwapX32, positionPda as perpsPositionPda, slippageBpsFromPercent, tierParams, vaultPda,
+  oiCap, orderPda as perpsOrderPda, perpsCoders, poolFeeTotal, poolTwapObs, POOL_TWAP_SECONDS, positionPda as perpsPositionPda, slippageBpsFromPercent, tierParams, vaultPda,
   vaultUsdcPda,
 } from "../src/perps/index";
 
@@ -237,16 +237,23 @@ function spotNow(): bigint {
 }
 /** Spot as the perps program sees it: the pool only once the market has graduated. */
 const perpSpot = () => (graduated() ? spotNow() : spotQ(st.curve));
-/** The pool's TWAP (Q64), or null while its observation history doesn't cover the window yet. */
+/** The pool's TWAP (Q64) over real observations, or null while the history doesn't span the window yet. May be stale (see `warming`). */
 function poolTwapNow(c: any): bigint | null {
   const k = poolKeys(c.mint, st.pool!.addr);
-  const t = poolTwapX32(st.pool!.obs, k.tokenIs0, BigInt(Math.floor(Date.now() / 1000)));
-  return t === null ? null : t << 32n;
+  const r = poolTwapObs(st.pool!.obs, k.tokenIs0, BigInt(Math.floor(Date.now() / 1000)));
+  return r === null ? null : r[0] << 32n;
+}
+/** True while the pool's newest observation is older than the TWAP window (or there is no usable history). */
+function poolStale(c: any): boolean {
+  const k = poolKeys(c.mint, st.pool!.addr);
+  const now = BigInt(Math.floor(Date.now() / 1000));
+  const r = poolTwapObs(st.pool!.obs, k.tokenIs0, now);
+  return r === null || now - r[1] > POOL_TWAP_SECONDS;
 }
 /** Mirrors warmup_price: the curve's final price stored at graduation (the band anchor for older markets). */
 const warmupPrice = (m: any): bigint => (m.gradPriceQ64 ? big(m.gradPriceQ64) : 0n) || big(m.bandAnchorQ64);
 /** A graduated market whose pool has no TWAP history yet: priced at the curve's final price, new opens refused. */
-const warming = () => graduated() && poolTwapNow(st.curve) === null;
+const warming = () => graduated() && poolStale(st.curve);
 function twapNow(c: any, slot: bigint): bigint {
   if (graduated()) return poolTwapNow(c) ?? warmupPrice(st.market);
   return twapQ(c, slot);

@@ -23,6 +23,10 @@ pub const INITIAL_VIRTUAL_SOL: u64 = 30 * 1_000_000_000;
 #[cfg(feature = "devnet")]
 pub const INITIAL_VIRTUAL_SOL: u64 = 500_000_000;
 pub const INITIAL_VIRTUAL_TOKENS: u64 = 1_073_000_000 * ONE_TOKEN;
+/// A fresh curve's price (virtual reserves at launch), Q64.
+pub fn initial_price_q64() -> u128 {
+    ((INITIAL_VIRTUAL_SOL as u128) << 64) / (INITIAL_VIRTUAL_TOKENS as u128)
+}
 pub const MAX_DEV_BUY_TOKENS: u64 = 50_000_000 * ONE_TOKEN; // 5% of supply
 pub const DEV_LOCK_SECONDS: i64 = 7 * 24 * 60 * 60;
 pub const BPS: u64 = 10_000;

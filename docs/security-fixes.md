@@ -69,7 +69,7 @@ Findings from the pre-audit review and what changed. Each entry: what, fix, test
 - `execute_order` never fills an order at or after `request_slot + ORDER_EXPIRY_SLOTS`. It refunds the escrow to the owner and closes the order instead (`OrderRejected`, reason 1), so anyone can clear an expired order and the keeper's queue cannot stick. `cancel_order` (owner, same slot threshold) still works. `OrderRejected.reason`: 0 price outside the bound, 1 expired, 2 new open on a pool with no history (F6), 3 increase queued before a pause (F5).
 - App: the order ticket has a slippage setting (default 1%, at most 5%, `DEFAULT_SLIPPAGE_BPS` / `MAX_SLIPPAGE_BPS` in `client/src/perps/math.ts`). The acceptable price is the current fill price (worse of mark and spot) moved by it, for opens and closes, and the ticket shows the limit. `buildOrderInstruction` refuses an order with no non-zero bound and slippage above 5%. The copy engine bounds perp orders the same way (slippage capped at 5%) and refuses to build one with no reference price. The devnet scripts bound at 50% around the market's band anchor.
 
-**Upgrade.** None. An order placed before the upgrade with a zero bound is refunded at fill if it is an open, and is filled as a close with no floor only inside its 150 slots.
+**Upgrade.** None for accounts. An order placed before the upgrade with a zero bound is handled by the fill rule `within` (programs/ringside_perps/src/lib.rs, `execute_order`): a zero-bound increase LONG and a zero-bound close SHORT are refunded; a zero-bound increase SHORT and a zero-bound close LONG are filled with no price limit. Only orders queued inside their 150 slots (~60 s) around the upgrade can be in that state.
 
 **Tests.** `tests/tests/flow.rs`: `orders_need_a_non_zero_acceptable_price`, `a_price_outside_the_bound_refunds_the_order`, `an_expired_order_is_never_filled_and_always_refundable` (refund by execute, by the owner's cancel, and a fill just inside the expiry). `client/test/perps.test.mjs`: builder and slippage rules.
 
@@ -125,7 +125,7 @@ Findings from the pre-audit review and what changed. Each entry: what, fix, test
 - Lower-of price: `request_withdrawal` records the vault's LP assets and total shares (`request_assets`, `request_total_shares`, appended to `WithdrawalRequest`). `withdraw_liquidity` pays the lower of the value of the shares at that recorded price and at the current one. A gain after the request stays with the remaining LPs; a loss is borne by the leaver. Any later `request_withdrawal` on the same request refreshes the recorded price and restarts the delay, so it can only be re-recorded at a cost of another wait.
 - `request_withdrawal` now takes `vault` and `vault_usdc` (read-only) to read the price.
 
-**Upgrade.** `WithdrawalRequest` grew by 16 bytes (73 bytes with the discriminator). Existing requests must be grown with the permissionless `resize_withdrawal` (`client/scripts/resize-accounts.ts` does it, run by `scripts/upgrade.sh`); a stored `request_total_shares` of zero means "no recorded price" and is paid at the current price. Requests made before the upgrade have normally passed their window and need a new request anyway; they can be cancelled after the resize.
+**Upgrade.** `WithdrawalRequest` grew by 16 bytes (73 bytes with the discriminator; 81 after N5 below). Existing requests must be grown with the permissionless `resize_withdrawal` (`client/scripts/resize-accounts.ts` does it, run by `scripts/upgrade.sh`); a stored `request_total_shares` of zero means "no recorded price" and is paid at the current price. Requests made before the upgrade have normally passed their window and need a new request anyway; they can be cancelled after the resize.
 
 **Tests.** `tests/tests/flow.rs`: `f2_expired_withdrawal_cannot_complete_and_re_request_restarts_the_delay` (last second of the window pays, the next is refused, re-request is locked again and burns exactly the request's shares) and `f2_withdrawal_pays_the_lower_of_request_and_completion_price` (price up and price down).
 
@@ -162,3 +162,37 @@ Findings from the pre-audit review and what changed. Each entry: what, fix, test
 - ADL ordering cannot be enforced on chain: the program cannot list a market's positions, and a caller can always omit a better one. What is enforced: remaining accounts after the price accounts (Tier 1+: after the 4 pool accounts) are other positions of the same market, and each must have a profit ratio (PnL net of funding / collateral) no higher than the target's, else `AdlWrongTarget`. The keeper passes the next-ranked positions and retries without them if its estimate disagrees with the real mark. There is no keeper role on chain to restrict the call to. ADL still pays at the mark (better than the worst-of fill of a voluntary close) and charges no fee, so a forced close costs the target only its future upside.
 
 **Tests.** `f10_adl_mode_clears_once_the_market_recovers_and_not_before` (hysteresis, clearing call closes nobody, admin reopens) and `f10_adl_rejects_a_target_when_a_higher_profit_ratio_position_is_passed`. Unit test for the budget and hysteresis. `client/test/adl-rank.test.mjs` for the keeper's order.
+
+## N1 (medium): the pool TWAP extended the newest observed interval over the rest of the window
+
+**What.** `pool_twap_x32` extended the cumulative from the newest observation to now at the price of the newest observed interval. A short pool move recorded by the last observation then stood for the whole window while the pool stayed quiet.
+
+**Fix.** The TWAP is taken only between real observations: from the newest observation at least `POOL_TWAP_SECONDS` (300 s) older than the newest one, to the newest one (`pool_twap_obs`), so it always spans at least a full window of real observations and never extends past the newest. If there is no such pair the market is warming as before. If the newest observation is more than 300 s old the market is also `warming` (opens and increases are refunded; closes, liquidations and ADL work) and is priced from the last TWAP over real observations; any swap makes it fresh again. No account layout change. `client/src/perps/pool.ts` and the app mirror it (`poolTwapObs`).
+
+**Tests.** `n1_a_short_pool_manipulation_then_quiet_does_not_set_the_mark_and_blocks_opens` (tests-graduation, real Raydium), `n1_a_short_pump_followed_by_quiet_is_not_extrapolated` and the other `pool_twap` unit tests, and the client `pool TWAP` test.
+
+## N2 (low): the band anchor in a token's creation slot was the live price
+
+**What.** For a curve younger than one TWAP window, `Curve::twap_q64` is the live price (in the creation slot) or an average that is mostly the live price, so a same-slot buy, `create_market`, sell sequence could set the anchor.
+
+**Fix.** `create_market` anchors at the curve's launch price (`ringside_launch::initial_price_q64()`, the virtual reserves at launch) when `slot - created_slot < TWAP_WINDOW_SLOTS`, and at the curve TWAP after that.
+
+**Tests.** `n2_young_curve_anchors_at_the_launch_price` (tests/flow.rs). Test setups that create a market now first let the curve age one window.
+
+## N3 (info): upgrade note for zero-bound orders was wrong for shorts
+
+The F7 upgrade note above now describes the fill rule as coded: of the orders queued with a zero bound, the increase SHORT is filled with no floor and the close SHORT is refunded (the increase LONG is refunded and the close LONG filled).
+
+## N4 (info): `pool_fee_total` comment offsets
+
+The comment said 349/365; the code reads the token 0 halves at 341/357 (349/365 are token 1's). Comment only.
+
+## N5 (medium): cancel and re-request kept a withdrawal claimable half of the time
+
+**What.** `cancel_withdrawal` was free and immediate, so an LP could cancel and re-request every 48 hours and always hold a claimable request for half of the time.
+
+**Fix.** After a cancel the next `request_withdrawal` must wait `WITHDRAWAL_RECANCEL_COOLDOWN` (24 h; 120 s with the `devnet` feature, like the delay). An unclaimed request that passed its window counts as a cancel at its expiry. `cancel_withdrawal` no longer closes the request account: it empties it and stores `cancel_ts`, a new `i64` appended to `WithdrawalRequest` (81 bytes with the discriminator). Adding to an open request, and a first request, have no cooldown. New error `WithdrawalCooldown` (last in `PerpsError`).
+
+**Upgrade.** Run `resize_withdrawal` on existing requests (`client/scripts/resize-accounts.ts`; `WITHDRAWAL_LEN` is now 81); `cancel_ts` reads as zero (never cancelled).
+
+**Tests.** `n5_cancel_then_re_request_waits_out_the_cooldown`, `n5_adding_to_an_open_request_and_a_first_request_have_no_cooldown`, and `f2_expired_withdrawal_cannot_complete_and_re_request_restarts_the_delay` (expiry cooldown); the layout pin is `withdrawal_request_size_matches_resize_script`.

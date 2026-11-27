@@ -84,6 +84,24 @@ impl G {
         ]
     }
 
+    /// Swaps `amount_in` lamports of wrapped SOL back into the token.
+    fn buy_back_ix(&self, amount_in: u64) -> Instruction {
+        let (wsol, m) = (spl_token::native_mint::ID, self.f.mint);
+        let buyer_ata = get_associated_token_address(&self.buyer.pubkey(), &m);
+        let buyer_wsol = get_associated_token_address(&self.buyer.pubkey(), &wsol);
+        Instruction {
+            program_id: raydium::CPMM_PROGRAM,
+            accounts: raydium_cp_swap::accounts::Swap {
+                payer: self.buyer.pubkey(), authority: self.p.authority, amm_config: raydium::AMM_CONFIG, pool_state: self.p.pool,
+                input_token_account: buyer_wsol, output_token_account: buyer_ata, input_vault: self.p.sol_vault, output_vault: self.p.tok_vault,
+                input_token_program: spl_token::ID, output_token_program: spl_token::ID, input_token_mint: wsol, output_token_mint: m,
+                observation_state: self.p.obs,
+            }
+            .to_account_metas(None),
+            data: raydium_cp_swap::instruction::SwapBaseInput { amount_in, minimum_amount_out: 1 }.data(),
+        }
+    }
+
     /// Sells `tokens` (whole tokens) into the pool.
     async fn dump(&mut self, tokens: u64) {
         let ixs = self.swap_ix(tokens * 1_000_000);
@@ -315,6 +333,45 @@ async fn a_donation_to_the_vaults_does_not_move_the_mark() {
     let (_, plain, _) = scenario(false).await;
     let (_, donated, _) = scenario(true).await;
     assert_eq!(donated, plain, "same observations, same mark, whatever sits in the vaults");
+}
+
+/// N1: price P, pushed far away for ~20 s, swapped back, then the pool goes quiet for longer than
+/// the window. The short manipulated interval must not become the TWAP (no extrapolation past the
+/// newest observation), and with the newest observation stale opens are refused (closes are not).
+#[tokio::test]
+async fn n1_a_short_pool_manipulation_then_quiet_does_not_set_the_mark_and_blocks_opens() {
+    let mut g = graduated().await;
+    let t = trading(&mut g).await;
+    let start = g.anchor().await;
+    advance(&mut g.f, 10, 5).await;
+    g.dump(1_000).await; // first observation
+    advance(&mut g.f, 5, 400).await;
+    g.dump(1_000).await; // history now spans the window
+    let base = g.pool_price().await;
+    advance(&mut g.f, 5, 30).await;
+    g.dump(300_000_000).await; // manipulate: the price falls by more than half
+    assert!(g.pool_price().await < base / 2);
+    advance(&mut g.f, 5, 20).await;
+    let wsol = get_associated_token_address(&g.buyer.pubkey(), &spl_token::native_mint::ID);
+    let sol_in = token_amount(&mut g.f.ctx, wsol).await;
+    let (back, buyer) = (g.buy_back_ix(sol_in), g.buyer.insecure_clone());
+    g.f.try_send(&[back], &[&buyer]).await.unwrap(); // this swap records the manipulated price over those 20 s
+    let after = g.pool_price().await;
+    assert!(after.abs_diff(base) * 100 < base * 10, "price is back near {base}: {after}");
+    // Quiet for well over a window.
+    advance(&mut g.f, perps::TWAP_WINDOW_SLOTS + 50, 400).await;
+    g.f.try_send(&[g.crank()], &[]).await.unwrap();
+    let anchor = g.anchor().await;
+    assert!(anchor < start, "the mark follows the real observations down a little");
+    assert!(anchor.abs_diff(base) * 100 < base * 5, "mark {anchor} stays within 5% of the true price {base}");
+    // Stale newest observation: an open is refunded, not filled.
+    t.run(&mut g, perps::ORDER_INCREASE, 50_000, 100_000, true).await;
+    assert_eq!(t.position(&mut g).await.size_usd, 0, "no opens while the newest observation is stale");
+    // A fresh swap makes it current again; the open then fills.
+    g.dump(1_000).await;
+    advance(&mut g.f, 5, 5).await;
+    t.run(&mut g, perps::ORDER_INCREASE, 50_000, 100_000, true).await;
+    assert_eq!(t.position(&mut g).await.size_usd, 100_000, "opens resume once a swap refreshes the history");
 }
 
 /// The fee offsets used to net vault balances match Raydium's real PoolState.

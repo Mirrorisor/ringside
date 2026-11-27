@@ -390,6 +390,7 @@ async fn launch_trade_and_perps_end_to_end() {
 
     let (market, _) = Pubkey::find_program_address(&[perps::SEED_MARKET, mint.pubkey().as_ref()], &perps::ID);
     let (registry, _) = Pubkey::find_program_address(&[perps::SEED_REGISTRY], &perps::ID);
+    env.warp(perps::TWAP_WINDOW_SLOTS).await; // a curve younger than one window anchors at its launch price (N2)
     env.send(
         &[Instruction {
             program_id: perps::ID,
@@ -1317,6 +1318,7 @@ async fn perps_with_accrued_fees(l: &mut Launched) -> PerpsFx {
     let curve = l.curve;
     let (market, _) = Pubkey::find_program_address(&[perps::SEED_MARKET, l.mint.as_ref()], &perps::ID);
     let (registry, _) = Pubkey::find_program_address(&[perps::SEED_REGISTRY], &perps::ID);
+    l.env.warp(perps::TWAP_WINDOW_SLOTS).await; // a curve younger than one window anchors at its launch price (N2)
     l.env
         .send(
             &[Instruction {
@@ -2105,6 +2107,25 @@ async fn market_anchor_is_the_curve_twap_not_its_instantaneous_price() {
     assert!(m.band_anchor_q64 >= p0 && m.band_anchor_q64 < p0 + p0 / 50, "anchor {} is the TWAP near {}, not spot {}", m.band_anchor_q64, p0, c.last_price_q64);
 }
 
+/// N2: in the token's creation slot (and for a curve younger than one window) the band anchor is the
+/// curve's launch price, not the live price a same-slot buy/create/sell bundle could inflate.
+#[tokio::test]
+async fn n2_young_curve_anchors_at_the_launch_price() {
+    let mut l = launch_only().await;
+    let trader = l.trader.insecure_clone();
+    let buy = (l.buy_ix)(20 * SOL);
+    let keeper = Keypair::new();
+    l.env.fund(keeper.pubkey(), 5 * SOL).await;
+    let (market, _) = Pubkey::find_program_address(&[perps::SEED_MARKET, l.mint.as_ref()], &perps::ID);
+    let (registry, _) = Pubkey::find_program_address(&[perps::SEED_REGISTRY], &perps::ID);
+    let create = create_market_ix(keeper.pubkey(), l.curve, market, registry);
+    l.env.send(&[buy, create], &[&trader, &keeper]).await.unwrap();
+    let c: launch::Curve = l.env.get(l.curve).await;
+    let m: perps::Market = l.env.get(market).await;
+    assert!(c.last_price_q64 > launch::initial_price_q64() * 2, "spot was pumped in the creation slot");
+    assert_eq!(m.band_anchor_q64, launch::initial_price_q64(), "anchored at the launch price");
+}
+
 #[tokio::test]
 async fn retire_by_volume_dust_does_not_keep_a_slot_alive() {
     let mut l = launch_only().await;
@@ -2419,6 +2440,53 @@ async fn lp_value_of(l: &mut Launched, fx: &PerpsFx, shares: u64) -> u64 {
 
 // --- F2: the claim window and the lower-of price ------------------------------
 
+fn cancel_withdrawal_ix(owner: Pubkey) -> Instruction {
+    Instruction {
+        program_id: perps::ID,
+        accounts: perps::accounts::CancelWithdrawal { owner, lp: pda_lp(&owner), request: pda_withdrawal(&owner) }.to_account_metas(None),
+        data: perps::instruction::CancelWithdrawal {}.data(),
+    }
+}
+
+#[tokio::test]
+async fn n5_cancel_then_re_request_waits_out_the_cooldown() {
+    let (mut l, fx) = perps_market().await;
+    let lp = fx.lp.insecure_clone();
+    let shares = (l.env.get::<perps::LpAccount>(fx.lp_acc).await).shares / 4;
+    let req_ix = || request_withdrawal_ix(fx.vault, fx.vault_usdc, lp.pubkey(), shares);
+    // Each repeated attempt gets a distinct message (the bank would otherwise see the same transaction again).
+    let tweak = |n: u64| system_instruction::transfer(&lp.pubkey(), &fx.lp_usdc, n);
+    l.env.send(&[req_ix()], &[&lp]).await.unwrap();
+    l.env.send(&[cancel_withdrawal_ix(lp.pubkey())], &[&lp]).await.unwrap();
+    let t = l.env.ctx.banks_client.get_sysvar::<solana_sdk::clock::Clock>().await.unwrap().unix_timestamp;
+    let r: perps::WithdrawalRequest = l.env.get(pda_withdrawal(&lp.pubkey())).await;
+    assert_eq!((r.shares, r.cancel_ts), (0, t));
+    // Cancelling twice is refused; an immediate re-request too, also in the same transaction.
+    let err = l.env.send(&[cancel_withdrawal_ix(lp.pubkey()), tweak(1)], &[&lp]).await.unwrap_err();
+    assert_eq!(custom_error(err), perr(perps::PerpsError::ZeroAmount));
+    let err = l.env.send(&[req_ix(), tweak(2)], &[&lp]).await.unwrap_err();
+    assert_eq!(custom_error(err), perr(perps::PerpsError::WithdrawalCooldown));
+    l.env.set_time(t + perps::WITHDRAWAL_RECANCEL_COOLDOWN - 1).await;
+    let err = l.env.send(&[req_ix(), tweak(3)], &[&lp]).await.unwrap_err();
+    assert_eq!(custom_error(err), perr(perps::PerpsError::WithdrawalCooldown), "one second early");
+    l.env.set_time(t + perps::WITHDRAWAL_RECANCEL_COOLDOWN).await;
+    l.env.send(&[req_ix()], &[&lp]).await.unwrap();
+    let r: perps::WithdrawalRequest = l.env.get(pda_withdrawal(&lp.pubkey())).await;
+    assert_eq!(r.shares, shares);
+}
+
+#[tokio::test]
+async fn n5_adding_to_an_open_request_and_a_first_request_have_no_cooldown() {
+    let (mut l, fx) = perps_market().await;
+    let lp = fx.lp.insecure_clone();
+    let shares = (l.env.get::<perps::LpAccount>(fx.lp_acc).await).shares / 4;
+    l.env.send(&[request_withdrawal_ix(fx.vault, fx.vault_usdc, lp.pubkey(), shares)], &[&lp]).await.unwrap();
+    l.env.warp(2).await;
+    l.env.send(&[request_withdrawal_ix(fx.vault, fx.vault_usdc, lp.pubkey(), shares)], &[&lp]).await.unwrap();
+    let r: perps::WithdrawalRequest = l.env.get(pda_withdrawal(&lp.pubkey())).await;
+    assert_eq!((r.shares, r.cancel_ts), (2 * shares, 0));
+}
+
 #[tokio::test]
 async fn f2_expired_withdrawal_cannot_complete_and_re_request_restarts_the_delay() {
     let (mut l, fx) = perps_market().await;
@@ -2438,8 +2506,16 @@ async fn f2_expired_withdrawal_cannot_complete_and_re_request_restarts_the_delay
     let req: perps::WithdrawalRequest = l.env.get(pda_withdrawal(&lp.pubkey())).await;
     assert_eq!(req.shares, a);
 
+    // An expired request counts as a cancel at its expiry: requesting again must wait out the cooldown.
+    let expiry = unlock + perps::WITHDRAWAL_WINDOW_SECONDS;
+    let err = l.env.send(&[request_withdrawal_ix(fx.vault, fx.vault_usdc, lp.pubkey(), b)], &[&lp]).await.unwrap_err();
+    assert_eq!(custom_error(err), perr(perps::PerpsError::WithdrawalCooldown), "cooldown after expiry");
+    l.env.set_time(expiry + perps::WITHDRAWAL_RECANCEL_COOLDOWN - 1).await;
+    let err = l.env.send(&[request_withdrawal_ix(fx.vault, fx.vault_usdc, lp.pubkey(), b)], &[&lp]).await.unwrap_err();
+    assert_eq!(custom_error(err), perr(perps::PerpsError::WithdrawalCooldown), "one second early");
     // Requesting again restarts the delay (and adds to the request).
-    let now = unlock + perps::WITHDRAWAL_WINDOW_SECONDS + 1;
+    let now = expiry + perps::WITHDRAWAL_RECANCEL_COOLDOWN;
+    l.env.set_time(now).await;
     l.env.send(&[request_withdrawal_ix(fx.vault, fx.vault_usdc, lp.pubkey(), b)], &[&lp]).await.unwrap();
     let req: perps::WithdrawalRequest = l.env.get(pda_withdrawal(&lp.pubkey())).await;
     assert_eq!((req.shares, req.unlock_ts), (a + b, now + perps::WITHDRAW_DELAY_SECONDS));
@@ -2816,13 +2892,13 @@ async fn resize_withdrawal_grows_an_old_request_and_it_is_paid_at_the_current_pr
     };
     // No-op on a current-size request.
     let len = l.env.ctx.banks_client.get_account(request).await.unwrap().unwrap().data.len();
-    assert_eq!(len, 73);
+    assert_eq!(len, 81);
     l.env.send(&[resize(request)], &[]).await.unwrap();
     // Old layout: 16 bytes shorter. It can't be read until resized. (No slot warps after the
     // shrink: it destroys lamports, which a warp's bank hash check would trip over.)
     l.env.advance_clock(perps::WITHDRAW_DELAY_SECONDS + 1).await;
     l.env.warp(2).await;
-    l.env.shrink_account(request, 16).await;
+    l.env.shrink_account(request, 24).await;
     let done = complete_withdrawal_ix(fx.vault, fx.vault_usdc, lp.pubkey(), fx.lp_usdc);
     assert!(l.env.send(&[done.clone()], &[&lp]).await.is_err(), "old-size request fails to load");
     // Only this program's withdrawal requests can be resized.

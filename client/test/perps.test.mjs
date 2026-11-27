@@ -8,7 +8,7 @@ import anchorPkg from "@coral-xyz/anchor";
 import { Connection, Keypair, PublicKey, SystemProgram, VersionedTransaction } from "@solana/web3.js";
 import { TOKEN_PROGRAM_ID, getAssociatedTokenAddressSync } from "@solana/spl-token";
 import {
-  BPS, DEFAULT_SLIPPAGE_BPS, GROSS_CAP_MULT, MAX_SLIPPAGE_BPS, acceptablePrice, netOfFees, poolFeeTotal, poolTwapX32, slippageBpsFromPercent, buildOrderInstruction, caps, checkIncreaseCaps, curvePda, decodeMarket, decodePerpEvents, decodePosition,
+  BPS, DEFAULT_SLIPPAGE_BPS, GROSS_CAP_MULT, MAX_SLIPPAGE_BPS, acceptablePrice, netOfFees, poolFeeTotal, poolTwapObs, poolTwapX32, slippageBpsFromPercent, buildOrderInstruction, caps, checkIncreaseCaps, curvePda, decodeMarket, decodePerpEvents, decodePosition,
   decodeVault, fundingOwed, marketPda, projectedFundingIndex, maxSizeForCollateral, oiCap, orderPda, perpsCoders, positionPda, tierParams, vaultPda, vaultUsdcPda,
 } from "../dist/perps/index.js";
 import { buildIntent, BuildError, cachedGenesisHash, cachedMintDecimals } from "../dist/copy/build.js";
@@ -542,23 +542,32 @@ function observations(steps, tokenIs0 = true) {
   return d;
 }
 
-test("pool TWAP: needs history covering the window, extends at the last observed price, ignores the live price", opts, () => {
+test("pool TWAP: real observations only, never extended past the newest, stale is not fresh", opts, () => {
   const steps = [...Array(20).keys()].map((k) => [1_000 + k * 60, 100]).concat([[2_200, 200]]);
   assert.equal(poolTwapX32(observations(steps), true, 2_260n), 100n);
   const steps2 = steps.concat([[2_230, 100]]);
-  assert.equal(poolTwapX32(observations(steps2), true, 2_260n), 120n);
-  // The other token's cumulative.
-  assert.equal(poolTwapX32(observations(steps2, false), false, 2_260n), 120n);
-  // No history, Raydium's first observation only, or history shorter than the window: no TWAP (the market is warming up).
+  // cum(2230) - cum(1900) = 100*300 + 200*30 over 330 s, whatever `now` is while fresh
+  assert.equal(poolTwapX32(observations(steps2), true, 2_260n), 36_000n / 330n);
+  assert.equal(poolTwapX32(observations(steps2), true, 2_530n), 36_000n / 330n);
+  assert.equal(poolTwapX32(observations(steps2, false), false, 2_260n), 36_000n / 330n);
+  // No history, Raydium's first observation only, or observations spanning less than the window: no TWAP (warming).
   assert.equal(poolTwapX32(Buffer.alloc(8 + 1 + 2 + 32 + 4000 + 32), true, 5_000n), null);
-  assert.equal(poolTwapX32(observations([[1_000, 100]]), true, 5_000n), null);
+  assert.equal(poolTwapX32(observations([[1_000, 100]]), true, 1_010n), null);
   assert.equal(poolTwapX32(observations([[4_900, 100], [4_950, 100]]), true, 5_000n), null);
-  assert.equal(poolTwapX32(observations([[4_600, 100], [4_650, 100]]), true, 4_900n), 100n);
-  // A stale newest observation extends at the last observed price.
-  assert.equal(poolTwapX32(observations([[1_000, 100], [1_100, 100], [1_200, 100]]), true, 4_800n), 100n);
+  assert.equal(poolTwapX32(observations([[4_700, 100], [4_950, 100]]), true, 5_000n), null);
+  assert.equal(poolTwapX32(observations([[4_600, 100], [4_900, 100]]), true, 4_900n), 100n);
+  // A stale newest observation: the last TWAP over real observations, but not fresh.
+  const quiet = observations([[1_000, 100], [1_100, 100], [1_200, 100], [1_300, 100]]);
+  assert.deepEqual(poolTwapObs(quiet, true, 4_800n), [100n, 1_300n]);
+  assert.equal(poolTwapX32(quiet, true, 4_800n), null);
+  // A short pump then quiet is not extrapolated over the window.
+  const pump = [...Array(20).keys()].map((k) => [1_000 + k * 60, 100]).concat([[2_200, 200], [2_215, 100]]);
+  const r = poolTwapObs(observations(pump), true, 2_515n);
+  assert.ok(r && r[0] < 110n && r[1] === 2_215n);
+  assert.equal(poolTwapX32(observations(pump), true, 2_516n), null);
   // A pump held one observation moves the TWAP but the band (the program's clamp) is what bounds the mark.
   const pumped = [...Array(20).keys()].map((k) => [1_000 + k * 60, 100]).concat([[2_200, 10_000], [2_215, 100]]);
-  assert.equal(poolTwapX32(observations(pumped), true, 2_260n), (174_000n + 450_000n) / 300n);
+  assert.equal(poolTwapX32(observations(pumped), true, 2_260n), 180_000n / 315n);
 });
 
 test("pool fees: protocol, fund and creator fees come off the vault balances", opts, () => {

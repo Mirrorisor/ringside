@@ -105,6 +105,13 @@ pub const SEED_TREASURY: &[u8] = b"treasury";
 pub const WITHDRAW_DELAY_SECONDS: i64 = 24 * 3_600;
 #[cfg(feature = "devnet")]
 pub const WITHDRAW_DELAY_SECONDS: i64 = 120;
+/// After cancelling a withdrawal request (or letting one expire unclaimed) an
+/// LP can't request again for this long, so cancel and re-request can't keep a
+/// claimable exit open half of the time.
+#[cfg(not(feature = "devnet"))]
+pub const WITHDRAWAL_RECANCEL_COOLDOWN: i64 = 24 * 3_600;
+#[cfg(feature = "devnet")]
+pub const WITHDRAWAL_RECANCEL_COOLDOWN: i64 = 120;
 /// An unlocked withdrawal request can be completed only this long after it
 /// unlocks. After that it has expired: it must be requested again (which
 /// restarts the delay), so an LP can't keep an always-open exit.
@@ -279,6 +286,16 @@ pub mod ringside_perps {
         let total_shares = ctx.accounts.vault.total_shares;
         ctx.accounts.lp.shares -= shares;
         let r = &mut ctx.accounts.request;
+        // Cooldown after a cancel, or after a request expired unclaimed (counts as a cancel at its expiry).
+        let since = if r.shares == 0 {
+            Some(r.cancel_ts)
+        } else {
+            let expiry = r.unlock_ts.saturating_add(WITHDRAWAL_WINDOW_SECONDS);
+            (now > expiry).then_some(expiry)
+        };
+        if let Some(t) = since {
+            require!(now >= t.saturating_add(WITHDRAWAL_RECANCEL_COOLDOWN), PerpsError::WithdrawalCooldown);
+        }
         r.owner = ctx.accounts.owner.key();
         r.shares += shares;
         r.unlock_ts = now + WITHDRAW_DELAY_SECONDS;
@@ -289,9 +306,15 @@ pub mod ringside_perps {
         Ok(())
     }
 
-    /// Puts a pending request's shares back in the LP account.
+    /// Puts a pending request's shares back in the LP account. The request
+    /// account stays (empty) to remember when it was cancelled: the next
+    /// request must wait WITHDRAWAL_RECANCEL_COOLDOWN.
     pub fn cancel_withdrawal(ctx: Context<CancelWithdrawal>) -> Result<()> {
-        ctx.accounts.lp.shares += ctx.accounts.request.shares;
+        let r = &mut ctx.accounts.request;
+        require!(r.shares > 0, PerpsError::ZeroAmount);
+        ctx.accounts.lp.shares += r.shares;
+        r.shares = 0;
+        r.cancel_ts = Clock::get()?.unix_timestamp;
         Ok(())
     }
 
@@ -342,7 +365,13 @@ pub mod ringside_perps {
         m.last_funding_ts = clock.unix_timestamp;
         // The curve's TWAP, not its instantaneous price: whoever calls first can't
         // pump, create and sell back to park the band anchor far from fair value.
-        m.band_anchor_q64 = curve.twap_q64(clock.slot, TWAP_WINDOW_SLOTS);
+        // A curve younger than one window has no real history (in its creation slot
+        // the "TWAP" is the live price): anchor at its launch price instead.
+        m.band_anchor_q64 = if clock.slot.saturating_sub(curve.created_slot) < TWAP_WINDOW_SLOTS {
+            ringside_launch::initial_price_q64()
+        } else {
+            curve.twap_q64(clock.slot, TWAP_WINDOW_SLOTS)
+        };
         m.band_anchor_slot = clock.slot;
         m.trader_net_pnl = 0;
         m.insurance = 0;
@@ -974,7 +1003,7 @@ fn token_amount(a: &AccountInfo) -> Result<u64> {
 
 /// Raydium PoolState offsets (8-byte discriminator, then packed): the fee fields
 /// that sit in the vaults but are not pool liquidity. protocol and fund fees are
-/// u64 pairs at 349/365 (token 0, token 1 each); the creator fees are the pair at
+/// u64 pairs at 341/357 (token 0 then token 1, 8 bytes each); the creator fees are the pair at
 /// 397. Older pool accounts hold zeros at 397 (padding there).
 const POOL_FEES_END: usize = 413;
 pub fn pool_fee_total(d: &[u8], token_1: bool) -> u64 {
@@ -988,7 +1017,9 @@ pub fn pool_fee_total(d: &[u8], token_1: bool) -> u64 {
 /// Vault balances are net of the pool's accrued protocol, fund and creator fees,
 /// as Raydium itself prices. The mark never takes the pool's instantaneous
 /// price: `twap` comes from the observation history only, or is `warm_price`
-/// (flagged `warming`) while that history does not yet cover the window.
+/// (flagged `warming`) while that history does not yet cover the window; if the
+/// newest observation is older than the window the last TWAP over real
+/// observations is used, also flagged `warming`.
 pub fn pool_view(mint: Pubkey, pool_key: Pubkey, warm_price: u128, rem: &[AccountInfo], now: i64) -> Result<PriceView> {
     require!(rem.len() >= 4, PerpsError::BadPool);
     let (pool, obs, tok_vault, sol_vault) = (&rem[0], &rem[1], &rem[2], &rem[3]);
@@ -1007,27 +1038,30 @@ pub fn pool_view(mint: Pubkey, pool_key: Pubkey, warm_price: u128, rem: &[Accoun
     let sol = token_amount(sol_vault)?.saturating_sub(sol_fees);
     require!(tokens > 0 && sol > 0, PerpsError::BadPool);
     let spot_x32 = ((sol as u128) << 32) / tokens as u128;
-    let twap_x32 = pool_twap_x32(&obs.try_borrow_data()?, token_is_0, now as u64);
+    let twap_x32 = pool_twap_obs(&obs.try_borrow_data()?, token_is_0, now as u64);
     Ok(match twap_x32 {
-        Some(t) => PriceView { twap: t << 32, spot: spot_x32 << 32, sol_reserve: sol, warming: false },
+        // Real observations spanning the window, newest one fresh: normal.
+        Some((t, last)) if now as u64 - last <= POOL_TWAP_SECONDS => PriceView { twap: t << 32, spot: spot_x32 << 32, sol_reserve: sol, warming: false },
+        // Stale: the last TWAP over real observations, but no new opens until a swap refreshes it.
+        Some((t, _)) => PriceView { twap: t << 32, spot: spot_x32 << 32, sol_reserve: sol, warming: true },
         None => PriceView { twap: warm_price, spot: spot_x32 << 32, sol_reserve: sol, warming: true },
     })
 }
 
-/// TWAP of the token's price in lamports per base unit (x32) over
-/// POOL_TWAP_SECONDS, from Raydium's ObservationState (packed, zero-copy):
+/// TWAP of the token's price in lamports per base unit (x32) from Raydium's
+/// ObservationState (packed, zero-copy):
 /// disc 8 | initialized u8 | observation_index u16 | pool 32 |
 /// 100 x (block_timestamp u64, cum_token_0_price_x32 u128, cum_token_1_price_x32 u128) | padding.
 /// Observation k holds the cumulative price up to its own timestamp (written
 /// at most every 15 s, on swaps, with the pre-swap price; the first swap only
-/// stamps a zero cumulative). The cumulative is extended from the newest
-/// observation to `now` at the last observed price, the average over the newest
-/// observed interval, never at the live pool price, so a stale newest
-/// observation or a donation to the vaults cannot move it. It is then
-/// differenced against the newest observation at least POOL_TWAP_SECONDS old.
-/// Returns None while the history cannot do that: no such observation (the
-/// history does not cover the window yet) or no interval to take a price from.
-pub fn pool_twap_x32(d: &[u8], token_is_0: bool, now: u64) -> Option<u128> {
+/// stamps a zero cumulative). The average is taken ONLY between real
+/// observations: from the newest one at least POOL_TWAP_SECONDS older than the
+/// newest observation, to the newest observation. It is never extended past
+/// the newest observation (that would let one short observed interval stand
+/// for the whole window), nor at the live pool price. Returns the TWAP and the
+/// newest observation's timestamp, or None while the history does not span a
+/// full window of real observations.
+pub fn pool_twap_obs(d: &[u8], token_is_0: bool, now: u64) -> Option<(u128, u64)> {
     const N: usize = 100;
     const BASE: usize = 8 + 1 + 2 + 32;
     if d.len() < BASE + N * 40 || d[8] == 0 {
@@ -1040,23 +1074,25 @@ pub fn pool_twap_x32(d: &[u8], token_is_0: bool, now: u64) -> Option<u128> {
         u128::from_le_bytes(d[o..o + 16].try_into().unwrap())
     };
     let t_latest = ts(latest);
-    let prev = (latest + N - 1) % N;
-    let t_prev = ts(prev);
-    if t_latest == 0 || t_latest > now || t_prev == 0 || t_prev >= t_latest {
+    if t_latest == 0 || t_latest > now {
         return None;
     }
-    let last_price = cum(latest).wrapping_sub(cum(prev)) / (t_latest - t_prev) as u128;
-    let cum_now = cum(latest).wrapping_add(last_price.wrapping_mul((now - t_latest) as u128));
-    let cutoff = now.saturating_sub(POOL_TWAP_SECONDS);
+    let cutoff = t_latest.saturating_sub(POOL_TWAP_SECONDS);
     let mut start: Option<(u64, u128)> = None;
     for k in 0..N {
         let t = ts(k);
-        if t != 0 && t <= cutoff && t <= t_latest && start.map_or(true, |b| t > b.0) {
+        if t != 0 && t <= cutoff && start.map_or(true, |b| t > b.0) {
             start = Some((t, cum(k)));
         }
     }
     let (t, c) = start?;
-    Some(cum_now.wrapping_sub(c) / (now - t) as u128)
+    Some((cum(latest).wrapping_sub(c) / (t_latest - t) as u128, t_latest))
+}
+
+/// `pool_twap_obs` when it is also fresh: the newest observation is at most
+/// POOL_TWAP_SECONDS old. None otherwise.
+pub fn pool_twap_x32(d: &[u8], token_is_0: bool, now: u64) -> Option<u128> {
+    pool_twap_obs(d, token_is_0, now).filter(|(_, t)| now - t <= POOL_TWAP_SECONDS).map(|(p, _)| p)
 }
 
 /// TWAP clamped to +/-15% of the band anchor. The anchor moves at most 15%
@@ -1354,6 +1390,9 @@ pub struct WithdrawalRequest {
     /// existed need `resize_withdrawal`, and read as zero = no recorded price.
     pub request_assets: u64,
     pub request_total_shares: u64,
+    /// When the request was last cancelled (0 = never). APPENDED: requests
+    /// from before need `resize_withdrawal`, and read as never cancelled.
+    pub cancel_ts: i64,
 }
 
 #[account]
@@ -1612,7 +1651,7 @@ pub struct CancelWithdrawal<'info> {
     pub owner: Signer<'info>,
     #[account(mut, seeds = [SEED_LP, owner.key().as_ref()], bump = lp.bump, has_one = owner)]
     pub lp: Box<Account<'info, LpAccount>>,
-    #[account(mut, close = owner, seeds = [SEED_WITHDRAWAL, owner.key().as_ref()], bump = request.bump, has_one = owner)]
+    #[account(mut, seeds = [SEED_WITHDRAWAL, owner.key().as_ref()], bump = request.bump, has_one = owner)]
     pub request: Box<Account<'info, WithdrawalRequest>>,
 }
 
@@ -2070,6 +2109,8 @@ pub enum PerpsError {
     VaultHasNoAssets,
     #[msg("A passed position has a higher profit ratio than the ADL target")]
     AdlWrongTarget,
+    #[msg("Withdrawal re-request is on cooldown after a cancel or an expired request")]
+    WithdrawalCooldown,
 }
 
 #[cfg(test)]
@@ -2298,20 +2339,20 @@ mod oracle_tests {
     }
 
     #[test]
-    fn pool_twap_averages_the_last_five_minutes() {
-        // Steps are (time, price from then on); each observation closes the previous step's
-        // interval. The newest interval (2140..2200) was at 100, so the extension to 2260 is at 100.
+    fn pool_twap_averages_real_observations_over_the_last_five_minutes() {
+        // Steps are (time, price from then on); each observation closes the previous step's interval.
         let steps: Vec<(u64, u128)> = (0..20).map(|k| (1_000 + k * 60, 100)).chain([(2_200, 200)]).collect();
         let d = observations(&steps);
         assert_eq!(pool_twap_x32(&d, true, 2_260), Some(100));
-        // One more observation: the price was 200 over 2200..2230. The TWAP over
-        // the last 300 s (start obs 1960) mixes the 100 and 200 intervals, and the
-        // extension to 2260 uses the last observed price (200), not the live one.
+        // One more observation: the price was 200 over 2200..2230. The TWAP runs from the
+        // newest observation at least 300 s before the newest (1900) to the newest (2230),
+        // and does not depend on `now`.
         let mut steps2 = steps.clone();
         steps2.push((2_230, 100));
         let d = observations(&steps2);
-        // cum(2230) - cum(1960) = 100*(2200-1960) + 200*30 = 30_000; + 30 s at 200 = 36_000; / 300
-        assert_eq!(pool_twap_x32(&d, true, 2_260), Some(120));
+        // cum(2230) - cum(1900) = 100*(2200-1900) + 200*30 = 36_000; / 330
+        assert_eq!(pool_twap_x32(&d, true, 2_260), Some(36_000 / 330));
+        assert_eq!(pool_twap_x32(&d, true, 2_500), Some(36_000 / 330));
     }
 
     #[test]
@@ -2321,12 +2362,28 @@ mod oracle_tests {
         steps.push((2_215, 100)); // ...back by the next observation (15 s)
         let d = observations(&steps);
         let twap = pool_twap_x32(&d, true, 2_260).unwrap();
-        // cum(2215)-cum(1960): 100*240 + 10_000*15 = 174_000; the newest interval
-        // (2200..2215) averaged 10_000, and the 45 s extension uses it: +450_000
-        assert_eq!(twap, (174_000 + 450_000) / 300);
-        // The TWAP alone moves ~20x; the band is what holds the mark to +15%.
+        // cum(2215)-cum(1900): 100*(2200-1900) + 10_000*15 = 180_000 over 315 s
+        assert_eq!(twap, 180_000 / 315);
+        // The TWAP alone moves ~6x; the band is what holds the mark to +15%.
         let mark = clamp_band(twap << 32, 100u128 << 32);
         assert!(mark <= (115u128 << 32), "mark {}", mark >> 32);
+    }
+
+    /// N1: price 100, pumped to 200 for 15 s, back to 100, then no swaps. The newest observed
+    /// interval (200) must not stand for the quiet time after it.
+    #[test]
+    fn n1_a_short_pump_followed_by_quiet_is_not_extrapolated() {
+        let mut steps: Vec<(u64, u128)> = (0..20).map(|k| (1_000 + k * 60, 100)).collect();
+        steps.push((2_200, 200));
+        steps.push((2_215, 100));
+        let d = observations(&steps);
+        let (twap, last) = pool_twap_obs(&d, true, 2_515).unwrap();
+        assert_eq!(last, 2_215);
+        assert!(twap < 110, "twap {twap} stays near 100 (true 100)");
+        // And it is stale (flagged warming by pool_view) rather than served as fresh.
+        assert_eq!(pool_twap_x32(&d, true, 2_515), Some(twap), "exactly one window old is still fresh");
+        assert_eq!(pool_twap_x32(&d, true, 2_516), None, "older than the window: stale");
+        assert_eq!(pool_twap_x32(&d, true, 5_000), None);
     }
 
     #[test]
@@ -2337,20 +2394,22 @@ mod oracle_tests {
         assert_eq!(pool_twap_x32(&d, true, 5_000), None, "initialized but empty");
         // Raydium's first observation only (zero cumulative at the first swap).
         let d = observations(&[(1_000, 100)]);
-        assert_eq!(pool_twap_x32(&d, true, 5_000), None, "no interval to price from");
-        // Two observations but none old enough to cover the window.
+        assert_eq!(pool_twap_x32(&d, true, 1_010), None, "no interval to price from");
+        // Two observations but they do not span the window.
         let d = observations(&[(4_900, 100), (4_950, 100)]);
         assert_eq!(pool_twap_x32(&d, true, 5_000), None, "history shorter than 300 s");
-        // Covered once an observation is 300 s old.
-        let d = observations(&[(4_600, 100), (4_650, 100)]);
+        let d = observations(&[(4_700, 100), (4_950, 100)]);
+        assert_eq!(pool_twap_x32(&d, true, 5_000), None, "250 s of real observations");
+        // Spans the window once the observations are 300 s apart.
+        let d = observations(&[(4_600, 100), (4_900, 100)]);
         assert_eq!(pool_twap_x32(&d, true, 4_900), Some(100));
     }
 
     #[test]
-    fn a_stale_newest_observation_extends_at_the_last_observed_price() {
-        let d = observations(&[(1_000, 100), (1_100, 100), (1_200, 100)]);
-        // Nothing for an hour: the TWAP is the last observed price, whatever the pool shows now.
-        assert_eq!(pool_twap_x32(&d, true, 4_800), Some(100));
+    fn a_stale_newest_observation_is_not_fresh() {
+        let d = observations(&[(1_000, 100), (1_100, 100), (1_200, 100), (1_300, 100)]);
+        assert_eq!(pool_twap_obs(&d, true, 4_800), Some((100, 1_300)), "last TWAP over real observations");
+        assert_eq!(pool_twap_x32(&d, true, 4_800), None, "but not fresh");
     }
 
     #[test]
@@ -2441,7 +2500,7 @@ mod layout_fixture {
     /// Same for `WITHDRAWAL_LEN` in `client/scripts/resize-accounts.ts`.
     #[test]
     fn withdrawal_request_size_matches_resize_script() {
-        assert_eq!(8 + WithdrawalRequest::INIT_SPACE, 73);
+        assert_eq!(8 + WithdrawalRequest::INIT_SPACE, 81);
     }
 
 }

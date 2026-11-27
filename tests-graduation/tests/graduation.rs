@@ -282,11 +282,11 @@ async fn sold_out_curve_graduates_into_a_raydium_pool_with_lp_burned() {
         },
     ], &[&buyer]).await;
     // The market prices from Raydium's observation history, never the live pool price: the first swap only
-    // starts the history, so a second, small swap 30 s later records the price the dump left behind.
+    // starts the history, so a second, small swap 400 s later (the TWAP needs observations a full window apart) records the price the dump left behind.
     clock = ctx.banks_client.get_sysvar().await.unwrap();
     ctx.warp_to_slot(clock.slot + 5).unwrap();
     clock = ctx.banks_client.get_sysvar().await.unwrap();
-    clock.unix_timestamp += 30;
+    clock.unix_timestamp += 400;
     ctx.set_sysvar(&clock);
     send(&mut ctx, &[Instruction {
         program_id: raydium::CPMM_PROGRAM,

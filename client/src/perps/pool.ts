@@ -16,27 +16,35 @@ const u64 = (b: Uint8Array, o: number): bigint => {
 const u128 = (b: Uint8Array, o: number): bigint => u64(b, o) | (u64(b, o + 8) << 64n);
 
 /**
- * TWAP of the token's price (lamports per base unit, x32) over POOL_TWAP_SECONDS from a Raydium ObservationState,
- * extended from the newest observation to `now` at the last observed price (the average over the newest observed
- * interval). `null` while there is no observation at least POOL_TWAP_SECONDS old or no interval to take a price from.
+ * TWAP of the token's price (lamports per base unit, x32) from a Raydium ObservationState, taken only between
+ * real observations: from the newest observation at least POOL_TWAP_SECONDS older than the newest one, to the newest
+ * one. Never extended past the newest observation. Returns `[twap, newest observation time]`, or `null` while the
+ * observations do not span a full window.
  */
-export function poolTwapX32(obs: Uint8Array, tokenIs0: boolean, now: bigint): bigint | null {
+export function poolTwapObs(obs: Uint8Array, tokenIs0: boolean, now: bigint): [bigint, bigint] | null {
   if (obs.length < BASE + N * 40 || obs[8] === 0) return null;
   const latest = (obs[9] | (obs[10] << 8)) % N;
   const ts = (k: number) => u64(obs, BASE + k * 40);
   const cum = (k: number) => u128(obs, BASE + k * 40 + 8 + (tokenIs0 ? 0 : 16));
-  const tLatest = ts(latest), prev = (latest + N - 1) % N, tPrev = ts(prev);
-  if (tLatest === 0n || tLatest > now || tPrev === 0n || tPrev >= tLatest) return null;
-  const lastPrice = ((cum(latest) - cum(prev) + U128) % U128) / (tLatest - tPrev);
-  const cumNow = (cum(latest) + lastPrice * (now - tLatest)) % U128;
-  const cutoff = now > POOL_TWAP_SECONDS ? now - POOL_TWAP_SECONDS : 0n;
+  const tLatest = ts(latest);
+  if (tLatest === 0n || tLatest > now) return null;
+  const cutoff = tLatest > POOL_TWAP_SECONDS ? tLatest - POOL_TWAP_SECONDS : 0n;
   let start: [bigint, bigint] | null = null;
   for (let k = 0; k < N; k++) {
     const t = ts(k);
-    if (t !== 0n && t <= cutoff && t <= tLatest && (!start || t > start[0])) start = [t, cum(k)];
+    if (t !== 0n && t <= cutoff && (!start || t > start[0])) start = [t, cum(k)];
   }
   if (!start) return null;
-  return ((cumNow - start[1] + U128) % U128) / (now - start[0]);
+  return [((cum(latest) - start[1] + U128) % U128) / (tLatest - start[0]), tLatest];
+}
+
+/**
+ * `poolTwapObs` when the newest observation is also at most POOL_TWAP_SECONDS old (otherwise the market is
+ * warming: new opens are refused, and the program prices from the last TWAP over real observations).
+ */
+export function poolTwapX32(obs: Uint8Array, tokenIs0: boolean, now: bigint): bigint | null {
+  const r = poolTwapObs(obs, tokenIs0, now);
+  return r && now - r[1] <= POOL_TWAP_SECONDS ? r[0] : null;
 }
 
 /** Accrued fees sitting in a pool vault (protocol + fund + creator) for token 0 or token 1, from raw PoolState bytes. */
