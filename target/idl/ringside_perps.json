@@ -80,6 +80,105 @@
       "args": []
     },
     {
+      "name": "admin_retire_market",
+      "docs": [
+        "Admin: retires any Tier 0 market with no open interest at once, whatever",
+        "its volume or the state of its curve (spam, or a market the admin wants",
+        "off). Same effects as `retire_market`."
+      ],
+      "discriminator": [
+        172,
+        245,
+        49,
+        239,
+        75,
+        43,
+        141,
+        176
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "vault"
+          ]
+        },
+        {
+          "name": "vault",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "market",
+          "writable": true
+        },
+        {
+          "name": "registry",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  114,
+                  101,
+                  103,
+                  105,
+                  115,
+                  116,
+                  114,
+                  121
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "retired",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  114,
+                  101,
+                  116,
+                  105,
+                  114,
+                  101,
+                  100
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "auto_deleverage",
       "docs": [
         "Auto-deleverage a profitable position once the market's budget is spent.",
@@ -1969,8 +2068,11 @@
       "name": "retire_market",
       "docs": [
         "Permissionless: frees the Tier 0 slot of a dead launch. Allowed when the",
-        "curve hasn't sold out, hasn't traded for ~7 days and the market has no",
-        "open interest. The market becomes reduce-only (it can still graduate later)."
+        "curve hasn't sold out, the market has no open interest and the curve has",
+        "been quiet: either no trade at all for ~7 days, or less than",
+        "RETIRE_MAX_VOLUME_FEES of volume (creator-fee growth, see `roll_volume_window`)",
+        "over a window of at least ~7 days. Dust trades therefore don't keep a slot",
+        "alive. The market becomes reduce-only (it can still graduate later)."
       ],
       "discriminator": [
         68,
@@ -3024,7 +3126,7 @@
     {
       "code": 6024,
       "name": "NotRetirable",
-      "msg": "Market can't be retired: it has open interest, its curve sold out, or it traded in the last 7 days"
+      "msg": "Market can't be retired: it has open interest, its curve sold out, or its curve volume over the last 7 days is above the threshold"
     },
     {
       "code": 6025,
@@ -3040,6 +3142,11 @@
       "code": 6027,
       "name": "NotUpgradeAuthority",
       "msg": "Only the program's upgrade authority can initialize it"
+    },
+    {
+      "code": 6028,
+      "name": "AcceptablePriceRequired",
+      "msg": "Every order needs a non-zero acceptable price"
     }
   ],
   "types": [
@@ -3337,6 +3444,29 @@
               "canonical address for the mint (see `expected_pool`)."
             ],
             "type": "pubkey"
+          },
+          {
+            "name": "grad_price_q64",
+            "docs": [
+              "The curve's final price (Q64.64), set at `graduate_market`: what a",
+              "graduated market is priced at until its pool has TWAP history. APPENDED",
+              "after `pool`. Zero for Tier 0 markets and for markets that graduated before",
+              "it existed (they fall back to the band anchor, see `warmup_price`)."
+            ],
+            "type": "u128"
+          },
+          {
+            "name": "vol_snap_slot",
+            "docs": [
+              "Start of the retirement volume window: slot and the curve's",
+              "`creator_fees_locked` then. APPENDED after `grad_price_q64`. Zero slot =",
+              "not started (the keeper's `crank_funding` starts it)."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "vol_snap_fees",
+            "type": "u64"
           }
         ]
       }
