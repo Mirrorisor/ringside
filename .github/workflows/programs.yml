@@ -76,6 +76,15 @@ jobs:
           name: idl
           path: target/idl/*.json
           if-no-files-found: ignore
+      # Manual runs also print the regenerated IDLs (gzip + base64 between markers),
+      # for environments that can read run logs but not download artifacts.
+      - name: Print regenerated IDLs (manual runs)
+        if: always() && github.event_name == 'workflow_dispatch'
+        run: |
+          echo "IDL-BUNDLE-BEGIN"
+          tar -czf - target/idl/*.json | base64 -w0
+          echo
+          echo "IDL-BUNDLE-END"
       - name: Committed IDLs match the source
         run: |
           if ! git diff --exit-code --stat -- target/idl; then
