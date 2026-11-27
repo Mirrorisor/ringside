@@ -107,9 +107,23 @@ IDL. CI fails if they drift from the source; a manual run of the workflow prints
 ## Where the forfeited value goes (read this before relying on it)
 - Perps: on chain. `protocol_fees` becomes treasury-owned LP shares through the existing
   `compound_protocol_fees` (permissionless; the keeper runs it hourly).
-- Launch: the forfeited SOL is paid to `global.fee_recipient`. It becomes protocol-owned liquidity ONLY if
-  the treasury sweep (`client/scripts/treasury.ts`) later swaps that SOL to USDC (`SWAP_SOL=1`) and calls
-  `deposit_to_treasury`. That step is off chain and needs a running job and Jupiter; no program does it.
+- Launch: the forfeited SOL is paid to `global.fee_recipient`, mixed with ordinary protocol revenue. The treasury
+  sweep (`client/scripts/treasury.ts sweep`, or `treasury.ts forfeits` alone) now turns it into protocol-owned
+  liquidity automatically, but still OFF chain: no program does it, and it needs a running job, the fee_recipient
+  key and Jupiter (mainnet).
+  - It scans the launch program's finalized transactions (newest to the stored cursor), keeps the successful ones,
+    and reads `CreatorFeesForfeited` from the logs (`Program data:` written by the launch program itself; the
+    perps event has the same name and is ignored).
+  - It converts exactly `total forfeited - total converted` lamports (never more than the balance above
+    `SOL_RESERVE`, nothing below 0.05 SOL; the remainder carries over) to USDC, then `deposit_to_treasury` with the
+    USDC received. Only the fee_recipient wallet does this; any other wallet just prints what is pending.
+  - `FORFEIT_STATE_FILE` (default `./forfeit-state.json`) holds the cursor, total forfeited, total converted,
+    USDC awaiting deposit, total USDC deposited and the last 2000 processed signatures, so re-runs never count a
+    transaction twice and an auditor can match the totals to `CreatorFeesForfeited` events and to the vault's
+    treasury LP shares. `--dry-run` / `FORFEIT_DRY_RUN=1` reports without sending or writing.
+  - Keeper alerts (`ALERT_WEBHOOK_URL`): a forfeit send failing 3 times in a row for an account, and, for the
+    graduation steps, migrate or graduate_market failing 3 times in a row or a migrated curve's market still at
+    tier 0 after 10 minutes.
 - The keeper calls `forfeit_creator_fees` automatically (`forfeit()` in `client/src/keeper.ts`, at most every
   `FORFEIT_EVERY_MS`, default 10 minutes; `FORFEIT_CRANK=0` turns it off). It scans all curves and markets and
   sends the launch forfeit for each curve that is not complete, is past `created_ts` + 30 days (plus a 60 s margin on

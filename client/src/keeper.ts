@@ -47,7 +47,7 @@ import {
 import { createHash } from "node:crypto";
 import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import { PythPoster } from "./pyth.js";
-import { Monitor, FILL_LAG_SLOTS, LOW_SOL_LAMPORTS, STALE_PRICE_S, type Condition } from "./monitor.js";
+import { Monitor, FILL_LAG_SLOTS, LOW_SOL_LAMPORTS, STALE_PRICE_S, clearGone, crankConditions, pruneCleared, recordAttempt, stuckTier0, tier0Conditions, type Condition, type Failures } from "./monitor.js";
 import { CREATOR_FEE_FORFEIT_SECONDS, LAUNCH_PROGRAM, type CurveState, decodeCurve, decodeFeeRecipient, graduateMarketIx, migrateIx, priceAccounts, retireMarketIx } from "./graduation.js";
 import { installLogRedaction } from "./logredact.js";
 
@@ -181,6 +181,11 @@ export class Keeper {
   private lastCompound = 0;
   private lastForfeit = 0;
   private warnedNoTreasury = false;
+  /** Consecutive send failures per "forfeit:<account>", "migrate:<mint>", "graduate:<market>"; see monitor.ts. */
+  private crankFailures: Failures = new Map();
+  /** Curve key -> when this keeper first saw it migrated (ms); drives the "market still tier 0" alert. */
+  private migratedAt = new Map<string, number>();
+  private migratedCurves = new Set<string>();
   monitor = new Monitor(process.env.ALERT_WEBHOOK_URL);
   /** Markets deliberately limited by the admin (e.g. the protocol's own token): no reduce-only alerts. */
   private quietMarkets = new Set((process.env.MONITOR_IGNORE_MARKETS ?? "").split(",").filter(Boolean));
@@ -417,7 +422,24 @@ export class Keeper {
       conditions.push({ key: `adl:${m.key}`, active: m.adlMode, message: `market ${m.key} spent its risk budget: reduce-only with ADL` });
       conditions.push({ key: `ro:${m.key}`, active: m.reduceOnly && !m.adlMode && !quiet, message: `market ${m.key} is reduce-only` });
     }
+    const now = Date.now();
+    conditions.push(...tier0Conditions(stuckTier0([...this.markets.values()], this.migratedCurves, this.migratedAt, now), now));
+    conditions.push(...crankConditions(this.crankFailures));
     await this.monitor.update(conditions);
+    pruneCleared(this.crankFailures);
+  }
+
+  /** Runs fn under guard() and counts consecutive failures per key for the alerts (a success resets the count). */
+  private tracked(key: string, fn: () => Promise<void>) {
+    return this.guard(key, async () => {
+      try {
+        await fn();
+        recordAttempt(this.crankFailures, key, true);
+      } catch (e) {
+        recordAttempt(this.crankFailures, key, false, (e as Error).message.slice(0, 200));
+        throw e;
+      }
+    });
   }
 
   /** Graduated markets price from their Raydium pool, passed as remaining accounts. */
@@ -444,10 +466,11 @@ export class Keeper {
     const curves = await this.launchCurves();
     await this.refreshMarkets();
     const targets = forfeitTargets(curves, [...this.markets.values()], now);
+    clearGone(this.crankFailures, "forfeit:", new Set([...targets.curves, ...targets.markets].map((t) => t.key as string)));
     if (targets.curves.length === 0 && targets.markets.length === 0) return;
     const [global] = await getProgramDerivedAddress({ programAddress: LAUNCH_PROGRAM, seeds: [new TextEncoder().encode("global")] });
     for (const c of targets.curves) {
-      await this.guard(`forfeit:${c.key}`, async () => {
+      await this.tracked(`forfeit:${c.key}`, async () => {
         const g = await this.rpc.getAccountInfo(global, { encoding: "base64" }).send();
         const feeRecipient = decodeFeeRecipient(new Uint8Array(Buffer.from(g.value!.data[0], "base64")));
         // launch ForfeitCreatorFees: global, curve (mut), fee_recipient (mut). No signer.
@@ -456,7 +479,7 @@ export class Keeper {
       });
     }
     for (const m of targets.markets) {
-      await this.guard(`forfeit:${m.key}`, async () => {
+      await this.tracked(`forfeit:${m.key}`, async () => {
         // perps ForfeitCreator: vault (mut), market (mut), curve. No signer.
         await this.sendIx({ programAddress: PERPS_PROGRAM, accounts: [w(this.vault), w(m.key), ro(m.curve)], data: IX.forfeitCreatorFees });
         console.log(`[keeper] forfeited ${Number(m.creatorFeesLocked) / 1e6} USDC (creator fees) on ${m.mint}`);
@@ -467,7 +490,7 @@ export class Keeper {
   private async graduate() {
     const decoded = await this.launchCurves();
     for (const c of decoded.filter((c) => c.complete && !c.migrated)) {
-      await this.guard(`migrate:${c.mint}`, async () => {
+      await this.tracked(`migrate:${c.mint}`, async () => {
         const [global] = await getProgramDerivedAddress({ programAddress: LAUNCH_PROGRAM, seeds: [new TextEncoder().encode("global")] });
         const g = await this.rpc.getAccountInfo(global, { encoding: "base64" }).send();
         const feeRecipient = decodeFeeRecipient(new Uint8Array(Buffer.from(g.value!.data[0], "base64")));
@@ -477,9 +500,12 @@ export class Keeper {
       });
     }
     const migrated = new Set(decoded.filter((c) => c.migrated).map((c) => c.key as string));
+    this.migratedCurves = migrated;
+    clearGone(this.crankFailures, "graduate:", new Set([...this.markets.values()].filter((m) => m.tier === 0 && migrated.has(m.curve)).map((m) => m.key as string)));
+    clearGone(this.crankFailures, "migrate:", new Set(decoded.filter((c) => c.complete && !c.migrated).map((c) => c.mint as string)));
     for (const m of this.markets.values()) {
       if (m.tier !== 0 || !migrated.has(m.curve)) continue;
-      await this.guard(`graduate:${m.key}`, async () => {
+      await this.tracked(`graduate:${m.key}`, async () => {
         await this.sendIx(await graduateMarketIx(m.key, m.curve, m.mint));
         m.tier = 1;
         console.log(`[keeper] market ${m.key} now prices from its Raydium pool`);

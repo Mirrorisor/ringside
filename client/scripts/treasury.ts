@@ -1,7 +1,9 @@
 /**
  * Treasury jobs for protocol-owned liquidity ($RING plan).
  *
- *   sweep                                    claim $RING's creator fees and put them in the vault
+ *   sweep                                    claim $RING's creator fees and put them in the vault,
+ *                                            then run `forfeits` (below)
+ *   forfeits [--dry-run]                     turn forfeited creator-fee SOL into treasury-owned liquidity
  *   set-treasury <pubkey>                    admin: who owns protocol-owned LP shares
  *   limits <mint> <capUsd> <reduceOnly 0|1>  admin: market limits (keep $RING off perps)
  *   handover <newAuthority>                  admin: propose a new admin for both programs
@@ -27,16 +29,29 @@
  * in the program's fee_recipient as SOL, and only reach vault liquidity when the SOL is swapped to
  * USDC and deposited (step 3), which is this sweep's job (SWAP_SOL=1), not an on-chain step.
  *
+ *
+ * Forfeits (`forfeits`, and the last part of `sweep`): launch `forfeit_creator_fees` pays the locked SOL to
+ * global.fee_recipient, mixed with ordinary protocol revenue. This job scans the launch program's finalized
+ * transactions for the `CreatorFeesForfeited` event (successful ones only), keeps a cursor and running totals in
+ * FORFEIT_STATE_FILE (default ./forfeit-state.json), and, only when the running wallet IS the fee_recipient, swaps
+ * exactly the not-yet-converted forfeited lamports (never more than balance - SOL_RESERVE) to USDC and calls
+ * deposit_to_treasury with the USDC received. Otherwise it prints what should be converted and exits 0.
+ * --dry-run / FORFEIT_DRY_RUN=1: scan and report only, send nothing, write no state (on `sweep` the whole
+ * sweep is skipped and only this report runs). The pure parsing and accounting are in src/forfeits.ts.
+ * Env: FORFEIT_STATE_FILE, FORFEIT_DRY_RUN, FORFEIT_SCAN_MAX (signatures per scan, default 20000).
+ *
  * Env: ANCHOR_PROVIDER_URL, ANCHOR_WALLET (treasury key), RING_MINT, NETWORK,
  *      TREASURY_KEEP_USDC (default 0), SWAP_SOL, SOL_RESERVE (default 0.5).
  * Instructions are built from discriminators so this runs before the IDL is rebuilt.
  */
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import {
   Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction, TransactionInstruction, VersionedTransaction,
   sendAndConfirmTransaction,
 } from "@solana/web3.js";
+import { decodeFeeRecipient } from "../src/graduation.js";
+import { applyScan, emptyState, parseState, pendingLamports, planConversion, recordDeposit, recordSwap, summaryLine, type ForfeitState, type ScannedTx } from "../src/forfeits.js";
 import { TOKEN_PROGRAM_ID, createAssociatedTokenAccountIdempotentInstruction, getAccount, getAssociatedTokenAddressSync } from "@solana/spl-token";
 
 const LAUNCH = new PublicKey("AfZWCTaDQEC9CVTwXkH7pFtDXs4RtLWCK5godexWQDVH");
@@ -48,9 +63,11 @@ const u64 = (n: bigint) => { const b = Buffer.alloc(8); b.writeBigUInt64LE(n); r
 const w = (pubkey: PublicKey, isSigner = false) => ({ pubkey, isSigner, isWritable: true });
 const r = (pubkey: PublicKey) => ({ pubkey, isSigner: false, isWritable: false });
 
-const [cmd, ...args] = process.argv.slice(2);
-if (!(cmd === "sweep" || (["set-treasury", "handover"].includes(cmd) && args.length === 1) || (cmd === "limits" && args.length === 3))) {
-  console.log("usage: treasury.ts sweep | set-treasury <pubkey> | handover <newAuthority> | limits <mint> <capUsd> <reduceOnly 0|1>");
+const rawArgs = process.argv.slice(2);
+const DRY = rawArgs.includes("--dry-run") || process.env.FORFEIT_DRY_RUN === "1";
+const [cmd, ...args] = rawArgs.filter((a) => a !== "--dry-run");
+if (!(cmd === "sweep" || (cmd === "forfeits" && args.length === 0) || (["set-treasury", "handover"].includes(cmd) && args.length === 1) || (cmd === "limits" && args.length === 3))) {
+  console.log("usage: treasury.ts sweep | set-treasury <pubkey> | handover <newAuthority> | limits <mint> <capUsd> <reduceOnly 0|1> | forfeits [--dry-run]");
   process.exit(1);
 }
 const url = process.env.ANCHOR_PROVIDER_URL ?? "https://api.devnet.solana.com";
@@ -72,6 +89,11 @@ async function readVault() {
 
 async function sweep() {
   const v = await readVault();
+  if (DRY) {
+    console.log("dry run: only the forfeits report runs; nothing is claimed, deposited or compounded");
+    await forfeits(v.usdcMint);
+    return;
+  }
   let owner = await readTreasury();
   if (!owner && process.env.NETWORK !== "mainnet" && v.authority.equals(treasury.publicKey)) {
     console.log("devnet: no treasury set; naming this wallet as the treasury");
@@ -84,6 +106,9 @@ async function sweep() {
   const usdc = getAssociatedTokenAddressSync(v.usdcMint, treasury.publicKey);
   await send(createAssociatedTokenAccountIdempotentInstruction(treasury.publicKey, usdc, treasury.publicKey, v.usdcMint));
 
+  // Forfeits first: they convert exactly the forfeited SOL, before SWAP_SOL below can sweep it up with everything else.
+  await forfeits(v.usdcMint, usdc, lp);
+
   const ring = process.env.RING_MINT ? new PublicKey(process.env.RING_MINT) : null;
   if (ring) {
     const market = pda([Buffer.from("market"), ring.toBuffer()], PERPS);
@@ -95,7 +120,7 @@ async function sweep() {
     if (await trySend("curve creator fees on $RING (early 20%, plus the locked 80% after graduation)", cix)) {
       console.log(`  +${((await conn.getBalance(treasury.publicKey)) - before) / LAMPORTS_PER_SOL} SOL (net of fee)`);
     }
-    if (process.env.SWAP_SOL === "1") await swapSol(v.usdcMint);
+    if (process.env.SWAP_SOL === "1") await swapSol(v.usdcMint, usdc);
   } else {
     console.log("RING_MINT not set: skipping $RING creator fees");
   }
@@ -133,25 +158,126 @@ async function trySend(label: string, ix: TransactionInstruction): Promise<boole
   return true;
 }
 
-/** Mainnet only: swap SOL above SOL_RESERVE to USDC through Jupiter (50 bps slippage cap). */
-async function swapSol(usdcMint: PublicKey) {
+/**
+ * Mainnet only: swap SOL to USDC through Jupiter (50 bps slippage cap). `lamports` is the exact amount to swap
+ * (the forfeits job); without it, everything above SOL_RESERVE (the SWAP_SOL=1 sweep). Returns the USDC (6 dp)
+ * that arrived in `usdcAta` (measured from the balance), or null when nothing was swapped.
+ */
+async function swapSol(usdcMint: PublicKey, usdcAta: PublicKey, lamports?: bigint): Promise<{ usdc: bigint; sig: string } | null> {
   if (process.env.NETWORK !== "mainnet" || usdcMint.toBase58() !== USDC_MAINNET) {
     console.log("- SOL→USDC swap: mainnet only, skipped");
-    return;
+    return null;
   }
   const reserve = Math.round(Number(process.env.SOL_RESERVE ?? "0.5") * LAMPORTS_PER_SOL);
-  const amount = (await conn.getBalance(treasury.publicKey)) - reserve;
-  if (amount < 0.05 * LAMPORTS_PER_SOL) return;
+  const available = (await conn.getBalance(treasury.publicKey)) - reserve;
+  const amount = lamports === undefined ? available : Number(lamports);
+  if (lamports !== undefined && amount > available) throw new Error(`swap of ${amount} lamports exceeds the balance above SOL_RESERVE (${available})`);
+  if (amount < 0.05 * LAMPORTS_PER_SOL && lamports === undefined) return null;
+  if (amount <= 0) return null;
   const api = "https://lite-api.jup.ag/swap/v1";
   const quote = await (await fetch(`${api}/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=${USDC_MAINNET}&amount=${amount}&slippageBps=50`)).json();
   if (!quote.outAmount) throw new Error(`Jupiter quote failed: ${JSON.stringify(quote).slice(0, 200)}`);
+  if (String(quote.inAmount) !== String(amount)) throw new Error(`Jupiter quote is for ${quote.inAmount} lamports, expected ${amount}`);
+  const before = (await getAccount(conn, usdcAta)).amount;
   const { swapTransaction } = await (await fetch(`${api}/swap`, { method: "POST", headers: { "content-type": "application/json" },
     body: JSON.stringify({ quoteResponse: quote, userPublicKey: treasury.publicKey.toBase58(), wrapAndUnwrapSol: true }) })).json();
   const tx = VersionedTransaction.deserialize(Buffer.from(swapTransaction, "base64"));
   tx.sign([treasury]);
   const sig = await conn.sendTransaction(tx);
   await conn.confirmTransaction(sig, "confirmed");
-  console.log(`✓ swapped ${amount / LAMPORTS_PER_SOL} SOL → ~${Number(quote.outAmount) / 1e6} USDC (${sig})`);
+  const usdc = (await getAccount(conn, usdcAta)).amount - before;
+  console.log(`✓ swapped ${amount / LAMPORTS_PER_SOL} SOL → ${Number(usdc) / 1e6} USDC (${sig})`);
+  return { usdc, sig };
+}
+
+// ---- forfeited creator-fee SOL -> treasury-owned liquidity ----
+
+const stateFile = () => process.env.FORFEIT_STATE_FILE ?? "./forfeit-state.json";
+const loadState = (): ForfeitState => (existsSync(stateFile()) ? parseState(JSON.parse(readFileSync(stateFile(), "utf8"))) : emptyState());
+function saveState(st: ForfeitState) {
+  const tmp = `${stateFile()}.tmp`;
+  writeFileSync(tmp, JSON.stringify(st, null, 2) + "\n");
+  renameSync(tmp, stateFile());
+}
+
+/** Every launch-program transaction newer than the cursor, newest first, with logs for the unseen successful ones. */
+async function scanLaunch(state: ForfeitState): Promise<ScannedTx[]> {
+  const max = Number(process.env.FORFEIT_SCAN_MAX ?? "20000");
+  const infos: { signature: string; err: unknown | null }[] = [];
+  let before: string | undefined;
+  for (;;) {
+    const page = await conn.getSignaturesForAddress(LAUNCH, { before, until: state.cursor ?? undefined, limit: 1000 }, "finalized");
+    infos.push(...page.map((p) => ({ signature: p.signature, err: p.err })));
+    if (infos.length > max) throw new Error(`more than ${max} launch transactions since the cursor; raise FORFEIT_SCAN_MAX (nothing was saved)`);
+    if (page.length < 1000) break;
+    before = page[page.length - 1].signature;
+  }
+  const seen = new Set(state.processed);
+  const todo = infos.filter((i) => !i.err && !seen.has(i.signature));
+  const logs = new Map<string, string[]>();
+  for (let i = 0; i < todo.length; i += 8) {
+    await Promise.all(todo.slice(i, i + 8).map(async (t) => {
+      const tx = await conn.getTransaction(t.signature, { commitment: "finalized", maxSupportedTransactionVersion: 0 });
+      if (!tx?.meta) throw new Error(`transaction ${t.signature} not available from the RPC (pruned?); nothing was saved`);
+      logs.set(t.signature, tx.meta.err ? [] : tx.meta.logMessages ?? []);
+    }));
+  }
+  return infos.map((i) => ({ signature: i.signature, err: i.err, logs: logs.get(i.signature) ?? null }));
+}
+
+async function forfeits(usdcMint: PublicKey, usdcAtaIn?: PublicKey, lp?: PublicKey) {
+  let st = loadState();
+  const scanned = applyScan(st, await scanLaunch(st), LAUNCH.toBase58());
+  for (const e of scanned.events) console.log(`  forfeit ${Number(e.lamports) / LAMPORTS_PER_SOL} SOL on ${e.mint} (${e.signature})`);
+  st = scanned.state;
+  const g = await conn.getAccountInfo(pda([Buffer.from("global")], LAUNCH));
+  if (!g) throw new Error("launch global account not found");
+  const feeRecipient = new PublicKey(decodeFeeRecipient(new Uint8Array(g.data)));
+  const reserve = BigInt(Math.round(Number(process.env.SOL_RESERVE ?? "0.5") * LAMPORTS_PER_SOL));
+  const min = BigInt(Math.round(0.05 * LAMPORTS_PER_SOL));
+  const plan = planConversion(st, BigInt(await conn.getBalance(treasury.publicKey)), reserve, min);
+  if (!feeRecipient.equals(treasury.publicKey)) {
+    console.log(`forfeited SOL: ${Number(st.totalForfeited) / 1e9} total, ${Number(st.totalConverted) / 1e9} converted, ${Number(pendingLamports(st)) / 1e9} pending.`
+      + ` ${Number(pendingLamports(st)) / 1e9} SOL sits in the fee_recipient ${feeRecipient.toBase58()} and should be swapped to USDC and deposited with deposit_to_treasury; this wallet is not the fee_recipient, so nothing is sent and no state is written`);
+    return;
+  }
+  if (DRY) {
+    console.log(`dry run: forfeited SOL: ${Number(st.totalForfeited) / 1e9} total, ${Number(st.totalConverted) / 1e9} converted, ${Number(pendingLamports(st)) / 1e9} pending; would convert ${Number(plan) / 1e9} SOL`
+      + ` (balance above the ${Number(reserve) / 1e9} SOL reserve, at least ${Number(min) / 1e9}), and deposit ${Number(BigInt(st.usdcPendingDeposit)) / 1e6} USDC left from an earlier run; state not written`);
+    return;
+  }
+  saveState(st); // the scan itself is final: never read these transactions again
+  const v = await readVault();
+  const owner = await readTreasury();
+  if (!owner) { console.log("- forfeits: no treasury set yet; nothing converted"); return; }
+  const usdc = usdcAtaIn ?? getAssociatedTokenAddressSync(v.usdcMint, treasury.publicKey);
+  const lpAcc = lp ?? pda([Buffer.from("lp"), owner.toBuffer()], PERPS);
+  if (!usdcAtaIn) await send(createAssociatedTokenAccountIdempotentInstruction(treasury.publicKey, usdc, treasury.publicKey, v.usdcMint));
+
+  let swapSig: string | null = null;
+  if (plan > 0n) {
+    const swapped = await swapSol(usdcMint, usdc, plan);
+    if (swapped) {
+      st = recordSwap(st, plan, swapped.usdc); // SOL is gone: record it before anything else can fail
+      saveState(st);
+      swapSig = swapped.sig;
+    }
+  }
+  // Deposit what the swaps produced, never more than the wallet holds (the sweep may have deposited it already).
+  const held = (await getAccount(conn, usdc)).amount;
+  const owed = BigInt(st.usdcPendingDeposit);
+  const dep = owed < held ? owed : held;
+  let depTx: string | null = null;
+  if (dep > 0n) {
+    depTx = await send(new TransactionInstruction({ programId: PERPS, data: Buffer.concat([disc("deposit_to_treasury"), u64(dep)]),
+      keys: [w(treasury.publicKey, true), w(VAULT), w(VAULT_USDC), r(TREASURY_CONFIG), w(lpAcc), w(usdc), r(TOKEN_PROGRAM_ID), r(SystemProgram.programId)] }));
+  }
+  if (dep > 0n || owed > 0n) { st = recordDeposit(st, dep < owed ? dep : owed); saveState(st); }
+  console.log(summaryLine(st, dep, depTx ?? swapSig));
+}
+
+async function forfeitsCmd() {
+  await forfeits((await readVault()).usdcMint);
 }
 
 async function setTreasury(to: string) {
@@ -182,4 +308,4 @@ async function limits(mintArg: string, capUsd: string, reduceOnly: string) {
   console.log(`✓ ${mint}: OI cap override ${capUsd === "0" ? "none" : `$${capUsd}`}, reduce-only ${reduceOnly === "1"}`);
 }
 
-(cmd === "sweep" ? sweep() : cmd === "set-treasury" ? setTreasury(args[0]) : cmd === "handover" ? handover(args[0]) : limits(args[0], args[1], args[2])).then(() => process.exit(0), (e) => { console.error(e.message ?? e); process.exit(1); });
+(cmd === "sweep" ? sweep() : cmd === "forfeits" ? forfeitsCmd() : cmd === "set-treasury" ? setTreasury(args[0]) : cmd === "handover" ? handover(args[0]) : limits(args[0], args[1], args[2])).then(() => process.exit(0), (e) => { console.error(e.message ?? e); process.exit(1); });

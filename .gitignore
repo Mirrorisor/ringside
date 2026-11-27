@@ -32,3 +32,4 @@ sim/data/launch-data.json
 __pycache__/
 *.pyc
 tests/target/
+forfeit-state.json
