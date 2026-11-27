@@ -19,6 +19,14 @@
  *   4. accrued protocol fees are compounded into the treasury's LP shares.
  * The keeper also compounds hourly; running it here as well is harmless.
  *
+ * Creator-fee model (docs/creator-fee-lock.md): a creator claim pays the early 20% at any time
+ * and the locked 80% only once the curve has graduated. The claim instructions' accounts are
+ * unchanged, so steps 1 and 2 only ever pay out what is claimable; before graduation that is the
+ * early share, and a claim with nothing claimable logs "nothing to claim" and carries on.
+ * Locked fees that are forfeited after 30 days are not claimed here: on the launch side they land
+ * in the program's fee_recipient as SOL, and only reach vault liquidity when the SOL is swapped to
+ * USDC and deposited (step 3), which is this sweep's job (SWAP_SOL=1), not an on-chain step.
+ *
  * Env: ANCHOR_PROVIDER_URL, ANCHOR_WALLET (treasury key), RING_MINT, NETWORK,
  *      TREASURY_KEEP_USDC (default 0), SWAP_SOL, SOL_RESERVE (default 0.5).
  * Instructions are built from discriminators so this runs before the IDL is rebuilt.
@@ -80,11 +88,11 @@ async function sweep() {
   if (ring) {
     const market = pda([Buffer.from("market"), ring.toBuffer()], PERPS);
     const curve = pda([Buffer.from("curve"), ring.toBuffer()], LAUNCH);
-    await trySend("perps creator fees on $RING", new TransactionInstruction({ programId: PERPS, data: disc("claim_creator_fees"),
+    await trySend("perps creator fees on $RING (early 20%, plus the locked 80% after graduation)", new TransactionInstruction({ programId: PERPS, data: disc("claim_creator_fees"),
       keys: [{ pubkey: treasury.publicKey, isSigner: true, isWritable: false }, w(VAULT), w(VAULT_USDC), w(market), w(usdc), r(TOKEN_PROGRAM_ID), r(curve)] }));
     const before = await conn.getBalance(treasury.publicKey);
     const cix = new TransactionInstruction({ programId: LAUNCH, data: disc("claim_creator_fees"), keys: [w(treasury.publicKey, true), w(curve)] });
-    if (await trySend("curve creator fees on $RING", cix)) {
+    if (await trySend("curve creator fees on $RING (early 20%, plus the locked 80% after graduation)", cix)) {
       console.log(`  +${((await conn.getBalance(treasury.publicKey)) - before) / LAMPORTS_PER_SOL} SOL (net of fee)`);
     }
     if (process.env.SWAP_SOL === "1") await swapSol(v.usdcMint);

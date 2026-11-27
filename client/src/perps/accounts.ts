@@ -10,6 +10,8 @@ export interface MarketAcc {
   mint: PublicKey; curve: PublicKey; creator: PublicKey; tier: number; createdSlot: BN; oiLong: BN; oiShort: BN; oiCapOverride: BN;
   fundingIndex: BN; lastFundingTs: BN; bandAnchorQ64: BN; bandAnchorSlot: BN; traderNetPnl: BN; insurance: BN; creatorFees: BN;
   reduceOnly: boolean; adlMode: boolean; bump: number;
+  /** Locked 80% of creator fees (docs/creator-fee-lock.md). Absent until the IDL is regenerated from the upgraded program. */
+  creatorFeesLocked?: BN;
 }
 export interface PositionAcc {
   owner: PublicKey; market: PublicKey; side: number; collateral: BN; sizeUsd: BN; entryPriceQ64: BN; fundingSnapshot: BN; openedSlot: BN; bump: number;

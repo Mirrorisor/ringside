@@ -272,6 +272,20 @@ async fn sold_out_curve_graduates_into_a_raydium_pool_with_lp_burned() {
     let left_in_curve = ctx.banks_client.get_balance(curve).await.unwrap();
     let rent_min = ctx.banks_client.get_rent().await.unwrap().minimum_balance(8 + <launch::Curve as anchor_lang::Space>::INIT_SPACE);
     assert!(left_in_curve >= rent_min, "curve keeps its rent");
+    // Migration takes only the graduation fee, the pool reserve and the pool SOL: both creator-fee
+    // buckets stay in the curve, which holds exactly rent + owed + locked.
+    assert!(c.creator_fees_owed > 0 && c.creator_fees_locked > 0);
+    assert_eq!(left_in_curve, rent_min + c.creator_fees_owed + c.creator_fees_locked, "fee buckets survive migration");
+    // The graduated curve lets the creator claim both buckets.
+    let creator_before = ctx.banks_client.get_balance(creator.pubkey()).await.unwrap();
+    send(&mut ctx, &[Instruction {
+        program_id: launch::ID,
+        accounts: launch::accounts::ClaimCreatorFees { creator: creator.pubkey(), curve }.to_account_metas(None),
+        data: launch::instruction::ClaimCreatorFees {}.data(),
+    }], &[&creator]).await;
+    let creator_after = ctx.banks_client.get_balance(creator.pubkey()).await.unwrap();
+    assert_eq!(creator_after - creator_before, c.creator_fees_owed + c.creator_fees_locked, "claim after migration pays early + locked");
+    assert_eq!(ctx.banks_client.get_balance(curve).await.unwrap(), rent_min);
     println!("raised {raised}, pool got {pool_sol} lamports + {} tokens, {} burned; Raydium cost {raydium_cost}",
         pool_tokens / 1_000_000, (launch::MIGRATION_SUPPLY - pool_tokens) / 1_000_000);
 

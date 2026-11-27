@@ -1,54 +1,147 @@
-# Creator fee lock (DRAFT, needs founder approval before audit)
+# Creator fee model: 20% now, 80% at graduation, forfeited after 30 days (DRAFT, needs founder approval before audit)
 
-## Change
-`claim_creator_fees` (launch program) now requires `curve.complete` OR
-`now >= curve.created_ts + CREATOR_FEE_LOCK_SECONDS`. Otherwise it fails with the new
-error `CreatorFeesLocked`. `CREATOR_FEE_LOCK_SECONDS = 7 * 24 * 3600` is a plain constant.
-No curve fees accrue after graduation: `buy` and `sell` refuse a complete curve.
+This replaces the 7-day lock (commit 71e8a7a on main, adb222a on the perps branch) in BOTH programs.
+`CREATOR_FEE_LOCK_SECONDS` and the time-based unlock are gone.
 
-## Rationale
-Creator fees accrue on every curve trade. Until now a creator could claim them at
-any time, including on launch day while dumping. The lock removes that early payout.
-Nothing is forfeited: the fees stay in `creator_fees_owed` and become claimable on
-graduation or after 7 days, whichever comes first. This mirrors the existing
-7-day dev-token lock (`DEV_LOCK_SECONDS`).
+## Rules
+For every creator fee, as it accrues:
 
-A constant, not a `Global` param: `Global` has no spare space, so a param would change its layout.
+    early  = fee * CREATOR_FEE_EARLY_BPS / BPS      (floor)
+    locked = fee - early                            (so early + locked == fee exactly)
 
-## Account layout impact: none
-`Curve` already stores `created_ts` (set from `Clock` in `create_token`), so the
-lock reuses it. No field added, none reordered, no realloc, no migration. No new
-event: `claim_creator_fees` emits none, and the unlock time is derivable as
-`created_ts + 7d` (the client can show "claimable from <date>" without a program change).
+| Bucket | Launch (`Curve`, SOL) | Perps (`Market`, USDC) | Claimable |
+|---|---|---|---|
+| early (20%, rounded down) | `creator_fees_owed` | `creator_fees` | at any time |
+| locked (80%, gets the rounding remainder) | `creator_fees_locked` (new, last field) | `creator_fees_locked` (new, last field) | only once `curve.complete` (graduation) |
 
-## Upgrade path for deployed devnet curves
-Upgrade the program in place (`scripts/upgrade.sh`). Existing curves carry a valid
-`created_ts`, so the rule applies to them immediately: curves older than 7 days or
-already complete are unaffected; younger ones lock until `created_ts + 7d`. No
-per-account action is needed. Note that `treasury.ts` already uses `trySend`
-for the launch claim, so a locked claim logs a failure rather than aborting.
+- Claim (`claim_creator_fees`, both programs) pays the early bucket always, plus the locked bucket if
+  `curve.complete`. The total must be > 0, else `ZeroAmount`. Perps lowers `vault.reserved` by the amount paid.
+- Forfeit (`forfeit_creator_fees`, both programs, permissionless): once
+  `now >= curve.created_ts + CREATOR_FEE_FORFEIT_SECONDS` and `!curve.complete`, anyone can move the
+  locked bucket to the ecosystem and zero it. Before 30 days, or on a graduated curve, it fails with
+  `NotForfeitable`. With nothing locked it fails with `ZeroAmount` (so a second call does nothing). The early
+  bucket is never forfeited. Fees keep accruing after a forfeit and lock again.
+  - Launch: `curve.creator_fees_locked` lamports go from the curve PDA to `global.fee_recipient`.
+  - Perps: `market.creator_fees_locked` is added to `vault.protocol_fees`. No USDC moves.
+- Event `CreatorFeesForfeited { mint, amount }` in each program.
+- No fee accrues after graduation: `buy`/`sell` refuse a complete curve. A curve that never graduates
+  and is never forfeited simply keeps its locked fees in the account.
+
+## Constants (`ringside_launch`, reused by perps)
+- `CREATOR_FEE_EARLY_BPS: u64 = 2_000`
+- `CREATOR_FEE_FORFEIT_SECONDS: i64 = 30 * 24 * 3600`
+- `split_creator_fee(fee) -> (early, locked)` is the single implementation, used by launch `buy`/`sell`
+  (through `Curve::add_creator_fee`) and perps `distribute_fee`.
+
+## Where fees accrue (all places)
+- Launch `apply_buy` (used by `buy` and by the dev buy inside `create_token`) and `sell`: both call
+  `Curve::add_creator_fee`.
+- Perps `distribute_fee` (every open, close, liquidation and ADL fee goes through it): the 10% creator share
+  is split with `split_creator_fee`.
+
+## Accounting
+- Launch: curve lamports = rent + `real_sol` + `creator_fees_owed` + `creator_fees_locked`. Buy sends
+  `net_in + creator_fee` into the curve; sell pays out `gross - creator_fee` while `real_sol` drops by `gross`, so
+  the creator fee stays behind; claim and forfeit subtract exactly what they zero. `migrate` takes only the
+  graduation fee, the pool reserve and the pool SOL out of `real_sol`, so both buckets survive migration
+  (asserted in `tests-graduation`: after migrate the curve holds rent + owed + locked, and the creator's claim
+  pays both).
+- Perps: `vault.reserved` already includes the whole creator share, so splitting it changes nothing there.
+  Claim lowers `reserved` by what it pays. Forfeit moves an amount between two buckets that are both inside
+  `reserved` (`creator_fees_locked` to `protocol_fees`), so `reserved` is unchanged and no token moves.
+  `compound_protocol_fees` then lowers `protocol_fees` and `reserved` together and mints treasury LP shares,
+  exactly as for any protocol fee. Tests check `reserved == protocol_fees + creator_fees +
+  creator_fees_locked + insurance` after each step.
+
+## Errors (codes are 6000 + index; no existing code moved)
+| Program | Error | Code | Status |
+|---|---|---|---|
+| launch | `CreatorFeesLocked` | 6014 | unused now; kept in place. Message changed to say so |
+| launch | `NotForfeitable` | 6015 | new, appended: forfeit before 30 days, or on a graduated curve |
+| perps | `CreatorFeesLocked` | 6025 | unused now; kept in place |
+| perps | `NotForfeitable` | 6026 | new, appended |
+
+`resize_*` reuses Anchor's own errors: `AccountOwnedByWrongProgram` (3007), `AccountDiscriminatorMismatch`
+(3002), `ConstraintSeeds` (2006).
+
+## Instructions
+- launch `claim_creator_fees`: accounts unchanged (`creator` signer+mut, `curve` mut, `has_one = creator`).
+- launch `forfeit_creator_fees`: `global`, `curve` (mut, PDA seeds), `fee_recipient` (mut, `address = global.fee_recipient`).
+  No signer.
+- launch `resize_curve`: `payer` (signer, mut), `curve` (unchecked, mut), `system_program`.
+- perps `claim_creator_fees`: accounts unchanged from the branch (`curve` is the last, read-only account,
+  constrained to `market.curve` and the launch PDA seeds).
+- perps `forfeit_creator_fees`: `vault` (mut), `market` (mut, `has_one = curve`), `curve` (PDA seeds of the launch
+  program, address = `market.curve`). No signer.
+- perps `resize_market`: `payer` (signer, mut), `market` (unchecked, mut), `system_program`.
+
+## Layout change and migration
+`Curve` and `Market` each gain `creator_fees_locked: u64` as the LAST field (after `bump`). Both grow by 8 bytes
+(`Curve` 1211 -> 1219, `Market` 220 -> 228 total bytes).
+- `Market` had no slack: an old market no longer deserializes after the upgrade. `Curve` contains
+  `max_len` strings, so most old curves have slack and still read (the new field reads as 0), but
+  a curve with maximum-length name, symbol and uri does not. Treat every old account as needing resize.
+- Perps also deserializes the launch `Curve` (oracle, create_market, orders), so old curves must be resized
+  for perps to work too.
+- `resize_curve` / `resize_market` are permissionless. They check owner = this program, the account
+  discriminator, and the PDA seeds (derived from the mint stored in the account), then grow the account to
+  `8 + INIT_SPACE` with zero-filled new bytes. The payer funds the rent for the extra 8 bytes only (the
+  rent difference, not the account's whole balance, which also holds real SOL and fees). They are no-ops on an
+  account that is already full size.
+- `client/scripts/resize-accounts.ts` finds every Curve and Market by discriminator with raw
+  `getProgramAccounts`, resizes the short ones, re-counts, and exits 1 if any remain. `scripts/upgrade.sh` runs it
+  right after both programs are upgraded and before the keeper and relayer restart, logging to
+  `$LOG/resize.log` with api keys redacted. It costs about 0.00006 SOL per account. A failure stops the upgrade
+  script before the services restart; re-run it.
+- Order of an upgrade: both programs, then the resize, then the services. Between the upgrade and the resize,
+  instructions that read an unresized account can fail.
+- The two sizes are hard-coded in the script and pinned by Rust unit tests
+  (`curve_account_size_matches_resize_script`, `market_account_size_matches_resize_script`).
+
+## IDL regeneration needed
+`target/idl/*.json` are stale (no `creator_fees_locked`, `forfeit_creator_fees`, `resize_*`,
+`CreatorFeesForfeited`, `NotForfeitable`). They were not hand-edited. Run a full `anchor build` on a machine
+that can fetch the nightly toolchain. Until then, `treasury.ts` (unchanged account lists), `resize-accounts.ts` and
+`fee-lock-devnet.ts` use raw instructions and manual decoding, and the keeper decoders read only a prefix of
+`Market`, which this change does not move. `MarketAcc.creatorFeesLocked` in the client is optional until the IDL
+catches up.
+
+## Where the forfeited value goes (read this before relying on it)
+- Perps: on chain. `protocol_fees` becomes treasury-owned LP shares through the existing
+  `compound_protocol_fees` (permissionless; the keeper runs it hourly).
+- Launch: the forfeited SOL is paid to `global.fee_recipient`. It becomes protocol-owned liquidity ONLY if
+  the treasury sweep (`client/scripts/treasury.ts`) later swaps that SOL to USDC (`SWAP_SOL=1`) and calls
+  `deposit_to_treasury`. That step is off chain and needs a running job and Jupiter; no program does it.
+- Nothing calls `forfeit_creator_fees` automatically yet. It is permissionless, but a keeper or the sweep has to
+  be taught to scan for markets and curves past 30 days. Until then forfeits only happen if someone sends the
+  transaction.
 
 ## Audit notes
-- `complete` is set when the curve sells out, before `migrate`, so claims are
-  allowed between sell-out and migration. Intended ("coin graduates").
-- Perps `claim_creator_fees` (the creator's 10% share of perp trading fees, paid in USDC)
-  now follows the same rule: `curve.complete` OR `now >= curve.created_ts +
-  ringside_launch::CREATOR_FEE_LOCK_SECONDS`, else `PerpsError::CreatorFeesLocked`
-  (appended last in the enum: index 25, code 6025, so no existing code shifts). The launch
-  constant is reused, not duplicated. `ClaimCreator` gains a read-only `curve` account as
-  its LAST field, constrained to `address = market.curve` plus the launch PDA seeds, so
-  raw-instruction callers only append one key (`client/scripts/treasury.ts` does). A
-  different token's curve is rejected by the address constraint. No stored account
-  changes (Market, Vault unchanged). Locked fees stay in `market.creator_fees` and are
-  claimable later. `target/idl/ringside_perps.json` must be regenerated with a full
-  `anchor build` on a machine that can fetch the nightly toolchain (it is not
-  hand-edited). Tests: `perps_creator_fees_locked_then_claimable_after_seven_days`,
-  `perps_creator_fees_claimable_right_after_graduation`,
-  `perps_claim_rejects_another_tokens_curve` in `tests/tests/flow.rs`.
-- Buying out your own curve unlocks fees early; that is the graduation case. Cost from
-  zero at 100 bps total fees: about 88 SOL on mainnet (30 virtual SOL), about 1.5 SOL
-  on devnet, and the tokens can only be sold into the new pool.
-- `target/idl/ringside_launch.json` was already stale relative to lib.rs (it lacks
-  several errors and instructions); regenerate it with `anchor build` (adds error 6014, `CreatorFeesLocked`).
-- Tests: `creator_fees_locked_for_seven_days`, `creator_fees_claimable_right_after_graduation`
-  in `tests/tests/flow.rs`.
+- Rounding: early is floored, so the creator never gets more than 20% and the remainder is locked; a fee of 0..4
+  has early = 0.
+- A creator can graduate their own curve to unlock everything (buying out the curve costs about 88 SOL
+  on mainnet, about 1.5 SOL on devnet at 100 bps total fees), as before.
+- `complete` is set when the curve sells out, before `migrate`: claims of the locked bucket are allowed from
+  sell-out. Forfeit is blocked from that moment too.
+- Forfeit can be front-run by a graduation, and graduation by a forfeit: both are decided by `curve.complete`
+  at execution time.
+- Live curves older than 30 days that never graduated can be forfeited immediately after the upgrade, because
+  the rule uses `created_ts`. For existing devnet curves the 80% bucket starts at 0 (the new field is zeroed)
+  and only fills from new trades, so the forfeit can only take fees accrued after the upgrade. Fees accrued
+  before it stay in `creator_fees_owed`, 100% claimable, exactly as the old rule had them (the 7-day lock is
+  removed, so they are claimable now).
+- Perps `ClaimCreator` and `ForfeitCreator` read the launch curve through the address constraint on
+  `market.curve`, so another token's curve is rejected (`perps_claim_rejects_another_tokens_curve`,
+  `perps_forfeit_rejects_wrong_curve`).
+
+## Tests
+`tests/tests/flow.rs` (replaces the 7-day tests): `creator_fee_split_is_20_80_floor_and_exact`,
+`creator_early_share_claimable_right_after_launch_locked_not_paid`, `creator_claim_after_graduation_pays_everything`,
+`forfeit_after_30_days_moves_exactly_the_locked_amount`, `forfeit_on_graduated_curve_fails`,
+`forfeit_rejects_wrong_fee_recipient_and_wrong_curve`, `resize_curve_grows_old_account_and_is_noop_on_new_one`,
+and the perps equivalents (`perps_creator_fee_split_is_20_80`, `perps_early_share_claimable_right_after_launch_locked_not_paid`,
+`perps_claim_after_graduation_pays_everything`, `perps_forfeit_after_30_days_moves_locked_into_protocol_fees_then_compounds`,
+`perps_forfeit_on_graduated_curve_fails`, `perps_forfeit_rejects_wrong_curve`,
+`resize_market_grows_old_account_and_is_noop_on_new_one`, `perps_claim_rejects_another_tokens_curve`).
+`tests-graduation` checks the fee buckets survive `migrate`. Unit test `creator_fee_split_floors_early_and_sums_exactly`
+in the launch crate.

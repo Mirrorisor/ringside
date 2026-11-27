@@ -25,10 +25,13 @@ pub const INITIAL_VIRTUAL_SOL: u64 = 500_000_000;
 pub const INITIAL_VIRTUAL_TOKENS: u64 = 1_073_000_000 * ONE_TOKEN;
 pub const MAX_DEV_BUY_TOKENS: u64 = 50_000_000 * ONE_TOKEN; // 5% of supply
 pub const DEV_LOCK_SECONDS: i64 = 7 * 24 * 60 * 60;
-/// Creator fees are claimable once the curve completes, or this long after launch,
-/// whichever comes first.
-pub const CREATOR_FEE_LOCK_SECONDS: i64 = 7 * 24 * 3600;
 pub const BPS: u64 = 10_000;
+/// Share of each creator fee the creator can claim at any time (20%, floor).
+/// The rest is `creator_fees_locked`: claimable only once the curve graduates.
+pub const CREATOR_FEE_EARLY_BPS: u64 = 2_000;
+/// If the curve has not graduated this long after launch, anyone may forfeit the
+/// locked creator fees to the ecosystem (`forfeit_creator_fees`).
+pub const CREATOR_FEE_FORFEIT_SECONDS: i64 = 30 * 24 * 3600;
 
 /// Observations kept for TWAP reads. One is written at most every
 /// `OBSERVATION_SPACING` slots, so 32 cover at least 800 slots (~5.3 min).
@@ -201,6 +204,7 @@ pub mod ringside_launch {
         curve.real_sol = 0;
         curve.real_tokens = CURVE_SUPPLY;
         curve.creator_fees_owed = 0;
+        curve.creator_fees_locked = 0;
         curve.complete = false;
         curve.migrated = false;
         curve.created_slot = clock.slot;
@@ -337,7 +341,7 @@ pub mod ringside_launch {
         curve.virtual_tokens = curve.virtual_tokens.checked_add(tokens_in).ok_or(LaunchError::MathOverflow)?;
         curve.real_sol -= gross;
         curve.real_tokens = curve.real_tokens.checked_add(tokens_in).ok_or(LaunchError::MathOverflow)?;
-        curve.creator_fees_owed += creator_fee;
+        curve.add_creator_fee(creator_fee)?;
         curve.last_price_q64 = curve.spot_price_q64();
         curve.record_observation(clock.slot);
 
@@ -360,19 +364,75 @@ pub mod ringside_launch {
         Ok(())
     }
 
+    /// Pays the creator `creator_fees_owed` (the early 20%) at any time, plus
+    /// `creator_fees_locked` once the curve has graduated.
     pub fn claim_creator_fees(ctx: Context<ClaimCreatorFees>) -> Result<()> {
         let curve = &mut ctx.accounts.curve;
-        let now = Clock::get()?.unix_timestamp;
-        let unlock_ts = curve
-            .created_ts
-            .checked_add(CREATOR_FEE_LOCK_SECONDS)
-            .ok_or(LaunchError::MathOverflow)?;
-        require!(curve.complete || now >= unlock_ts, LaunchError::CreatorFeesLocked);
-        let amount = curve.creator_fees_owed;
-        require!(amount > 0, LaunchError::ZeroAmount);
+        let mut amount = curve.creator_fees_owed;
         curve.creator_fees_owed = 0;
+        if curve.complete {
+            amount = amount.checked_add(curve.creator_fees_locked).ok_or(LaunchError::MathOverflow)?;
+            curve.creator_fees_locked = 0;
+        }
+        require!(amount > 0, LaunchError::ZeroAmount);
         curve.to_account_info().sub_lamports(amount)?;
         ctx.accounts.creator.to_account_info().add_lamports(amount)?;
+        Ok(())
+    }
+
+    /// Permissionless. Once the curve is `CREATOR_FEE_FORFEIT_SECONDS` old and
+    /// has not graduated, moves the locked creator fees to the protocol's
+    /// `fee_recipient` and zeroes them. The early share stays claimable.
+    pub fn forfeit_creator_fees(ctx: Context<ForfeitCreatorFees>) -> Result<()> {
+        let curve = &mut ctx.accounts.curve;
+        let now = Clock::get()?.unix_timestamp;
+        let forfeit_ts = curve
+            .created_ts
+            .checked_add(CREATOR_FEE_FORFEIT_SECONDS)
+            .ok_or(LaunchError::MathOverflow)?;
+        require!(!curve.complete && now >= forfeit_ts, LaunchError::NotForfeitable);
+        let amount = curve.creator_fees_locked;
+        require!(amount > 0, LaunchError::ZeroAmount);
+        curve.creator_fees_locked = 0;
+        curve.to_account_info().sub_lamports(amount)?;
+        ctx.accounts.fee_recipient.to_account_info().add_lamports(amount)?;
+        emit!(CreatorFeesForfeited { mint: curve.mint, amount });
+        Ok(())
+    }
+
+    /// Permissionless migration helper: grows a `Curve` created before
+    /// `creator_fees_locked` existed to the current size (the payer funds the
+    /// extra rent; new bytes are zero, so the new field reads 0). No-op if the
+    /// account is already large enough.
+    pub fn resize_curve(ctx: Context<ResizeCurve>) -> Result<()> {
+        let info = ctx.accounts.curve.to_account_info();
+        require_keys_eq!(*info.owner, crate::ID, anchor_lang::error::ErrorCode::AccountOwnedByWrongProgram);
+        let mint = {
+            let data = info.try_borrow_data()?;
+            require!(data.len() >= 8 + 32, anchor_lang::error::ErrorCode::AccountDiscriminatorNotFound);
+            require!(data[..8] == *Curve::DISCRIMINATOR, anchor_lang::error::ErrorCode::AccountDiscriminatorMismatch);
+            Pubkey::new_from_array(data[8..40].try_into().unwrap())
+        };
+        let (expected, _) = Pubkey::find_program_address(&[SEED_CURVE, mint.as_ref()], &crate::ID);
+        require_keys_eq!(expected, info.key(), anchor_lang::error::ErrorCode::ConstraintSeeds);
+        let new_len = 8 + Curve::INIT_SPACE;
+        if info.data_len() >= new_len {
+            return Ok(());
+        }
+        // Rent for the extra bytes only: the account also holds real SOL / fee balances,
+        // so comparing the new minimum with its total lamports would charge nothing.
+        let rent = Rent::get()?;
+        let needed = rent.minimum_balance(new_len).saturating_sub(rent.minimum_balance(info.data_len()));
+        if needed > 0 {
+            system_program::transfer(
+                CpiContext::new(
+                    ctx.accounts.system_program.to_account_info(),
+                    system_program::Transfer { from: ctx.accounts.payer.to_account_info(), to: info.clone() },
+                ),
+                needed,
+            )?;
+        }
+        info.resize(new_len)?;
         Ok(())
     }
 
@@ -569,9 +629,28 @@ pub struct Curve {
     pub obs_index: u8,
     pub obs_count: u8,
     pub bump: u8,
+    /// The 80% of creator fees held until graduation. APPENDED after `bump`:
+    /// curves created before this field existed need `resize_curve`.
+    pub creator_fees_locked: u64,
+}
+
+/// Splits a creator fee into (early, locked). `early` is floored, so rounding
+/// goes to the locked side and early + locked == fee exactly.
+pub fn split_creator_fee(fee: u64) -> (u64, u64) {
+    let early = ((fee as u128) * (CREATOR_FEE_EARLY_BPS as u128) / (BPS as u128)) as u64;
+    (early, fee - early)
 }
 
 impl Curve {
+    /// Books a creator fee that stays in the curve's lamports: the early share
+    /// to `creator_fees_owed`, the rest to `creator_fees_locked`.
+    pub fn add_creator_fee(&mut self, fee: u64) -> Result<()> {
+        let (early, locked) = split_creator_fee(fee);
+        self.creator_fees_owed = self.creator_fees_owed.checked_add(early).ok_or(LaunchError::MathOverflow)?;
+        self.creator_fees_locked = self.creator_fees_locked.checked_add(locked).ok_or(LaunchError::MathOverflow)?;
+        Ok(())
+    }
+
     /// Spot price in lamports per base unit, Q64.64.
     pub fn spot_price_q64(&self) -> u128 {
         ((self.virtual_sol as u128) << 64) / (self.virtual_tokens as u128)
@@ -618,7 +697,7 @@ impl Curve {
         self.virtual_tokens = self.virtual_tokens.checked_sub(tokens_out).ok_or(LaunchError::MathOverflow)?;
         self.real_sol = self.real_sol.checked_add(net_in).ok_or(LaunchError::MathOverflow)?;
         self.real_tokens = self.real_tokens.checked_sub(tokens_out).ok_or(LaunchError::MathOverflow)?;
-        self.creator_fees_owed += creator_fee;
+        self.add_creator_fee(creator_fee)?;
         self.last_price_q64 = self.spot_price_q64();
         self.record_observation(slot);
         Ok(())
@@ -781,6 +860,28 @@ pub struct ClaimCreatorFees<'info> {
     pub creator: Signer<'info>,
     #[account(mut, seeds = [SEED_CURVE, curve.mint.as_ref()], bump = curve.bump, has_one = creator)]
     pub curve: Account<'info, Curve>,
+}
+
+#[derive(Accounts)]
+pub struct ForfeitCreatorFees<'info> {
+    #[account(seeds = [SEED_GLOBAL], bump = global.bump)]
+    pub global: Box<Account<'info, Global>>,
+    #[account(mut, seeds = [SEED_CURVE, curve.mint.as_ref()], bump = curve.bump)]
+    pub curve: Box<Account<'info, Curve>>,
+    /// CHECK: checked against global.
+    #[account(mut, address = global.fee_recipient)]
+    pub fee_recipient: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct ResizeCurve<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    /// CHECK: owner, discriminator and PDA seeds are verified in the handler,
+    /// because an account too small for `Curve` cannot be deserialized.
+    #[account(mut)]
+    pub curve: UncheckedAccount<'info>,
+    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
@@ -1152,6 +1253,12 @@ pub struct TradeEvent {
 }
 
 #[event]
+pub struct CreatorFeesForfeited {
+    pub mint: Pubkey,
+    pub amount: u64,
+}
+
+#[event]
 pub struct CurveCompleted {
     pub mint: Pubkey,
     pub real_sol: u64,
@@ -1197,8 +1304,10 @@ pub enum LaunchError {
     NotEnoughToMigrate,
     #[msg("Pool creation did not produce LP tokens")]
     MigrationFailed,
-    #[msg("Creator fees are locked until the curve completes or 7 days after launch")]
+    #[msg("Deprecated, unused: the 7-day creator fee lock was replaced by the 20/80 split")]
     CreatorFeesLocked,
+    #[msg("Creator fees can be forfeited only 30 days after launch, if the curve has not graduated")]
+    NotForfeitable,
 }
 
 #[cfg(test)]
@@ -1256,7 +1365,19 @@ mod tests {
             obs_index: 0,
             obs_count: 1,
             bump: 255,
+            creator_fees_locked: 0,
         }
+    }
+
+    #[test]
+    fn creator_fee_split_floors_early_and_sums_exactly() {
+        for fee in [0u64, 1, 4, 5, 6, 9, 10, 1_234_567, u64::MAX] {
+            let (early, locked) = split_creator_fee(fee);
+            assert_eq!(early as u128, fee as u128 * 2_000 / 10_000);
+            assert_eq!(early + locked, fee);
+        }
+        assert_eq!(split_creator_fee(5), (1, 4));
+        assert_eq!(split_creator_fee(4), (0, 4));
     }
 
     #[test]
@@ -1296,4 +1417,11 @@ mod tests {
         assert!(spot > p0 * 2);
         assert!(twap < p0 + (spot - p0) / 10, "TWAP should barely move 10 slots after the pump");
     }
+    /// `client/scripts/resize-accounts.ts` hard-codes this size to find accounts that
+    /// predate `creator_fees_locked`. Update both together.
+    #[test]
+    fn curve_account_size_matches_resize_script() {
+        assert_eq!(8 + Curve::INIT_SPACE, 1219);
+    }
+
 }

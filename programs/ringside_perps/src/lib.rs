@@ -293,6 +293,7 @@ pub mod ringside_perps {
         m.trader_net_pnl = 0;
         m.insurance = 0;
         m.creator_fees = 0;
+        m.creator_fees_locked = 0;
         m.reduce_only = false;
         m.adl_mode = false;
         m.bump = ctx.bumps.market;
@@ -657,18 +658,72 @@ pub mod ringside_perps {
         Ok(())
     }
 
+    /// Pays the creator `creator_fees` (the early 20%) at any time, plus
+    /// `creator_fees_locked` once the market's curve has graduated.
     pub fn claim_creator_fees(ctx: Context<ClaimCreator>) -> Result<()> {
-        // Same rule as the launch program's claim: locked until the curve completes
-        // or CREATOR_FEE_LOCK_SECONDS after launch.
-        let now = Clock::get()?.unix_timestamp;
-        let curve = &ctx.accounts.curve;
-        let unlock = curve.created_ts.checked_add(ringside_launch::CREATOR_FEE_LOCK_SECONDS).ok_or(ProgramError::ArithmeticOverflow)?;
-        require!(curve.complete || now >= unlock, PerpsError::CreatorFeesLocked);
-        let amount = ctx.accounts.market.creator_fees;
+        let m = &mut ctx.accounts.market;
+        let mut amount = m.creator_fees;
+        m.creator_fees = 0;
+        if ctx.accounts.curve.complete {
+            amount = amount.checked_add(m.creator_fees_locked).ok_or(ProgramError::ArithmeticOverflow)?;
+            m.creator_fees_locked = 0;
+        }
         require!(amount > 0, PerpsError::ZeroAmount);
-        ctx.accounts.market.creator_fees = 0;
         ctx.accounts.vault.reserved -= amount;
         pay_from_vault(&ctx.accounts.vault, &ctx.accounts.vault_usdc, &ctx.accounts.creator_usdc, &ctx.accounts.token_program, amount)
+    }
+
+    /// Permissionless. Once the market's curve is `CREATOR_FEE_FORFEIT_SECONDS`
+    /// old and has not graduated, moves the market's locked creator fees into
+    /// `vault.protocol_fees` (compoundable into treasury LP shares). No USDC
+    /// moves and `vault.reserved` is unchanged: both buckets are part of it.
+    pub fn forfeit_creator_fees(ctx: Context<ForfeitCreator>) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let curve = &ctx.accounts.curve;
+        let forfeit_ts = curve.created_ts.checked_add(ringside_launch::CREATOR_FEE_FORFEIT_SECONDS).ok_or(ProgramError::ArithmeticOverflow)?;
+        require!(!curve.complete && now >= forfeit_ts, PerpsError::NotForfeitable);
+        let m = &mut ctx.accounts.market;
+        let amount = m.creator_fees_locked;
+        require!(amount > 0, PerpsError::ZeroAmount);
+        m.creator_fees_locked = 0;
+        ctx.accounts.vault.protocol_fees += amount;
+        emit!(CreatorFeesForfeited { mint: m.mint, amount });
+        Ok(())
+    }
+
+    /// Permissionless migration helper: grows a `Market` created before
+    /// `creator_fees_locked` existed to the current size (the payer funds the
+    /// extra rent; new bytes are zero). No-op if already large enough.
+    pub fn resize_market(ctx: Context<ResizeMarket>) -> Result<()> {
+        let info = ctx.accounts.market.to_account_info();
+        require_keys_eq!(*info.owner, crate::ID, anchor_lang::error::ErrorCode::AccountOwnedByWrongProgram);
+        let mint = {
+            let data = info.try_borrow_data()?;
+            require!(data.len() >= 8 + 32, anchor_lang::error::ErrorCode::AccountDiscriminatorNotFound);
+            require!(data[..8] == *Market::DISCRIMINATOR, anchor_lang::error::ErrorCode::AccountDiscriminatorMismatch);
+            Pubkey::new_from_array(data[8..40].try_into().unwrap())
+        };
+        let (expected, _) = Pubkey::find_program_address(&[SEED_MARKET, mint.as_ref()], &crate::ID);
+        require_keys_eq!(expected, info.key(), anchor_lang::error::ErrorCode::ConstraintSeeds);
+        let new_len = 8 + Market::INIT_SPACE;
+        if info.data_len() >= new_len {
+            return Ok(());
+        }
+        // Rent for the extra bytes only: the account also holds real SOL / fee balances,
+        // so comparing the new minimum with its total lamports would charge nothing.
+        let rent = Rent::get()?;
+        let needed = rent.minimum_balance(new_len).saturating_sub(rent.minimum_balance(info.data_len()));
+        if needed > 0 {
+            anchor_lang::system_program::transfer(
+                CpiContext::new(
+                    ctx.accounts.system_program.to_account_info(),
+                    anchor_lang::system_program::Transfer { from: ctx.accounts.payer.to_account_info(), to: info.clone() },
+                ),
+                needed,
+            )?;
+        }
+        info.resize(new_len)?;
+        Ok(())
     }
 }
 
@@ -879,8 +934,13 @@ fn distribute_fee<'info>(
     let keeper = protocol / 2;
     let creator = fee / 10;
     let insurance = fee / 10;
+    // The creator's share is split 20/80: early (claimable now) and locked
+    // (claimable at graduation, forfeited to protocol_fees after 30 days). Both
+    // stay in `reserved`, so the total added to it is unchanged.
+    let (creator_early, creator_locked) = ringside_launch::split_creator_fee(creator);
     v.protocol_fees += protocol - keeper;
-    m.creator_fees += creator;
+    m.creator_fees += creator_early;
+    m.creator_fees_locked += creator_locked;
     m.insurance += insurance;
     v.reserved += protocol - keeper + creator + insurance;
     pay_from_vault(v, vault_usdc, keeper_usdc, token_program, keeper)
@@ -1020,6 +1080,9 @@ pub struct Market {
     pub reduce_only: bool,
     pub adl_mode: bool,
     pub bump: u8,
+    /// Locked 80% of creator fees. APPENDED after `bump`: markets created
+    /// before this field existed need `resize_market`.
+    pub creator_fees_locked: u64,
 }
 
 #[account]
@@ -1414,9 +1477,30 @@ pub struct ClaimCreator<'info> {
     #[account(mut, token::mint = vault.usdc_mint, token::authority = creator)]
     pub creator_usdc: Box<Account<'info, TokenAccount>>,
     pub token_program: Program<'info, Token>,
-    /// The market's launch curve; read for the creator-fee lock. Appended last.
+    /// The market's launch curve; read for graduation. Appended last.
     #[account(address = market.curve, seeds = [ringside_launch::SEED_CURVE, curve.mint.as_ref()], bump = curve.bump, seeds::program = ringside_launch::ID)]
     pub curve: Box<Account<'info, Curve>>,
+}
+
+#[derive(Accounts)]
+pub struct ForfeitCreator<'info> {
+    #[account(mut, seeds = [SEED_VAULT], bump = vault.bump)]
+    pub vault: Box<Account<'info, Vault>>,
+    #[account(mut, has_one = curve)]
+    pub market: Box<Account<'info, Market>>,
+    #[account(seeds = [ringside_launch::SEED_CURVE, curve.mint.as_ref()], bump = curve.bump, seeds::program = ringside_launch::ID)]
+    pub curve: Box<Account<'info, Curve>>,
+}
+
+#[derive(Accounts)]
+pub struct ResizeMarket<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    /// CHECK: owner, discriminator and PDA seeds are verified in the handler,
+    /// because an account too small for `Market` cannot be deserialized.
+    #[account(mut)]
+    pub market: UncheckedAccount<'info>,
+    pub system_program: Program<'info, System>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1494,6 +1578,12 @@ pub struct ProtocolFeesCompounded {
 }
 
 #[event]
+pub struct CreatorFeesForfeited {
+    pub mint: Pubkey,
+    pub amount: u64,
+}
+
+#[event]
 pub struct WithdrawalRequested {
     pub owner: Pubkey,
     pub shares: u64,
@@ -1565,8 +1655,10 @@ pub enum PerpsError {
     MarketLimit,
     #[msg("Market can't be retired: it has open interest, its curve sold out, or it traded in the last 7 days")]
     NotRetirable,
-    #[msg("Creator fees are locked until the curve completes or 7 days after launch")]
+    #[msg("Deprecated, unused: the 7-day creator fee lock was replaced by the 20/80 split")]
     CreatorFeesLocked,
+    #[msg("Creator fees can be forfeited only 30 days after launch, if the curve has not graduated")]
+    NotForfeitable,
 }
 
 #[cfg(test)]
@@ -1595,7 +1687,7 @@ mod tests {
             mint: Pubkey::default(), curve: Pubkey::default(), creator: Pubkey::default(), tier: 0, created_slot: 0,
             oi_long: 0, oi_short: 0, oi_cap_override: 0, funding_index: 0, last_funding_ts: 0,
             band_anchor_q64: entry, band_anchor_slot: 0, trader_net_pnl: 0, insurance: 0, creator_fees: 0,
-            reduce_only: false, adl_mode: false, bump: 0,
+            reduce_only: false, adl_mode: false, bump: 0, creator_fees_locked: 0,
         };
         let (payout, realized) = settle_close(&p, &m, entry / 10, 3_000_000).unwrap();
         assert_eq!(payout, 0);
@@ -1727,7 +1819,7 @@ mod layout_fixture {
         Market {
             mint: k(1), curve: k(2), creator: k(3), tier: 1, created_slot: 9, oi_long: 10, oi_short: 11, oi_cap_override: 12,
             funding_index: -13, last_funding_ts: 14, band_anchor_q64: 15u128 << 64, band_anchor_slot: 16, trader_net_pnl: -17,
-            insurance: 18, creator_fees: 19, reduce_only: true, adl_mode: true, bump: 254,
+            insurance: 18, creator_fees: 19, reduce_only: true, adl_mode: true, bump: 254, creator_fees_locked: 20,
         }.try_serialize(&mut out).unwrap();
         println!("MARKET {}", out.iter().map(|b| format!("{b:02x}")).collect::<String>());
         let mut out = Vec::new();
@@ -1739,4 +1831,11 @@ mod layout_fixture {
             .try_serialize(&mut out).unwrap();
         println!("ORDER {}", out.iter().map(|b| format!("{b:02x}")).collect::<String>());
     }
+    /// `client/scripts/resize-accounts.ts` hard-codes this size to find accounts that
+    /// predate `creator_fees_locked`. Update both together.
+    #[test]
+    fn market_account_size_matches_resize_script() {
+        assert_eq!(8 + Market::INIT_SPACE, 228);
+    }
+
 }

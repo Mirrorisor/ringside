@@ -3,8 +3,9 @@
 #   1. Builds both programs with the devnet feature (0.5 virtual SOL curves).
 #   2. Upgrades both programs in place (same IDs), one at a time, checking SOL
 #      before each and extending the program accounts if they grew.
-#   3. Restarts the keeper (now on Pyth) and relayer.
-#   4. Sets devnet fees/caps, runs the graduation test and the creator-fee lock test.
+#   3. Resizes existing curves and markets for the creator_fees_locked field (resize-accounts.ts).
+#   4. Restarts the keeper (now on Pyth) and relayer.
+#   5. Sets devnet fees/caps, runs the graduation test and the creator-fee test.
 # Safe to re-run: every step picks up where it left off.
 set -euo pipefail
 . "$HOME/.cargo/env" 2>/dev/null || true
@@ -125,6 +126,12 @@ for p in ringside_perps ringside_launch; do
     [ $try = 3 ] && { echo "Upgrade failed after 3 tries. Run this again."; exit 1; }
   done
 done
+# Layout migration: Curve and Market gained creator_fees_locked (8 bytes). Grow the existing
+# accounts before anything that reads them runs (the keeper and relayer restart below).
+# Re-runs are harmless: accounts already at full size are skipped. A failure stops the upgrade here.
+say "Resizing existing curves and markets (creator_fees_locked field)"
+(cd client && ANCHOR_PROVIDER_URL=$RPC ANCHOR_WALLET=$WALLET npx tsx scripts/resize-accounts.ts 2>&1 | sed -u -E 's/api-key=[A-Za-z0-9-]+/api-key=<redacted>/g' | tee "$LOG/resize.log")
+
 GRAD_TEST=1
 if [ "$(bal)" -lt 2100000000 ]; then
   echo "  $(sol "$(bal)") SOL left: skipping the graduation test this time (it needs 2.1 SOL to buy out a curve)"
@@ -139,7 +146,7 @@ if [ $GRAD_TEST = 1 ]; then
   say "Graduation and Pyth test"
   ANCHOR_PROVIDER_URL=$RPC ANCHOR_WALLET=$WALLET npx tsx scripts/graduation-devnet.ts 2>&1 | sed -u -E 's/api-key=[A-Za-z0-9-]+/api-key=<redacted>/g' | tee "$LOG/graduation-test.log"
 fi
-say "Creator-fee lock test (a claim before 7 days must fail)"
+say "Creator-fee test (20% claimable, 80% locked until graduation, early forfeit refused)"
 ANCHOR_PROVIDER_URL=$RPC ANCHOR_WALLET=$WALLET npx tsx scripts/fee-lock-devnet.ts 2>&1 | sed -u -E 's/api-key=[A-Za-z0-9-]+/api-key=<redacted>/g' | tee "$LOG/fee-lock-test.log"
 say "Treasury sweep (protocol fees into treasury-owned vault liquidity)"
 TREASURY_KEEP_USDC=${TREASURY_KEEP_USDC:-1000} ANCHOR_PROVIDER_URL=$RPC ANCHOR_WALLET=$WALLET npx tsx scripts/treasury.ts sweep 2>&1 | sed -u -E 's/api-key=[A-Za-z0-9-]+/api-key=<redacted>/g' | tee "$LOG/treasury.log"
