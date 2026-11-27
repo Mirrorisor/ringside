@@ -26,7 +26,7 @@ import { createHash } from "node:crypto";
 
 export const SOL_USD_FEED_ID = "0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d";
 export const SPONSORED_SOL_USD = new PublicKey("7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE");
-/** Must stay under the program's 60 s limit, with room for the transaction to land. */
+/** Must stay under the program's limit (SOL_PRICE_MAX_AGE, 120 s), with room for the transaction to land. */
 const FRESH_ENOUGH_S = 30;
 
 /**

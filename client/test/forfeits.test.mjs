@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import {
   FORFEIT_EVENT_DISC, PROCESSED_CAP, applyScan, base58, decodeForfeitEvent, emptyState, parseForfeitEvents, parseState,
   pendingLamports, planConversion, recordDeposit, recordSwap, summaryLine,
+  NO_START_MESSAGE, limitToSlot, parseStart, seedState,
 } from "../dist/forfeits.js";
 
 const LAUNCH = "AfZWCTaDQEC9CVTwXkH7pFtDXs4RtLWCK5godexWQDVH";
@@ -118,4 +119,52 @@ test("state file validation and the log line", () => {
   assert.throws(() => parseState({ ...emptyState(), totalConverted: "5" }), /exceeds/);
   const st = parseState(JSON.parse(JSON.stringify(recordSwap(applyScan(emptyState(), [tx("s", okLogs(1, 3n * SOL))], LAUNCH).state, SOL, 1n))));
   assert.equal(summaryLine(st, 140_000_000n, "5xTx"), "forfeited SOL: 3 total, 1 converted, 2 pending → deposited 140 USDC as treasury-owned liquidity (tx 5xTx)");
+});
+
+const SIG = "5".repeat(88);
+const SIG2 = "4".repeat(87);
+
+test("first run with no state file and no start refuses with a clear message", () => {
+  assert.throws(() => seedState(emptyState(), false, parseStart({})), (e) => e.message === NO_START_MESSAGE && /FORFEIT_START_SIGNATURE/.test(e.message) && /FORFEIT_START_SLOT/.test(e.message));
+  assert.throws(() => seedState(emptyState(), false, parseStart({ FORFEIT_START_SIGNATURE: "  ", FORFEIT_START_SLOT: "" })), /refusing/);
+});
+
+test("a start signature seeds the cursor; a start slot seeds the slot floor", () => {
+  const a = seedState(emptyState(), false, parseStart({ FORFEIT_START_SIGNATURE: SIG }));
+  assert.equal(a.seeded, true);
+  assert.equal(a.state.cursor, SIG);
+  const b = seedState(emptyState(), false, parseStart({ FORFEIT_START_SLOT: "400000000" }));
+  assert.equal(b.state.cursor, null);
+  assert.equal(b.state.startSlot, 400_000_000);
+  // the seeded cursor survives a scan that finds nothing, so the next run does not go back to the beginning
+  assert.equal(applyScan(a.state, [], LAUNCH).state.cursor, SIG);
+  assert.equal(applyScan(b.state, [], LAUNCH).state.startSlot, 400_000_000);
+  assert.equal(parseState(JSON.parse(JSON.stringify(b.state))).startSlot, 400_000_000);
+});
+
+test("an existing state file wins: the start is ignored and the cursor is never overwritten", () => {
+  const saved = { ...emptyState(), cursor: SIG2, totalForfeited: "7", processed: ["x"] };
+  const r = seedState(saved, true, parseStart({ FORFEIT_START_SIGNATURE: SIG, FORFEIT_START_SLOT: undefined }));
+  assert.equal(r.seeded, false);
+  assert.deepEqual(r.state, saved);
+  // and an existing file needs no start at all
+  assert.equal(seedState(saved, true, parseStart({})).state.cursor, SIG2);
+});
+
+test("start values are validated", () => {
+  assert.throws(() => parseStart({ FORFEIT_START_SIGNATURE: "not-a-signature" }), /base58/);
+  assert.throws(() => parseStart({ FORFEIT_START_SIGNATURE: "0".repeat(88) }), /base58/);
+  for (const bad of ["0", "-5", "1.5", "abc", "12e3"]) assert.throws(() => parseStart({ FORFEIT_START_SLOT: bad }), /slot/, bad);
+  assert.throws(() => parseStart({ FORFEIT_START_SIGNATURE: SIG, FORFEIT_START_SLOT: "5" }), /only one/);
+  assert.deepEqual(parseStart({ FORFEIT_START_SLOT: " 42 " }), { signature: null, slot: 42 });
+  assert.throws(() => parseState({ ...emptyState(), startSlot: -1 }), /startSlot/);
+});
+
+test("slot floor trims a page newest-first and says when to stop paging", () => {
+  const page = [{ signature: "a", slot: 120 }, { signature: "b", slot: 100 }, { signature: "c", slot: 99 }, { signature: "d", slot: 50 }];
+  const r = limitToSlot(page, 100);
+  assert.deepEqual(r.kept.map((p) => p.signature), ["a", "b"]);
+  assert.equal(r.done, true);
+  assert.deepEqual(limitToSlot(page.slice(0, 2), 100), { kept: page.slice(0, 2), done: false });
+  assert.deepEqual(limitToSlot(page, null), { kept: page, done: false });
 });

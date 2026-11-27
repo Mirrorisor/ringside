@@ -1839,3 +1839,61 @@ async fn initialize_vault_only_by_the_upgrade_authority() {
     assert_eq!(v.authority, authority.pubkey());
     assert_eq!(v.usdc_mint, usdc);
 }
+
+fn set_fees_ix(authority: Pubkey, global: Pubkey, launch_fee: u64, graduation_fee: u64) -> Instruction {
+    Instruction {
+        program_id: launch::ID,
+        accounts: launch::accounts::AdminOnly { authority, global }.to_account_metas(None),
+        data: launch::instruction::SetFees { launch_fee_lamports: launch_fee, graduation_fee_lamports: graduation_fee }.data(),
+    }
+}
+
+#[tokio::test]
+async fn set_fees_above_the_caps_fails_and_at_the_caps_succeeds() {
+    let mut l = launch_only().await;
+    let (global, authority) = (l.global, l.env.authority.insecure_clone());
+    let max_grad = launch::max_graduation_fee(launch::graduation_raised_lamports());
+    let max_launch = launch::MAX_LAUNCH_FEE_LAMPORTS;
+    // Mainnet build: 2 SOL, far below 10% of the ~87.9 SOL a curve raises.
+    assert_eq!(max_grad, 2 * SOL);
+
+    for (lf, gf, err) in [
+        (max_launch, max_grad + 1, launch::LaunchError::GraduationFeeAboveCap),
+        (max_launch + 1, max_grad, launch::LaunchError::LaunchFeeAboveCap),
+        (0, 80 * SOL, launch::LaunchError::GraduationFeeAboveCap), // "real_sol - 0.2 SOL": would drain the raise
+        (0, u64::MAX, launch::LaunchError::GraduationFeeAboveCap),
+    ] {
+        let e = l.env.send(&[set_fees_ix(authority.pubkey(), global, lf, gf)], &[&authority]).await.unwrap_err();
+        assert_eq!(custom_error(e), err as u32 + 6000);
+    }
+    let g: launch::Global = l.env.get(global).await;
+    assert_eq!((g.launch_fee_lamports, g.graduation_fee_lamports), (SOL / 50, 3 * SOL / 2), "failed calls change nothing");
+
+    l.env.send(&[set_fees_ix(authority.pubkey(), global, max_launch, max_grad)], &[&authority]).await.unwrap();
+    let g: launch::Global = l.env.get(global).await;
+    assert_eq!((g.launch_fee_lamports, g.graduation_fee_lamports), (max_launch, max_grad));
+    l.env.send(&[set_fees_ix(authority.pubkey(), global, 0, 0)], &[&authority]).await.unwrap();
+
+    // Only the admin can call it at all.
+    let stranger = Keypair::new();
+    l.env.fund(stranger.pubkey(), SOL).await;
+    assert!(l.env.send(&[set_fees_ix(stranger.pubkey(), global, 0, 0)], &[&stranger]).await.is_err());
+}
+
+#[tokio::test]
+async fn initialize_global_refuses_fees_above_the_caps() {
+    let mut env = setup().await;
+    let authority = env.authority.insecure_clone();
+    let program_data = program_data_of(launch::ID);
+    let mut bad = global_params(&env);
+    bad.graduation_fee_lamports = launch::max_graduation_fee(launch::graduation_raised_lamports()) + 1;
+    let (global, _) = Pubkey::find_program_address(&[launch::SEED_GLOBAL], &launch::ID);
+    let ix = Instruction {
+        program_id: launch::ID,
+        accounts: launch::accounts::InitializeGlobal { authority: authority.pubkey(), global, program_data, system_program: system_program::ID }.to_account_metas(None),
+        data: launch::instruction::InitializeGlobal { params: bad }.data(),
+    };
+    let e = env.send(&[ix], &[&authority]).await.unwrap_err();
+    assert_eq!(custom_error(e), launch::LaunchError::GraduationFeeAboveCap as u32 + 6000);
+    env.send(&[init_global_ix(&env, authority.pubkey(), program_data)], &[&authority]).await.unwrap();
+}

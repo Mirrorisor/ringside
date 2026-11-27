@@ -1,4 +1,4 @@
-# Creator fee model: 20% now, 80% at graduation, forfeited after 30 days (DRAFT, needs founder approval before audit)
+# Creator fee model: 20% now, 80% at graduation, forfeited after 30 days (APPROVED by the founder on 2026-11-27)
 
 This replaces the 7-day lock (commit 71e8a7a on main, adb222a on the perps branch) in BOTH programs.
 `CREATOR_FEE_LOCK_SECONDS` and the time-based unlock are gone.

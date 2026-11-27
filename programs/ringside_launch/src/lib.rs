@@ -54,7 +54,74 @@ pub fn launch_pool_address(mint: &Pubkey) -> Pubkey {
 }
 /// Lamports kept back from the raised SOL to pay Raydium's create-pool fee
 /// (0.15 SOL) and the rent for the pool's accounts.
+///
+/// This DEPENDS ON RAYDIUM: the fee is `create_pool_fee` in Raydium's AmmConfig and
+/// Raydium can change it. `migrate` reads it and fails with `PoolReserveTooSmall`
+/// (before moving anything) if `fee + RAYDIUM_RENT_ALLOWANCE` no longer fits in this
+/// reserve. If Raydium raises the fee, raise this constant and upgrade the program
+/// (README, Graduation); curves that already sold out can then be migrated.
 pub const POOL_CREATION_RESERVE: u64 = 200_000_000;
+/// Rent for the pool, observation, LP mint, vault and LP token accounts that Raydium
+/// creates at the pool creator's expense (about 0.044 SOL), with a small margin.
+pub const RAYDIUM_RENT_ALLOWANCE: u64 = 50_000_000;
+/// Byte offset of `create_pool_fee` in Raydium's AmmConfig account:
+/// discriminator 8, bump 1, disable_create_pool 1, index 2, trade/protocol/fund rates 3 x 8.
+pub const AMM_CONFIG_CREATE_POOL_FEE_OFFSET: usize = 36;
+
+/// Upper bounds on what `set_fees` / `initialize_global` accept, so a compromised or
+/// careless admin cannot divert the SOL a curve raised or make `migrate` fail.
+/// The graduation fee is paid out of the raised SOL at `migrate`, which anyone can call.
+/// Mainnet raises about 87.9 SOL, the fee is 1.5 SOL (cap 2 SOL); the devnet build raises
+/// about 1.46 SOL, the fee is 0.05 SOL (cap 0.1 SOL).
+#[cfg(not(feature = "devnet"))]
+pub const MAX_GRADUATION_FEE_LAMPORTS: u64 = 2_000_000_000;
+#[cfg(feature = "devnet")]
+pub const MAX_GRADUATION_FEE_LAMPORTS: u64 = 100_000_000;
+/// ...and never more than this share of what the curve raises (10%), so the pool is always funded.
+pub const MAX_GRADUATION_FEE_BPS_OF_RAISED: u64 = 1_000;
+/// Launch fee cap (mainnet value 0.02 SOL).
+pub const MAX_LAUNCH_FEE_LAMPORTS: u64 = 500_000_000;
+/// Cap on protocol + creator + insurance trade fees together (5%); mainnet uses 1%.
+pub const MAX_TOTAL_TRADE_FEE_BPS: u64 = 500;
+
+/// SOL a curve has raised (`real_sol`) when it sells out, before any sells: the constant
+/// product moves the virtual SOL from INITIAL_VIRTUAL_SOL to k / (virtual tokens left).
+pub const fn graduation_raised_lamports() -> u64 {
+    let k = (INITIAL_VIRTUAL_SOL as u128) * (INITIAL_VIRTUAL_TOKENS as u128);
+    (k / ((INITIAL_VIRTUAL_TOKENS - CURVE_SUPPLY) as u128) - INITIAL_VIRTUAL_SOL as u128) as u64
+}
+
+/// Largest graduation fee allowed for a curve that raised `raised` lamports.
+pub fn max_graduation_fee(raised: u64) -> u64 {
+    MAX_GRADUATION_FEE_LAMPORTS.min(((raised as u128) * (MAX_GRADUATION_FEE_BPS_OF_RAISED as u128) / BPS as u128) as u64)
+}
+
+/// Validates the fee settings against the caps above (used by `initialize_global` and `set_fees`).
+fn check_fee_caps(launch_fee: u64, graduation_fee: u64) -> Result<()> {
+    require!(launch_fee <= MAX_LAUNCH_FEE_LAMPORTS, LaunchError::LaunchFeeAboveCap);
+    require!(graduation_fee <= max_graduation_fee(graduation_raised_lamports()), LaunchError::GraduationFeeAboveCap);
+    Ok(())
+}
+
+/// Splits a sold-out curve's `real_sol` into (graduation fee, SOL for the pool). The fee is the
+/// configured one, clamped to the caps, so a value stored before they existed cannot drain a curve.
+fn graduation_split(configured_fee: u64, real_sol: u64) -> Result<(u64, u64)> {
+    let fee = configured_fee.min(max_graduation_fee(real_sol));
+    let after_fee = real_sol - fee;
+    require!(after_fee > POOL_CREATION_RESERVE + 1_000_000, LaunchError::NotEnoughToMigrate);
+    Ok((fee, after_fee - POOL_CREATION_RESERVE))
+}
+
+/// Raydium's current create-pool fee from its AmmConfig account data.
+fn raydium_create_pool_fee(config_data: &[u8]) -> Option<u64> {
+    let o = AMM_CONFIG_CREATE_POOL_FEE_OFFSET;
+    Some(u64::from_le_bytes(config_data.get(o..o + 8)?.try_into().ok()?))
+}
+
+/// True if the reserve covers Raydium's create-pool fee plus the rent it charges.
+fn reserve_covers_raydium(create_pool_fee: u64) -> bool {
+    create_pool_fee.checked_add(RAYDIUM_RENT_ALLOWANCE).map_or(false, |need| need <= POOL_CREATION_RESERVE)
+}
 
 /// Raydium CPMM (constant-product AMM) addresses. Checked against
 /// raydium-cp-swap's lib.rs and live devnet accounts.
@@ -130,11 +197,14 @@ pub mod raydium {
 pub mod ringside_launch {
     use super::*;
 
+    /// `fee_recipient` and `insurance_recipient` are fixed here: there is no setter, so on
+    /// mainnet they must be the treasury / multisig from the start (`init-mainnet.ts` checks).
     pub fn initialize_global(ctx: Context<InitializeGlobal>, params: GlobalParams) -> Result<()> {
         require!(
-            params.protocol_fee_bps + params.creator_fee_bps + params.insurance_fee_bps <= 500,
+            params.protocol_fee_bps as u64 + params.creator_fee_bps as u64 + params.insurance_fee_bps as u64 <= MAX_TOTAL_TRADE_FEE_BPS,
             LaunchError::FeeTooHigh
         );
+        check_fee_caps(params.launch_fee_lamports, params.graduation_fee_lamports)?;
         let g = &mut ctx.accounts.global;
         g.authority = ctx.accounts.authority.key();
         g.fee_recipient = params.fee_recipient;
@@ -485,10 +555,8 @@ pub mod ringside_launch {
         require!(curve.mint == ctx.accounts.mint.key(), LaunchError::MigrationFailed);
         require!(curve.complete && !curve.migrated, LaunchError::NotReadyToMigrate);
         let mint = curve.mint;
-        let fee = ctx.accounts.global.graduation_fee_lamports.min(curve.real_sol);
-        let after_fee = curve.real_sol - fee;
-        require!(after_fee > POOL_CREATION_RESERVE + 1_000_000, LaunchError::NotEnoughToMigrate);
-        let pool_sol = after_fee - POOL_CREATION_RESERVE;
+        check_reserve(&ctx.accounts.amm_config)?;
+        let (fee, pool_sol) = graduation_split(ctx.accounts.global.graduation_fee_lamports, curve.real_sol)?;
         // Open the pool at the curve's final price: pool_sol / tokens equal to
         // virtual_sol / virtual_tokens. Reserve tokens it doesn't need are burned,
         // so fees never show up as a price gap at graduation.
@@ -512,7 +580,6 @@ pub mod ringside_launch {
         Ok(())
     }
 
-    /// Admin: fee settings (devnet uses a small graduation fee).
     /// Admin handover, step 1: the current authority names its successor
     /// (on mainnet, the Squads multisig vault). Nothing changes until step 2.
     pub fn propose_authority(ctx: Context<ProposeAuthority>, new_authority: Pubkey) -> Result<()> {
@@ -532,7 +599,11 @@ pub mod ringside_launch {
         Ok(())
     }
 
+    /// Admin: launch and graduation fee, within the hard caps (`MAX_LAUNCH_FEE_LAMPORTS`,
+    /// `max_graduation_fee`). The recipients, the trade fee rates and `migration_authority`
+    /// are fixed at `initialize_global` (README, Fees).
     pub fn set_fees(ctx: Context<AdminOnly>, launch_fee_lamports: u64, graduation_fee_lamports: u64) -> Result<()> {
+        check_fee_caps(launch_fee_lamports, graduation_fee_lamports)?;
         let g = &mut ctx.accounts.global;
         g.launch_fee_lamports = launch_fee_lamports;
         g.graduation_fee_lamports = graduation_fee_lamports;
@@ -596,6 +667,8 @@ pub struct Global {
     pub authority: Pubkey,
     pub fee_recipient: Pubkey,
     pub insurance_recipient: Pubkey,
+    /// UNUSED: stored at init but checked nowhere (`migrate` is permissionless). Kept
+    /// because removing it would change the account layout; it grants no power.
     pub migration_authority: Pubkey,
     pub launch_fee_lamports: u64,
     pub graduation_fee_lamports: u64,
@@ -691,6 +764,9 @@ impl Curve {
             let needed_net = (ceil_div(k, target_y) - x) as u64;
             net = needed_net;
             gross = ceil_div((needed_net as u128) * BPS as u128, (BPS - total_bps) as u128) as u64;
+            // Rounding up can land 1 lamport above what the buyer offered; `needed_net` is at
+            // most the net of `sol_in`, so charging `sol_in` still covers it (the rest is fee).
+            gross = gross.min(sol_in);
         }
         let protocol = mul_bps(gross, g.protocol_fee_bps)?;
         let creator = mul_bps(gross, g.creator_fee_bps)?;
@@ -783,6 +859,8 @@ fn ceil_div(a: u128, b: u128) -> u128 {
 pub struct GlobalParams {
     pub fee_recipient: Pubkey,
     pub insurance_recipient: Pubkey,
+    /// UNUSED: stored at init but checked nowhere (`migrate` is permissionless). Kept
+    /// because removing it would change the account layout; it grants no power.
     pub migration_authority: Pubkey,
     pub launch_fee_lamports: u64,
     pub graduation_fee_lamports: u64,
@@ -1009,6 +1087,14 @@ fn migrate_sol<'info>(a: &Migrate<'info>, fee: u64, pool_sol: u64, creator_seeds
         pool_sol,
     )?;
     token::sync_native(CpiContext::new(a.token_program.to_account_info(), token::SyncNative { account: a.creator_wsol.to_account_info() }))
+}
+
+/// Fails with a clear error if Raydium's create-pool fee no longer fits the reserve.
+#[inline(never)]
+fn check_reserve(amm_config: &UncheckedAccount) -> Result<()> {
+    let fee = raydium_create_pool_fee(&amm_config.try_borrow_data()?).ok_or(LaunchError::MigrationFailed)?;
+    require!(reserve_covers_raydium(fee), LaunchError::PoolReserveTooSmall);
+    Ok(())
 }
 
 /// The pool creator's associated token account for `mint`, paid by the caller.
@@ -1336,6 +1422,12 @@ pub enum LaunchError {
     NotForfeitable,
     #[msg("Only the program's upgrade authority can initialize it")]
     NotUpgradeAuthority,
+    #[msg("Graduation fee is above the cap")]
+    GraduationFeeAboveCap,
+    #[msg("Launch fee is above the cap")]
+    LaunchFeeAboveCap,
+    #[msg("Raydium's create-pool fee plus rent no longer fits the pool creation reserve; the program needs an upgrade")]
+    PoolReserveTooSmall,
 }
 
 #[cfg(test)]
@@ -1471,4 +1563,93 @@ mod tests {
         assert_eq!(8 + Curve::INIT_SPACE, 1219);
     }
 
+
+    // ---- F8: fee caps ----
+
+    #[test]
+    fn fee_caps_accept_the_configured_values_and_the_caps_but_nothing_above() {
+        let raised = graduation_raised_lamports();
+        #[cfg(not(feature = "devnet"))]
+        {
+            assert!((raised as f64 / 1e9 - 87.912).abs() < 0.01);
+            assert!(check_fee_caps(20_000_000, 1_500_000_000).is_ok(), "mainnet values");
+            assert_eq!(max_graduation_fee(raised), 2_000_000_000);
+        }
+        #[cfg(feature = "devnet")]
+        {
+            assert!(check_fee_caps(20_000_000, 50_000_000).is_ok(), "devnet values");
+            assert_eq!(max_graduation_fee(raised), 100_000_000);
+        }
+        let max = max_graduation_fee(raised);
+        assert!(check_fee_caps(MAX_LAUNCH_FEE_LAMPORTS, max).is_ok());
+        assert!(check_fee_caps(0, 0).is_ok());
+        assert!(check_fee_caps(MAX_LAUNCH_FEE_LAMPORTS + 1, 0).is_err());
+        assert!(check_fee_caps(0, max + 1).is_err());
+        assert!(check_fee_caps(0, raised - 1_000_000).is_err(), "a fee of nearly everything raised");
+        assert!(check_fee_caps(0, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn migrate_leaves_the_pool_funded_at_the_max_fee() {
+        let raised = graduation_raised_lamports();
+        let max = max_graduation_fee(raised);
+        let (fee, pool_sol) = graduation_split(max, raised).unwrap();
+        assert_eq!(fee, max);
+        assert_eq!(fee + POOL_CREATION_RESERVE + pool_sol, raised);
+        assert!(pool_sol >= raised / 2, "the pool gets most of the raise: {pool_sol} of {raised}");
+        // A stored fee above the cap (set before the caps existed) is clamped, not paid.
+        let (fee, pool_sol) = graduation_split(raised - POOL_CREATION_RESERVE - 2_000_000, raised).unwrap();
+        assert_eq!(fee, max);
+        assert!(pool_sol > 0);
+        // Same through an actual sell-out of a fresh curve.
+        let mut c = fresh_curve();
+        c.last_price_q64 = c.spot_price_q64();
+        let (out, fees) = c.quote_buy(500 * 1_000_000_000, &global()).unwrap();
+        c.apply_buy(fees.net_in, out, fees.creator, 1).unwrap();
+        assert_eq!(c.real_tokens, 0);
+        assert!(c.real_sol.abs_diff(raised) < 10, "real {} vs const {}", c.real_sol, raised);
+        let (fee, pool_sol) = graduation_split(u64::MAX, c.real_sol).unwrap();
+        assert_eq!(fee, max_graduation_fee(c.real_sol));
+        assert!(pool_sol > 0 && fee <= c.real_sol / 10);
+    }
+
+    // ---- F12: reserve ----
+
+    #[test]
+    fn reserve_covers_raydiums_current_fee_and_refuses_a_higher_one() {
+        // First 44 bytes of the live devnet AmmConfig (create_pool_fee = 0.15 SOL).
+        let hex = "daf42168cbcb2b6ffd000000c409000000000000c0d4010000000000409c00000000000080d1f00800000000";
+        let data: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap()).collect();
+        assert_eq!(raydium_create_pool_fee(&data), Some(150_000_000));
+        assert_eq!(raydium_create_pool_fee(&data[..43]), None, "short data");
+        assert!(reserve_covers_raydium(150_000_000));
+        assert!(reserve_covers_raydium(POOL_CREATION_RESERVE - RAYDIUM_RENT_ALLOWANCE));
+        assert!(!reserve_covers_raydium(POOL_CREATION_RESERVE - RAYDIUM_RENT_ALLOWANCE + 1));
+        assert!(!reserve_covers_raydium(u64::MAX));
+    }
+
+    // ---- last buy never charges more than offered ----
+
+    #[test]
+    fn final_buy_never_charges_more_than_offered() {
+        let g = global();
+        let mut checked = 0;
+        // Several pre-sales, so the finishing buy lands on different roundings.
+        for first_buy in [80_000_000_000u64, 85_123_456_789, 70_000_000_001, 86_500_000_000, 87_000_000_000] {
+            let mut c = fresh_curve();
+            c.last_price_q64 = c.spot_price_q64();
+            let (out, fees) = c.quote_buy(first_buy, &g).unwrap();
+            c.apply_buy(fees.net_in, out, fees.creator, 1).unwrap();
+            // What it costs to buy out the rest, then offers on both sides of that.
+            let (rest, f) = c.quote_buy(500 * 1_000_000_000, &g).unwrap();
+            assert_eq!(rest, c.real_tokens);
+            for offer in f.gross_in.saturating_sub(300)..f.gross_in + 300 {
+                let (out, q) = c.quote_buy(offer, &g).unwrap();
+                assert!(q.gross_in <= offer, "charged {} for an offer of {offer}", q.gross_in);
+                assert_eq!(q.protocol + q.creator + q.insurance + q.net_in, q.gross_in, "fees add up");
+                if out == rest { assert!(q.gross_in <= f.gross_in); checked += 1; }
+            }
+        }
+        assert!(checked > 100, "the sweep must include finishing buys: {checked}");
+    }
 }

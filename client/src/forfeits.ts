@@ -70,6 +70,12 @@ export interface ForfeitState {
   totalDepositedUsdc: string;
   /** Newest first, capped at PROCESSED_CAP. */
   processed: string[];
+  /**
+   * Optional (absent in older state files): seeded from FORFEIT_START_SLOT on the first run. While `cursor` is
+   * still null, a scan ignores transactions in slots below it, so a scan that found nothing cannot fall back to
+   * reading the whole history on the next run.
+   */
+  startSlot?: number | null;
 }
 
 export const emptyState = (): ForfeitState => ({ cursor: null, totalForfeited: "0", totalConverted: "0", usdcPendingDeposit: "0", totalDepositedUsdc: "0", processed: [] });
@@ -82,8 +88,50 @@ export function parseState(raw: unknown): ForfeitState {
     || !big(o.usdcPendingDeposit) || !big(o.totalDepositedUsdc) || !Array.isArray(o.processed) || !o.processed.every((s) => typeof s === "string")) {
     throw new Error("forfeit state file is malformed; fix or remove it (removing it re-scans the whole history)");
   }
+  if (o.startSlot !== undefined && o.startSlot !== null && !(Number.isSafeInteger(o.startSlot) && o.startSlot > 0)) throw new Error("forfeit state: startSlot must be a positive integer");
   if (BigInt(o.totalConverted as string) > BigInt(o.totalForfeited as string)) throw new Error("forfeit state: totalConverted exceeds totalForfeited");
   return o as ForfeitState;
+}
+
+/** The operator's starting point for a first run, from FORFEIT_START_SIGNATURE / FORFEIT_START_SLOT. */
+export interface ForfeitStart { signature: string | null; slot: number | null }
+
+/** Reads and validates the two env vars (empty counts as unset). Throws on a malformed value or on both being set. */
+export function parseStart(env: { FORFEIT_START_SIGNATURE?: string; FORFEIT_START_SLOT?: string }): ForfeitStart {
+  const sigRaw = (env.FORFEIT_START_SIGNATURE ?? "").trim();
+  const slotRaw = (env.FORFEIT_START_SLOT ?? "").trim();
+  // A transaction signature is 64 bytes: 86 to 88 base58 characters.
+  if (sigRaw && !/^[1-9A-HJ-NP-Za-km-z]{80,90}$/.test(sigRaw)) throw new Error("FORFEIT_START_SIGNATURE is not a base58 transaction signature");
+  if (slotRaw && !/^[1-9]\d{0,15}$/.test(slotRaw)) throw new Error("FORFEIT_START_SLOT must be a positive integer slot number");
+  if (sigRaw && slotRaw) throw new Error("set only one of FORFEIT_START_SIGNATURE and FORFEIT_START_SLOT");
+  return { signature: sigRaw || null, slot: slotRaw ? Number(slotRaw) : null };
+}
+
+export const NO_START_MESSAGE =
+  "first forfeit run with no state file: refusing to read the launch program's whole signature history. "
+  + "Set FORFEIT_START_SIGNATURE to any launch-program transaction signature from before the first forfeit "
+  + "(forfeits only exist 30 days after the 20/80 upgrade), or FORFEIT_START_SLOT to a slot before it, and run again";
+
+/**
+ * Applies the starting point to the state that was loaded (or is new). With an existing state file the start
+ * is ignored: the saved cursor is the audit trail and is never overwritten. Without one, a start is required;
+ * a signature becomes the cursor (that transaction itself is not scanned), a slot becomes `startSlot`.
+ */
+export function seedState(state: ForfeitState, stateFileExists: boolean, start: ForfeitStart): { state: ForfeitState; seeded: boolean } {
+  if (stateFileExists) return { state, seeded: false };
+  if (start.signature) return { state: { ...state, cursor: start.signature }, seeded: true };
+  if (start.slot) return { state: { ...state, startSlot: start.slot }, seeded: true };
+  throw new Error(NO_START_MESSAGE);
+}
+
+/**
+ * Trims one page of signatures (newest first, each with its slot) to `floorSlot` and above. `done` is true once
+ * an older entry was seen, so paging can stop. Without a floor everything is kept.
+ */
+export function limitToSlot<T extends { slot: number }>(page: T[], floorSlot: number | null | undefined): { kept: T[]; done: boolean } {
+  if (!floorSlot) return { kept: page, done: false };
+  const kept = page.filter((p) => p.slot >= floorSlot);
+  return { kept, done: kept.length < page.length };
 }
 
 export const pendingLamports = (s: ForfeitState): bigint => BigInt(s.totalForfeited) - BigInt(s.totalConverted);

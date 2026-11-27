@@ -1,10 +1,12 @@
 /**
  * One-time mainnet configuration, run after both programs are deployed and audited:
- *   1. launch program global config: 0.02 SOL launch fee, 1.5 SOL graduation fee,
+ *   1. launch program global config: 0.02 SOL launch fee, 1.5 SOL graduation fee (hard caps in the
+ *      program: 0.5 SOL and 2 SOL; set_fees cannot exceed them), recipients fixed for good,
  *      0.5% protocol / 0.3% creator / 0.2% insurance on curve trades;
  *   2. perps vault on Circle USDC, with the manual SOL price authority set to a
  *      key nobody holds (11111111111111111111111111111111), so only Pyth moves SOL/USD;
- *   3. risk params: OI cap 1.5% of the SOL behind the price, net exposure 25% of that.
+ *   3. risk params: OI cap 1.5% of the SOL behind the price (the program's default is 1%; this script sets 1.5%),
+ *      net exposure 25% of that.
  *
  * Who may run it: `initialize_global` and `initialize_vault` accept only the
  * program's upgrade authority, so whoever deployed the programs must run the
@@ -48,6 +50,10 @@ export const MAINNET_PARAMS = {
   skewCapBps: 2_500,
 };
 
+// Hard caps in the launch program (MAX_LAUNCH_FEE_LAMPORTS, MAX_GRADUATION_FEE_LAMPORTS on the mainnet build).
+const MAX_LAUNCH_FEE = 0.5 * LAMPORTS;
+const MAX_GRADUATION_FEE = 2 * LAMPORTS;
+
 const pda = (seeds: Buffer[], program: PublicKey) => PublicKey.findProgramAddressSync(seeds, program)[0];
 const die = (m: string): never => {
   console.error(`\n✗ ${m}`);
@@ -81,10 +87,22 @@ async function main() {
   const fee = new PublicKey(process.env.FEE_RECIPIENT ?? die("set FEE_RECIPIENT"));
   const insurance = new PublicKey(process.env.INSURANCE_RECIPIENT ?? die("set INSURANCE_RECIPIENT"));
   const migration = new PublicKey(process.env.MIGRATION_AUTHORITY ?? fee.toBase58());
+  // fee_recipient and insurance_recipient are FIXED at initialization: the launch program has no setter for them.
+  // Both must be accounts the team will still control for the life of the program (the treasury / multisig, or the
+  // treasury key that runs `treasury.ts forfeits`), and never the deployer key, which is a throwaway after the handover.
+  if (MAINNET_PARAMS.launchFeeLamports > MAX_LAUNCH_FEE || MAINNET_PARAMS.graduationFeeLamports > MAX_GRADUATION_FEE) {
+    die("MAINNET_PARAMS fees exceed the launch program's hard caps (0.5 SOL launch, 2 SOL graduation); the program would refuse them");
+  }
+  for (const [name, key] of [["FEE_RECIPIENT", fee], ["INSURANCE_RECIPIENT", insurance]] as const) {
+    if (key.equals(NOBODY)) die(`${name} is the system program address: SOL sent there is lost, and it cannot be changed later`);
+  }
   // The Squads vault: owns protocol-owned liquidity now, and is proposed as admin of both programs at the end.
   const multisig = new PublicKey(process.env.MULTISIG ?? die("set MULTISIG to the Squads vault address (not the multisig account)"));
   const walletPath = process.env.ANCHOR_WALLET ?? `${process.env.HOME}/.config/solana/id.json`;
   const payer = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(readFileSync(walletPath, "utf8"))));
+  for (const [name, key] of [["FEE_RECIPIENT", fee], ["INSURANCE_RECIPIENT", insurance], ["MIGRATION_AUTHORITY", migration]] as const) {
+    if (key.equals(payer.publicKey)) die(`${name} is the deployer key (${key.toBase58()}). The recipients cannot be changed after initialization: use the treasury or multisig.`);
+  }
   const connection = new Connection(url, "confirmed");
   const provider = new AnchorProvider(connection, new Wallet(payer), { commitment: "confirmed" });
   const launch = new Program(JSON.parse(readFileSync(resolve(ROOT, "target/idl/ringside_launch.json"), "utf8")), provider) as any;
@@ -111,9 +129,9 @@ async function main() {
   const p = MAINNET_PARAMS;
   console.log(`
 Admin (this key):   ${payer.publicKey.toBase58()}
-Fee recipient:      ${fee.toBase58()}
-Insurance:          ${insurance.toBase58()}
-Migration auth:     ${migration.toBase58()}
+Fee recipient:      ${fee.toBase58()}   (fixed for the life of the program: no setter)
+Insurance:          ${insurance.toBase58()}   (fixed: no setter)
+Migration auth:     ${migration.toBase58()}   (stored, unused by the program)
 Multisig (Squads):  ${multisig.toBase58()} (treasury now; admin once it accepts)
 Launch fee:         ${p.launchFeeLamports / LAMPORTS} SOL, graduation fee ${p.graduationFeeLamports / LAMPORTS} SOL
 Curve trade fees:   ${p.protocolFeeBps / 100}% protocol, ${p.creatorFeeBps / 100}% creator, ${p.insuranceFeeBps / 100}% insurance

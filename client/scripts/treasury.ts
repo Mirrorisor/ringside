@@ -38,7 +38,11 @@
  * deposit_to_treasury with the USDC received. Otherwise it prints what should be converted and exits 0.
  * --dry-run / FORFEIT_DRY_RUN=1: scan and report only, send nothing, write no state (on `sweep` the whole
  * sweep is skipped and only this report runs). The pure parsing and accounting are in src/forfeits.ts.
- * Env: FORFEIT_STATE_FILE, FORFEIT_DRY_RUN, FORFEIT_SCAN_MAX (signatures per scan, default 20000).
+ * First run: with no state file the scan would read the launch program's whole history, so it refuses unless
+ * FORFEIT_START_SIGNATURE (a launch transaction signature from before the first forfeit; becomes the cursor)
+ * or FORFEIT_START_SLOT (ignore anything older) is set. Both are ignored once a state file exists.
+ * Env: FORFEIT_STATE_FILE, FORFEIT_DRY_RUN, FORFEIT_SCAN_MAX (signatures per scan, default 20000),
+ *      FORFEIT_START_SIGNATURE / FORFEIT_START_SLOT (first run only).
  *
  * Env: ANCHOR_PROVIDER_URL, ANCHOR_WALLET (treasury key), RING_MINT, NETWORK,
  *      TREASURY_KEEP_USDC (default 0), SWAP_SOL, SOL_RESERVE (default 0.5).
@@ -51,7 +55,7 @@ import {
   sendAndConfirmTransaction,
 } from "@solana/web3.js";
 import { decodeFeeRecipient } from "../src/graduation.js";
-import { applyScan, emptyState, parseState, pendingLamports, planConversion, recordDeposit, recordSwap, summaryLine, type ForfeitState, type ScannedTx } from "../src/forfeits.js";
+import { applyScan, emptyState, limitToSlot, parseStart, parseState, seedState, pendingLamports, planConversion, recordDeposit, recordSwap, summaryLine, type ForfeitState, type ScannedTx } from "../src/forfeits.js";
 import { TOKEN_PROGRAM_ID, createAssociatedTokenAccountIdempotentInstruction, getAccount, getAssociatedTokenAddressSync } from "@solana/spl-token";
 
 const LAUNCH = new PublicKey("AfZWCTaDQEC9CVTwXkH7pFtDXs4RtLWCK5godexWQDVH");
@@ -193,7 +197,14 @@ async function swapSol(usdcMint: PublicKey, usdcAta: PublicKey, lamports?: bigin
 // ---- forfeited creator-fee SOL -> treasury-owned liquidity ----
 
 const stateFile = () => process.env.FORFEIT_STATE_FILE ?? "./forfeit-state.json";
-const loadState = (): ForfeitState => (existsSync(stateFile()) ? parseState(JSON.parse(readFileSync(stateFile(), "utf8"))) : emptyState());
+/** The saved state, or on a first run (no file) a fresh one seeded from FORFEIT_START_SIGNATURE / FORFEIT_START_SLOT; refuses with neither. */
+const loadState = (): ForfeitState => {
+  const exists = existsSync(stateFile());
+  const st = exists ? parseState(JSON.parse(readFileSync(stateFile(), "utf8"))) : emptyState();
+  const seeded = seedState(st, exists, parseStart(process.env));
+  if (seeded.seeded) console.log(`forfeits: first run, scanning from ${seeded.state.cursor ? `signature ${seeded.state.cursor}` : `slot ${seeded.state.startSlot}`}`);
+  return seeded.state;
+};
 function saveState(st: ForfeitState) {
   const tmp = `${stateFile()}.tmp`;
   writeFileSync(tmp, JSON.stringify(st, null, 2) + "\n");
@@ -204,12 +215,14 @@ function saveState(st: ForfeitState) {
 async function scanLaunch(state: ForfeitState): Promise<ScannedTx[]> {
   const max = Number(process.env.FORFEIT_SCAN_MAX ?? "20000");
   const infos: { signature: string; err: unknown | null }[] = [];
+  const floor = state.cursor ? null : state.startSlot ?? null; // FORFEIT_START_SLOT, only until a cursor exists
   let before: string | undefined;
   for (;;) {
     const page = await conn.getSignaturesForAddress(LAUNCH, { before, until: state.cursor ?? undefined, limit: 1000 }, "finalized");
-    infos.push(...page.map((p) => ({ signature: p.signature, err: p.err })));
+    const { kept, done } = limitToSlot(page, floor);
+    infos.push(...kept.map((p) => ({ signature: p.signature, err: p.err })));
     if (infos.length > max) throw new Error(`more than ${max} launch transactions since the cursor; raise FORFEIT_SCAN_MAX (nothing was saved)`);
-    if (page.length < 1000) break;
+    if (done || page.length < 1000) break;
     before = page[page.length - 1].signature;
   }
   const seen = new Set(state.processed);
