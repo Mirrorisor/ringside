@@ -792,6 +792,10 @@
     },
     {
       "name": "initialize_global",
+      "docs": [
+        "`fee_recipient` and `insurance_recipient` are fixed here: there is no setter, so on",
+        "mainnet they must be the treasury / multisig from the start (`init-mainnet.ts` checks)."
+      ],
       "discriminator": [
         47,
         225,
@@ -1375,7 +1379,6 @@
     {
       "name": "propose_authority",
       "docs": [
-        "Admin: fee settings (devnet uses a small graduation fee).",
         "Admin handover, step 1: the current authority names its successor",
         "(on mainnet, the Squads multisig vault). Nothing changes until step 2."
       ],
@@ -1854,6 +1857,11 @@
     },
     {
       "name": "set_fees",
+      "docs": [
+        "Admin: launch and graduation fee, within the hard caps (`MAX_LAUNCH_FEE_LAMPORTS`,",
+        "`max_graduation_fee`). The recipients, the trade fee rates and `migration_authority`",
+        "are fixed at `initialize_global` (README, Fees)."
+      ],
       "discriminator": [
         137,
         178,
@@ -2170,6 +2178,21 @@
       "code": 6016,
       "name": "NotUpgradeAuthority",
       "msg": "Only the program's upgrade authority can initialize it"
+    },
+    {
+      "code": 6017,
+      "name": "GraduationFeeAboveCap",
+      "msg": "Graduation fee is above the cap"
+    },
+    {
+      "code": 6018,
+      "name": "LaunchFeeAboveCap",
+      "msg": "Launch fee is above the cap"
+    },
+    {
+      "code": 6019,
+      "name": "PoolReserveTooSmall",
+      "msg": "Raydium's create-pool fee plus rent no longer fits the pool creation reserve; the program needs an upgrade"
     }
   ],
   "types": [
@@ -2396,6 +2419,10 @@
           },
           {
             "name": "migration_authority",
+            "docs": [
+              "UNUSED: stored at init but checked nowhere (`migrate` is permissionless). Kept",
+              "because removing it would change the account layout; it grants no power."
+            ],
             "type": "pubkey"
           },
           {
@@ -2444,6 +2471,10 @@
           },
           {
             "name": "migration_authority",
+            "docs": [
+              "UNUSED: stored at init but checked nowhere (`migrate` is permissionless). Kept",
+              "because removing it would change the account layout; it grants no power."
+            ],
             "type": "pubkey"
           },
           {
