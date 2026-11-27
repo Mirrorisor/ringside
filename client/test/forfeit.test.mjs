@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import { forfeitTargets, FORFEIT_SAFETY_MARGIN_S } from "../dist/keeper.js";
 import { CREATOR_FEE_FORFEIT_SECONDS, decodeCurve } from "../dist/graduation.js";
 import { decodeMarket } from "../dist/keeper.js";
+import { getAddressDecoder } from "@solana/kit";
 
 const DAY = 24n * 3600n;
 const T0 = 1_700_000_000n;
@@ -65,8 +66,13 @@ test("decoders read creator_fees_locked as the last field and treat missing byte
   assert.equal(c.complete, false);
   assert.equal(decodeCurve("k", new Uint8Array(full.subarray(0, full.length - 8))).creatorFeesLocked, 0n);
 
-  const m = Buffer.alloc(228);
+  const m = Buffer.alloc(260);
   m.writeBigUInt64LE(99n, 220);
   assert.equal(decodeMarket("m", new Uint8Array(m)).creatorFeesLocked, 99n);
   assert.equal(decodeMarket("m", new Uint8Array(m.subarray(0, 220))).creatorFeesLocked, 0n);
+  // `pool` follows it: all zero or missing (a market from before the field) reads as null, else the stored key.
+  assert.equal(decodeMarket("m", new Uint8Array(m)).pool, null);
+  assert.equal(decodeMarket("m", new Uint8Array(m.subarray(0, 228))).pool, null);
+  m.fill(7, 228, 260);
+  assert.equal(decodeMarket("m", new Uint8Array(m)).pool, getAddressDecoder().decode(new Uint8Array(32).fill(7)));
 });

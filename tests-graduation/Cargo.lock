@@ -3781,6 +3781,7 @@ version = "0.1.0"
 dependencies = [
  "anchor-lang",
  "anchor-spl",
+ "bincode",
  "raydium-cp-swap",
  "ringside_launch",
  "ringside_perps",

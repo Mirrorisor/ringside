@@ -10,7 +10,7 @@ This code is public and **unaudited**. Treat it as a reference for review, not s
 
 - **Report vulnerabilities privately.** Use GitHub's private vulnerability reporting on this repo (Security → Report a vulnerability). Please don't open public issues for security bugs. A paid bounty will run on Immunefi before mainnet deposits open.
 - **Scope that matters most:** the graduation CPI into Raydium (lamport accounting, SBF stack frames), mark pricing (curve price, pool TWAP, the price band), Pyth parsing, LP share pricing and the withdrawal delay, per-market loss budgets and ADL, and the admin handover.
-- **Mainnet keys:** upgrade authority, admin and treasury go to a Squads multisig; the manual SOL price authority goes to a key nobody holds. `init-mainnet.ts` refuses a single-key upgrade authority.
+- **Mainnet keys:** upgrade authority, admin and treasury go to a Squads multisig; the manual SOL price authority goes to a key nobody holds. `initialize_global` and `initialize_vault` accept only the program's upgrade authority, so initialize first (deployer key) and then hand the upgrade authority to the multisig; `init-mainnet.ts` checks every field of anything already initialized. Fixes from the pre-audit review are listed in [docs/security-fixes.md](docs/security-fixes.md).
 - **Privacy:** Helius Rings' first mainnet ring hides amounts, not who sent to whom. Don't rely on Ringside's private funding to unlink wallets until that's verified on chain.
 - **No licence.** All rights reserved; you may read the code, not reuse it.
 
@@ -36,7 +36,7 @@ This code is public and **unaudited**. Treat it as a reference for review, not s
 | `client/src/graduation.ts`, `client/src/pyth.ts` | Raydium addresses and migrate/graduate instructions; Pyth poster |
 | `client/app` | Devnet web app (Vite): launch, spot (curve or Raydium), perps via the relayer, positions, faucet |
 | `tests/tests/flow.rs` | End-to-end test: launch, buy, LP deposit, market, caps, open, close, skew cap, crash and liquidation |
-| `tests-graduation/` | Graduation test against Raydium's real CPMM program (vendored at b0b2a08) and byte copies of the live devnet config and fee accounts |
+| `tests-graduation/` | Graduation tests (including the pool pre-creation and pre-funding cases) against Raydium's real CPMM program (vendored at b0b2a08) and byte copies of the live devnet config and fee accounts |
 | `sim/` | `risk_sim.py` (synthetic model, manipulation study) and `replay.py` (replay of the program's rules on real pump.fun price paths) |
 
 ## Build and test
@@ -61,7 +61,7 @@ The `devnet` feature gives curves 0.5 virtual SOL (so a curve sells out for ~1.5
 
 ## Mainnet
 
-`bash scripts/mainnet.sh` builds without the devnet feature, stops on stack warnings, and prints the deploy and configuration steps. `client/scripts/init-mainnet.ts` sets the launch fees, creates the vault, sets the 1.5% cap and 25% skew limit, and hands the manual SOL price authority to a key nobody holds. It refuses to run against a devnet RPC or with a program whose upgrade authority is a single key, unless told otherwise. Run it only after the audits.
+`bash scripts/mainnet.sh` builds without the devnet feature, stops on stack warnings, and prints the deploy and configuration steps. `client/scripts/init-mainnet.ts` sets the launch fees, creates the vault, sets the 1.5% cap and 25% skew limit, and hands the manual SOL price authority to a key nobody holds. It must be run by the programs' upgrade authority (the deployer key, before the handover to the multisig), refuses to run against a devnet RPC, and aborts if Global or the vault already exist with any different field. Run it only after the audits.
 
 ## Operations
 
@@ -218,7 +218,7 @@ The shared Ringside perps client, used by the copy engine and the app: PDA deriv
 - **OI cap = 1.5% of the SOL behind the price** (virtual curve SOL, or pool SOL after graduation), the vault's net exposure capped at 25% of that. Set from the real-data replay: at 2% a patient attacker pumping a quiet curve roughly breaks even. Each side may hold up to **2x the cap** (`GROSS_CAP_MULT`), because the vault only carries the imbalance: in the replay (`sim/gross_check.py`, `sim/results-gross.json`) that doubled fees with unchanged tail losses, while 3x worsened the worst case under heavy one-sided demand.
 - **Risk budget per market** (0.25% of LP value at Tier 0, 1% at Tier 1). Past it the market goes reduce-only and keepers ADL profitable positions.
 - **SOL/USD only sizes caps.** It comes from Pyth: fully verified, under 60 s old, confidence within 2%.
-- **Graduation is permissionless.** Anyone can call `migrate` and `graduate_market`; every Raydium account is checked against addresses derived from the token.
+- **Graduation is permissionless and cannot be pre-empted.** Anyone can call `migrate` and `graduate_market`. The pool is created at a PDA of the launch program (`[raydium_pool, mint]`) that signs Raydium's `initialize`, so creating Raydium's canonical pool first does not block it; perps stores the pool in the market at `graduate_market` and checks every Raydium account against it. Markets that graduated earlier keep the canonical pool.
 - **Rings for unlinkability, not hidden positions.** Positions are public; Rings break the link between a trader's identity wallet and their trading account.
 
 ## Lessons from devnet (kept here so they aren't relearned)

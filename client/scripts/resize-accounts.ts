@@ -1,7 +1,9 @@
 /**
- * Migration for the creator-fee model (docs/creator-fee-lock.md): grows every launch
- * `Curve` and perps `Market` created before `creator_fees_locked` existed (8 bytes short)
- * with the programs' permissionless `resize_curve` / `resize_market`. The payer
+ * Account migrations: grows every launch `Curve` created before `creator_fees_locked` existed
+ * (docs/creator-fee-lock.md) and every perps `Market` created before its `pool` field existed
+ * (32 bytes; the pool a market prices from, fixed at graduation; markets that graduated earlier
+ * read as "no stored pool" and keep using Raydium's canonical pool), with the programs'
+ * permissionless `resize_curve` / `resize_market`. The payer
  * (ANCHOR_WALLET) funds the extra rent, about 0.00006 SOL per account. Safe to re-run:
  * accounts that are already full size are skipped, and the instructions are no-ops on them.
  *
@@ -22,9 +24,9 @@ import {
 
 const LAUNCH = new PublicKey("AfZWCTaDQEC9CVTwXkH7pFtDXs4RtLWCK5godexWQDVH");
 const PERPS = new PublicKey("DsZ69w3q25nRmAzJCRBMLbwZWN6NyVbYipTWsCAUsg1F");
-/** 8 + INIT_SPACE, with creator_fees_locked. Rust unit tests pin these numbers: keep them in step. */
+/** 8 + INIT_SPACE (Curve with creator_fees_locked, Market with pool). Rust unit tests pin these numbers: keep them in step. */
 const CURVE_LEN = 1219;
-const MARKET_LEN = 228;
+const MARKET_LEN = 260;
 const PER_TX = 4;
 
 const RPC_URL = process.env.ANCHOR_PROVIDER_URL ?? "https://api.devnet.solana.com";

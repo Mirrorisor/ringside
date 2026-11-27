@@ -124,8 +124,8 @@ async function main() {
   check(c1.complete, `curve sold out, raised ${(Number(c1.realSol) / LAMPORTS_PER_SOL).toFixed(3)} SOL`);
 
   console.log("\n4. Keeper graduates it");
-  const [t0, t1] = mint.publicKey.toBuffer().compare(NATIVE_MINT.toBuffer()) < 0 ? [mint.publicKey, NATIVE_MINT] : [NATIVE_MINT, mint.publicKey];
-  const pool = pda([enc("pool"), AMM_CONFIG.toBuffer(), t0.toBuffer(), t1.toBuffer()], CPMM);
+  // migrate creates the pool at a PDA of the launch program (nobody can create it first), not Raydium's canonical address.
+  const pool = pda([enc("raydium_pool"), mint.publicKey.toBuffer()], launch.programId);
   const poolVault = (m: PublicKey) => pda([enc("pool_vault"), pool.toBuffer(), m.toBuffer()], CPMM);
   await until("migrate", 120, async () => (await launch.account.curve.fetch(curve)).migrated);
   const [tv, sv] = await connection.getMultipleAccountsInfo([poolVault(mint.publicKey), poolVault(NATIVE_MINT)]);

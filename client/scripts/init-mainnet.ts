@@ -6,14 +6,23 @@
  *      key nobody holds (11111111111111111111111111111111), so only Pyth moves SOL/USD;
  *   3. risk params: OI cap 1.5% of the SOL behind the price, net exposure 25% of that.
  *
- * Safety checks (override only on purpose):
+ * Who may run it: `initialize_global` and `initialize_vault` accept only the
+ * program's upgrade authority, so whoever deployed the programs must run the
+ * first-time initialization, BEFORE the upgrade authority moves to the multisig
+ * (the script prints the commands for that at the end). Once Global and the vault
+ * exist, the script only checks them and applies the admin steps below.
+ *
+ * Safety checks:
  *   - refuses a devnet/testnet RPC;
- *   - refuses if either program's upgrade authority is the key running this
- *     script (it should be a multisig) — ALLOW_SINGLE_KEY_AUTHORITY=1 to override;
+ *   - when a program still has to be initialized, requires this key to be its
+ *     upgrade authority (nobody else can initialize it);
+ *   - when Global / the vault already exist, compares EVERY field with what this
+ *     script would set and aborts on any difference (an already-initialized
+ *     account is never silently trusted);
  *   - prints everything and waits for CONFIRM=yes before sending.
  *
  * Env: ANCHOR_PROVIDER_URL, ANCHOR_WALLET, FEE_RECIPIENT, INSURANCE_RECIPIENT,
- *      MIGRATION_AUTHORITY (optional, defaults to FEE_RECIPIENT), CONFIRM=yes.
+ *      MIGRATION_AUTHORITY (optional, defaults to FEE_RECIPIENT), MULTISIG, CONFIRM=yes.
  * Idempotent: steps already done on chain are skipped.
  */
 import { readFileSync } from "node:fs";
@@ -53,6 +62,19 @@ async function upgradeAuthority(c: Connection, program: PublicKey): Promise<Publ
   return acc!.data[12] === 1 ? new PublicKey(acc!.data.subarray(13, 45)) : null;
 }
 
+/** Collects differences between an on-chain account and what this script would set; aborts if there are any. */
+function verifyFields(what: string, onChain: Record<string, unknown>, expected: Record<string, unknown>) {
+  const show = (v: unknown) => (v && typeof (v as any).toBase58 === "function" ? (v as PublicKey).toBase58() : String(v));
+  const same = (a: unknown, b: unknown) =>
+    a && b && typeof (a as any).equals === "function" ? (a as PublicKey).equals(b as PublicKey) : String(a) === String(b);
+  const bad = Object.keys(expected).filter((k) => !same(onChain[k], expected[k]));
+  if (bad.length) {
+    die(`${what} already exists but differs from what this script would set:\n` +
+      bad.map((k) => `    ${k}: on chain ${show(onChain[k])}, expected ${show(expected[k])}`).join("\n") +
+      `\n  Someone else may have initialized it first. Do NOT continue with this deployment: investigate (redeploy under a fresh program id if the account is not yours).`);
+  }
+}
+
 async function main() {
   const url = process.env.ANCHOR_PROVIDER_URL ?? die("set ANCHOR_PROVIDER_URL to a mainnet RPC");
   if (/devnet|testnet|localhost|127\.0\.0\.1/.test(url)) die("this is the mainnet script; ANCHOR_PROVIDER_URL points at devnet/testnet/local");
@@ -71,17 +93,21 @@ async function main() {
   const genesis = await connection.getGenesisHash();
   if (genesis !== "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d") die(`RPC genesis ${genesis} is not mainnet-beta`);
 
-  for (const [name, id] of [["ringside_launch", launch.programId], ["ringside_perps", perps.programId]] as const) {
-    const auth = await upgradeAuthority(connection, id);
-    console.log(`${name} ${id.toBase58()} upgrade authority: ${auth?.toBase58() ?? "none (immutable)"}`);
-    if (auth?.equals(payer.publicKey) && process.env.ALLOW_SINGLE_KEY_AUTHORITY !== "1") {
-      die(`${name}'s upgrade authority is this single key. Move it to a Squads multisig first (solana program set-upgrade-authority), or set ALLOW_SINGLE_KEY_AUTHORITY=1.`);
-    }
-  }
-
   const global = pda([Buffer.from("global")], launch.programId);
   const vault = pda([Buffer.from("vault")], perps.programId);
   const vaultUsdc = pda([Buffer.from("vault_usdc")], perps.programId);
+  const authorities: Record<string, PublicKey | null> = {};
+  for (const [name, id, state] of [["ringside_launch", launch.programId, global], ["ringside_perps", perps.programId, vault]] as const) {
+    const auth = await upgradeAuthority(connection, id);
+    authorities[name] = auth;
+    console.log(`${name} ${id.toBase58()} upgrade authority: ${auth?.toBase58() ?? "none (immutable)"}`);
+    if (!(await connection.getAccountInfo(state)) && !auth?.equals(payer.publicKey)) {
+      die(`${name} is not initialized yet and only its upgrade authority (${auth?.toBase58() ?? "none: immutable"}) can initialize it. ` +
+        `Run this script with that key (before moving the upgrade authority to the multisig), or use a Squads transaction.`);
+    }
+  }
+  const launchProgramData = pda([launch.programId.toBuffer()], BPF_UPGRADEABLE);
+  const perpsProgramData = pda([perps.programId.toBuffer()], BPF_UPGRADEABLE);
   const p = MAINNET_PARAMS;
   console.log(`
 Admin (this key):   ${payer.publicKey.toBase58()}
@@ -95,6 +121,8 @@ Vault:              USDC ${USDC_MAINNET.toBase58()}, SOL price authority ${NOBOD
 Risk:               OI cap ${p.tier0CapBps / 100}% of SOL behind the price, net exposure ${p.skewCapBps / 100}% of the cap`);
   if (process.env.CONFIRM !== "yes") die("dry run. Check the values above, then re-run with CONFIRM=yes");
 
+  // Admin may already have moved to the multisig (the handover below), so either is fine for the admin field.
+  const adminIs = (a: PublicKey) => a.equals(payer.publicKey) || a.equals(multisig);
   if (!(await connection.getAccountInfo(global))) {
     const sig = await launch.methods
       .initializeGlobal({
@@ -102,18 +130,34 @@ Risk:               OI cap ${p.tier0CapBps / 100}% of SOL behind the price, net 
         launchFeeLamports: new BN(p.launchFeeLamports), graduationFeeLamports: new BN(p.graduationFeeLamports),
         protocolFeeBps: p.protocolFeeBps, creatorFeeBps: p.creatorFeeBps, insuranceFeeBps: p.insuranceFeeBps,
       })
-      .accountsPartial({ authority: payer.publicKey, global, systemProgram: SystemProgram.programId })
+      .accountsPartial({ authority: payer.publicKey, global, programData: launchProgramData, systemProgram: SystemProgram.programId })
       .rpc();
     console.log(`✓ global config ${sig}`);
-  } else console.log("• global config exists; leaving it");
+  } else {
+    const g = await launch.account.global.fetch(global);
+    if (!adminIs(g.authority)) die(`global config admin is ${g.authority.toBase58()}, neither this key nor the multisig`);
+    verifyFields("global config", g, {
+      feeRecipient: fee, insuranceRecipient: insurance, migrationAuthority: migration,
+      launchFeeLamports: p.launchFeeLamports, graduationFeeLamports: p.graduationFeeLamports,
+      protocolFeeBps: p.protocolFeeBps, creatorFeeBps: p.creatorFeeBps, insuranceFeeBps: p.insuranceFeeBps, paused: false,
+    });
+    console.log("• global config exists and matches every field");
+  }
 
   if (!(await connection.getAccountInfo(vault))) {
     const sig = await perps.methods
       .initializeVault(NOBODY)
-      .accountsPartial({ authority: payer.publicKey, vault, usdcMint: USDC_MAINNET, vaultUsdc, tokenProgram: TOKEN_PROGRAM_ID, systemProgram: SystemProgram.programId })
+      .accountsPartial({ authority: payer.publicKey, vault, usdcMint: USDC_MAINNET, programData: perpsProgramData, vaultUsdc, tokenProgram: TOKEN_PROGRAM_ID, systemProgram: SystemProgram.programId })
       .rpc();
     console.log(`✓ vault ${sig}`);
-  } else console.log("• vault exists");
+  } else {
+    const ex = await perps.account.vault.fetch(vault);
+    if (!adminIs(ex.authority)) die(`vault admin is ${ex.authority.toBase58()}, neither this key nor the multisig`);
+    // The risk params are left out on purpose: the steps below set them, so a run that stopped after
+    // creating the vault can resume. The fields that identify whose vault this is are all compared.
+    verifyFields("perps vault", ex, { usdcMint: USDC_MAINNET, priceAuthority: NOBODY, paused: false });
+    console.log("• vault exists and matches every field");
+  }
 
   const v = await perps.account.vault.fetch(vault);
   if (!v.priceAuthority.equals(NOBODY)) {
@@ -136,6 +180,12 @@ Risk:               OI cap ${p.tier0CapBps / 100}% of SOL behind the price, net 
     const pending = pda([Buffer.from("pending_authority")], program.programId);
     await program.methods.proposeAuthority(multisig).accountsPartial({ authority: payer.publicKey, [program === perps ? "vault" : "global"]: admin, pending, systemProgram: SystemProgram.programId }).rpc();
     console.log(`✓ proposed the multisig as admin of the ${name}; approve accept_authority in Squads to finish`);
+  }
+  for (const [name, id] of [["ringside_launch", launch.programId], ["ringside_perps", perps.programId]] as const) {
+    const auth = await upgradeAuthority(connection, id);
+    if (auth?.equals(payer.publicKey)) {
+      console.log(`\n! ${name}'s upgrade authority is still this key. Move it to the multisig now:\n    solana program set-upgrade-authority ${id.toBase58()} --new-upgrade-authority ${multisig.toBase58()} -u mainnet-beta`);
+    }
   }
   console.log("\nDone. Next: seed the vault (deposit_liquidity), start two keepers with PYTH_API_KEY and NETWORK=mainnet, then the relayer.");
 }

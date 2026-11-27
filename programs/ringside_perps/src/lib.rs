@@ -294,6 +294,7 @@ pub mod ringside_perps {
         m.insurance = 0;
         m.creator_fees = 0;
         m.creator_fees_locked = 0;
+        m.pool = Pubkey::default();
         m.reduce_only = false;
         m.adl_mode = false;
         m.bump = ctx.bumps.market;
@@ -529,6 +530,25 @@ pub mod ringside_perps {
         }
         let m = &mut ctx.accounts.market;
         m.tier = 1;
+        // Fix the pool once. Curves migrate into ringside_launch's own pool PDA.
+        // The one exception is a curve that migrated before that change: its
+        // pool is Raydium's canonical one, accepted only while the launch PDA
+        // holds no pool (remaining account 4, a system-owned or empty account).
+        let mint = ctx.accounts.curve.mint;
+        let launch_pool = ringside_launch::launch_pool_address(&mint);
+        let first = ctx.remaining_accounts.first().ok_or(PerpsError::BadPool)?;
+        m.pool = if *first.key == launch_pool {
+            launch_pool
+        } else {
+            let legacy = ctx.remaining_accounts.get(4).ok_or(PerpsError::BadPool)?;
+            require!(
+                *first.key == raydium::canonical_pool_address(mint)
+                    && *legacy.key == launch_pool
+                    && *legacy.owner != raydium::CPMM_PROGRAM,
+                PerpsError::BadPool
+            );
+            *first.key
+        };
         // Validates the pool accounts.
         let view = price_view(m, &ctx.accounts.curve, ctx.remaining_accounts, clock.slot, clock.unix_timestamp)?;
         // The band restarts at the curve's final price. It's fixed by the
@@ -759,7 +779,15 @@ pub fn price_view(m: &Market, curve: &Curve, rem: &[AccountInfo], slot: u64, now
     if m.tier == 0 {
         return Ok(PriceView { twap: curve.twap_q64(slot, TWAP_WINDOW_SLOTS), spot: curve.last_price_q64, sol_reserve: curve.virtual_sol_lamports() });
     }
-    pool_view(curve.mint, rem, now)
+    pool_view(curve.mint, expected_pool(m, curve.mint), rem, now)
+}
+
+/// The pool a Tier 1+ market must price from: the key stored at graduation or,
+/// for markets that graduated before one was stored, Raydium's canonical pool
+/// (where those curves migrated). New markets always store a key, so the
+/// canonical address (which anyone can create) is never accepted for them.
+pub fn expected_pool(m: &Market, mint: Pubkey) -> Pubkey {
+    if m.pool == Pubkey::default() { raydium::canonical_pool_address(mint) } else { m.pool }
 }
 
 fn token_amount(a: &AccountInfo) -> Result<u64> {
@@ -769,14 +797,14 @@ fn token_amount(a: &AccountInfo) -> Result<u64> {
 }
 
 /// Reads a graduated token's price from its Raydium CPMM pool. remaining
-/// accounts: [pool_state, observation_state, token vault, wSOL vault], each
-/// checked against the PDAs derived from the mint.
-pub fn pool_view(mint: Pubkey, rem: &[AccountInfo], now: i64) -> Result<PriceView> {
+/// accounts: [pool_state, observation_state, token vault, wSOL vault]; the pool
+/// must be `pool_key` and the rest are PDAs of Raydium derived from it.
+pub fn pool_view(mint: Pubkey, pool_key: Pubkey, rem: &[AccountInfo], now: i64) -> Result<PriceView> {
     require!(rem.len() >= 4, PerpsError::BadPool);
     let (pool, obs, tok_vault, sol_vault) = (&rem[0], &rem[1], &rem[2], &rem[3]);
     let wsol = anchor_spl::token::spl_token::native_mint::ID;
     let vault_pda = |m: &Pubkey| Pubkey::find_program_address(&[raydium::POOL_VAULT_SEED, pool.key.as_ref(), m.as_ref()], &raydium::CPMM_PROGRAM).0;
-    require!(*pool.key == raydium::pool_address(mint) && *pool.owner == raydium::CPMM_PROGRAM, PerpsError::BadPool);
+    require!(*pool.key == pool_key && *pool.owner == raydium::CPMM_PROGRAM, PerpsError::BadPool);
     require!(*obs.key == raydium::observation_address(*pool.key) && *obs.owner == raydium::CPMM_PROGRAM, PerpsError::BadPool);
     require!(*tok_vault.key == vault_pda(&mint) && *sol_vault.key == vault_pda(&wsol), PerpsError::BadPool);
     let tokens = token_amount(tok_vault)?;
@@ -1083,6 +1111,12 @@ pub struct Market {
     /// Locked 80% of creator fees. APPENDED after `bump`: markets created
     /// before this field existed need `resize_market`.
     pub creator_fees_locked: u64,
+    /// The Raydium pool this market prices from, fixed once at `graduate_market`.
+    /// APPENDED after `creator_fees_locked` (`resize_market` grows older
+    /// markets). All zero = no stored pool: a Tier 0 market, or one that
+    /// graduated before this field existed, whose pool is Raydium's
+    /// canonical address for the mint (see `expected_pool`).
+    pub pool: Pubkey,
 }
 
 #[account]
@@ -1134,6 +1168,15 @@ pub struct InitializeVault<'info> {
     #[account(init, payer = authority, space = 8 + Vault::INIT_SPACE, seeds = [SEED_VAULT], bump)]
     pub vault: Box<Account<'info, Vault>>,
     pub usdc_mint: Box<Account<'info, Mint>>,
+    /// This program's ProgramData account, which the upgradeable loader keeps at
+    /// the PDA of the program id and which names the upgrade authority. Only that
+    /// authority may initialize: whoever calls first becomes vault admin and
+    /// picks the USDC mint.
+    #[account(
+        seeds = [crate::ID.as_ref()], bump, seeds::program = anchor_lang::solana_program::bpf_loader_upgradeable::ID,
+        constraint = program_data.upgrade_authority_address == Some(authority.key()) @ PerpsError::NotUpgradeAuthority
+    )]
+    pub program_data: Account<'info, ProgramData>,
     #[account(init, payer = authority, seeds = [SEED_VAULT_USDC], bump, token::mint = usdc_mint, token::authority = vault)]
     pub vault_usdc: Box<Account<'info, TokenAccount>>,
     pub token_program: Program<'info, Token>,
@@ -1659,6 +1702,8 @@ pub enum PerpsError {
     CreatorFeesLocked,
     #[msg("Creator fees can be forfeited only 30 days after launch, if the curve has not graduated")]
     NotForfeitable,
+    #[msg("Only the program's upgrade authority can initialize it")]
+    NotUpgradeAuthority,
 }
 
 #[cfg(test)]
@@ -1687,7 +1732,7 @@ mod tests {
             mint: Pubkey::default(), curve: Pubkey::default(), creator: Pubkey::default(), tier: 0, created_slot: 0,
             oi_long: 0, oi_short: 0, oi_cap_override: 0, funding_index: 0, last_funding_ts: 0,
             band_anchor_q64: entry, band_anchor_slot: 0, trader_net_pnl: 0, insurance: 0, creator_fees: 0,
-            reduce_only: false, adl_mode: false, bump: 0, creator_fees_locked: 0,
+            reduce_only: false, adl_mode: false, bump: 0, creator_fees_locked: 0, pool: Pubkey::default(),
         };
         let (payout, realized) = settle_close(&p, &m, entry / 10, 3_000_000).unwrap();
         assert_eq!(payout, 0);
@@ -1819,7 +1864,7 @@ mod layout_fixture {
         Market {
             mint: k(1), curve: k(2), creator: k(3), tier: 1, created_slot: 9, oi_long: 10, oi_short: 11, oi_cap_override: 12,
             funding_index: -13, last_funding_ts: 14, band_anchor_q64: 15u128 << 64, band_anchor_slot: 16, trader_net_pnl: -17,
-            insurance: 18, creator_fees: 19, reduce_only: true, adl_mode: true, bump: 254, creator_fees_locked: 20,
+            insurance: 18, creator_fees: 19, reduce_only: true, adl_mode: true, bump: 254, creator_fees_locked: 20, pool: k(21),
         }.try_serialize(&mut out).unwrap();
         println!("MARKET {}", out.iter().map(|b| format!("{b:02x}")).collect::<String>());
         let mut out = Vec::new();
@@ -1832,10 +1877,10 @@ mod layout_fixture {
         println!("ORDER {}", out.iter().map(|b| format!("{b:02x}")).collect::<String>());
     }
     /// `client/scripts/resize-accounts.ts` hard-codes this size to find accounts that
-    /// predate `creator_fees_locked`. Update both together.
+    /// predate the `pool` field. Update both together.
     #[test]
     fn market_account_size_matches_resize_script() {
-        assert_eq!(8 + Market::INIT_SPACE, 228);
+        assert_eq!(8 + Market::INIT_SPACE, 260);
     }
 
 }

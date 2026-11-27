@@ -7,14 +7,14 @@
 //! Raydium config and fee receiver are byte-for-byte copies of the live devnet
 //! accounts.
 
+mod common;
+
 use anchor_lang::{AccountDeserialize, InstructionData, ToAccountMetas};
 use anchor_spl::associated_token::get_associated_token_address;
-use solana_program_test::{processor, ProgramTest, ProgramTestContext};
+use solana_program_test::{processor, ProgramTest};
 use solana_sdk::{
     account::Account,
-    account_info::AccountInfo,
     compute_budget::ComputeBudgetInstruction,
-    entrypoint::ProgramResult,
     instruction::Instruction,
     program_pack::Pack,
     pubkey::Pubkey,
@@ -23,107 +23,16 @@ use solana_sdk::{
     transaction::Transaction,
 };
 
+use common::*;
 use ringside_launch as launch;
-use ringside_perps as perps;
 use ringside_launch::raydium;
-
-const SOL: u64 = 1_000_000_000;
-
-fn launch_entry(p: &Pubkey, a: &[AccountInfo], d: &[u8]) -> ProgramResult {
-    let a: &[AccountInfo] = unsafe { std::mem::transmute(a) };
-    launch::entry(p, a, d)
-}
-fn perps_entry(p: &Pubkey, a: &[AccountInfo], d: &[u8]) -> ProgramResult {
-    let a: &[AccountInfo] = unsafe { std::mem::transmute(a) };
-    perps::entry(p, a, d)
-}
-fn cpmm_entry(p: &Pubkey, a: &[AccountInfo], d: &[u8]) -> ProgramResult {
-    let a: &[AccountInfo] = unsafe { std::mem::transmute(a) };
-    raydium_cp_swap::entry(p, a, d)
-}
-
-fn b64(s: &str) -> Vec<u8> {
-    // Small decoder so the test has no extra dependency.
-    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = Vec::new();
-    let (mut buf, mut bits) = (0u32, 0u32);
-    for c in s.bytes().filter(|c| *c != b'=') {
-        buf = (buf << 6) | T.iter().position(|x| *x == c).unwrap() as u32;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((buf >> bits) as u8);
-            buf &= (1 << bits) - 1;
-        }
-    }
-    out
-}
-
-/// Live devnet copies (fetched 2026-11-25).
-const AMM_CONFIG_0: &str = "2vQhaMvLK2/9AAAAxAkAAAAAAADA1AEAAAAAAECcAAAAAAAAgNHwCAAAAAC4mJaRONvzA6sDp2AE1wRgqmmZIOQxnfZ7bFgjjmAnrLiYlpE42/MDqwOnYATXBGCqaZkg5DGd9ntsWCOOYCesxAkAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
-const CREATE_POOL_FEE: &str = "BpuIV/6rgYT7aH9jRhjANdrEOdwa6ztVmKDwAAAAAAG4mJeWr6vW5z/gclM0sV3uNkK57dEt4kypM71w+PadqUhQxv0KAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQEAAAA4thYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-
-async fn send(ctx: &mut ProgramTestContext, ixs: &[Instruction], signers: &[&Keypair]) {
-    let payer = ctx.payer.insecure_clone();
-    let mut all = vec![&payer];
-    all.extend_from_slice(signers);
-    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
-    let tx = Transaction::new_signed_with_payer(ixs, Some(&payer.pubkey()), &all, bh);
-    ctx.banks_client.process_transaction(tx).await.unwrap();
-}
-
-async fn token_amount(ctx: &mut ProgramTestContext, key: Pubkey) -> u64 {
-    let acc = ctx.banks_client.get_account(key).await.unwrap().expect("token account");
-    spl_token::state::Account::unpack(&acc.data).unwrap().amount
-}
-
-/// Stand-in for Metaplex Token Metadata in native tests: checks what Ringside
-/// controls (CreateMetadataAccountV3 tag, metadata PDA, signers) and creates
-/// the metadata account. The real program accepted the same bytes in a devnet
-/// simulation (see README).
-fn mock_metaplex(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
-    use solana_sdk::program::invoke_signed;
-    use solana_sdk::program_error::ProgramError;
-    if data.first() != Some(&33) || accounts.len() < 6 {
-        return Err(ProgramError::InvalidInstructionData);
-    }
-    let (metadata, mint, mint_auth, payer, update_auth, system) = (&accounts[0], &accounts[1], &accounts[2], &accounts[3], &accounts[4], &accounts[5]);
-    let (pda, bump) = Pubkey::find_program_address(&[b"metadata", program_id.as_ref(), mint.key.as_ref()], program_id);
-    if *metadata.key != pda || !mint_auth.is_signer || !payer.is_signer || !update_auth.is_signer || !metadata.data_is_empty() {
-        return Err(ProgramError::InvalidArgument);
-    }
-    let space = data.len();
-    invoke_signed(
-        &solana_sdk::system_instruction::create_account(payer.key, metadata.key, 10_000_000, space as u64, program_id),
-        &[payer.clone(), metadata.clone(), system.clone()],
-        &[&[b"metadata", program_id.as_ref(), mint.key.as_ref(), &[bump]]],
-    )?;
-    metadata.try_borrow_mut_data()?.copy_from_slice(data);
-    Ok(())
-}
-fn metaplex_entry(p: &Pubkey, a: &[AccountInfo], d: &[u8]) -> ProgramResult {
-    let a: &[AccountInfo] = unsafe { std::mem::transmute(a) };
-    mock_metaplex(p, a, d)
-}
+use ringside_perps as perps;
 
 #[tokio::test]
 async fn sold_out_curve_graduates_into_a_raydium_pool_with_lp_burned() {
-    let mut pt = ProgramTest::default();
-    pt.prefer_bpf(false);
-    pt.add_program("ringside_launch", launch::ID, processor!(launch_entry));
-    pt.add_program("ringside_perps", perps::ID, processor!(perps_entry));
-    pt.add_program("mpl_token_metadata", launch::metaplex::PROGRAM, processor!(metaplex_entry));
-    pt.add_program("raydium_cp_swap", raydium::CPMM_PROGRAM, processor!(cpmm_entry));
-    pt.add_account(raydium::AMM_CONFIG, Account { lamports: 2_533_440, data: b64(AMM_CONFIG_0), owner: raydium::CPMM_PROGRAM, ..Account::default() });
-    pt.add_account(raydium::CREATE_POOL_FEE, Account { lamports: 1_488_440 + 2_246_230_560_840 /* rent reserve + recorded amount */, data: b64(CREATE_POOL_FEE), owner: spl_token::ID, ..Account::default() });
-    let mut native = vec![0u8; spl_token::state::Mint::LEN];
-    spl_token::state::Mint { decimals: 9, is_initialized: true, ..Default::default() }.pack_into_slice(&mut native);
-    pt.add_account(spl_token::native_mint::ID, Account { lamports: 1_000_000_000, data: native, owner: spl_token::ID, ..Account::default() });
     let authority = Keypair::new();
     let fee_recipient = Pubkey::new_unique();
-    for k in [authority.pubkey(), fee_recipient] {
-        pt.add_account(k, Account { lamports: 10 * SOL, owner: system_program::ID, ..Account::default() });
-    }
+    let pt = program_test(&authority, fee_recipient);
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.pubkey();
 
@@ -131,7 +40,7 @@ async fn sold_out_curve_graduates_into_a_raydium_pool_with_lp_burned() {
     let (global, _) = Pubkey::find_program_address(&[launch::SEED_GLOBAL], &launch::ID);
     send(&mut ctx, &[Instruction {
         program_id: launch::ID,
-        accounts: launch::accounts::InitializeGlobal { authority: authority.pubkey(), global, system_program: system_program::ID }.to_account_metas(None),
+        accounts: launch::accounts::InitializeGlobal { authority: authority.pubkey(), global, program_data: program_data_of(launch::ID), system_program: system_program::ID }.to_account_metas(None),
         data: launch::instruction::InitializeGlobal { params: launch::GlobalParams {
             fee_recipient, insurance_recipient: fee_recipient, migration_authority: fee_recipient,
             launch_fee_lamports: SOL / 100, graduation_fee_lamports: SOL / 20,
@@ -172,7 +81,7 @@ async fn sold_out_curve_graduates_into_a_raydium_pool_with_lp_burned() {
     send(&mut ctx, &[
         Instruction {
             program_id: perps::ID,
-            accounts: perps::accounts::InitializeVault { authority: authority.pubkey(), vault: perps_vault, usdc_mint: usdc.pubkey(), vault_usdc, token_program: spl_token::ID, system_program: system_program::ID }.to_account_metas(None),
+            accounts: perps::accounts::InitializeVault { authority: authority.pubkey(), vault: perps_vault, usdc_mint: usdc.pubkey(), program_data: program_data_of(perps::ID), vault_usdc, token_program: spl_token::ID, system_program: system_program::ID }.to_account_metas(None),
             data: perps::instruction::InitializeVault { price_authority: authority.pubkey() }.data(),
         },
         Instruction {
@@ -207,7 +116,7 @@ async fn sold_out_curve_graduates_into_a_raydium_pool_with_lp_burned() {
     // Migrate (anyone can call it).
     let wsol = spl_token::native_mint::ID;
     let (t0, t1) = raydium::order(m, wsol);
-    let pool = raydium::pool_address(m);
+    let pool = launch::launch_pool_address(&m);
     let (cpmm_auth, _) = Pubkey::find_program_address(&[raydium::AUTH_SEED], &raydium::CPMM_PROGRAM);
     let (lp_mint, _) = Pubkey::find_program_address(&[raydium::POOL_LP_MINT_SEED, pool.as_ref()], &raydium::CPMM_PROGRAM);
     let vault = |t: Pubkey| Pubkey::find_program_address(&[raydium::POOL_VAULT_SEED, pool.as_ref(), t.as_ref()], &raydium::CPMM_PROGRAM).0;
@@ -336,6 +245,8 @@ async fn sold_out_curve_graduates_into_a_raydium_pool_with_lp_burned() {
     send(&mut ctx, &[grad.clone()], &[]).await;
     let mk = market_state(ctx.banks_client.get_account(market).await.unwrap().unwrap().data);
     assert_eq!(mk.tier, 1);
+    assert_eq!(mk.pool, pool, "the market stores the launch program's pool");
+    assert_ne!(pool, raydium::canonical_pool_address(m), "not Raydium's canonical address");
     let reg: perps::Registry = perps::Registry::try_deserialize(&mut ctx.banks_client.get_account(registry).await.unwrap().unwrap().data.as_slice()).unwrap();
     assert_eq!(reg.live_tier0, 0, "graduation frees the Tier 0 slot");
     assert!(!mk.reduce_only, "graduated market trades again");

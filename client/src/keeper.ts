@@ -48,7 +48,7 @@ import { createHash } from "node:crypto";
 import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import { PythPoster } from "./pyth.js";
 import { Monitor, FILL_LAG_SLOTS, LOW_SOL_LAMPORTS, STALE_PRICE_S, clearGone, crankConditions, pruneCleared, recordAttempt, stuckTier0, tier0Conditions, type Condition, type Failures } from "./monitor.js";
-import { CREATOR_FEE_FORFEIT_SECONDS, LAUNCH_PROGRAM, type CurveState, decodeCurve, decodeFeeRecipient, graduateMarketIx, migrateIx, priceAccounts, retireMarketIx } from "./graduation.js";
+import { CREATOR_FEE_FORFEIT_SECONDS, LAUNCH_PROGRAM, type CurveState, decodeCurve, decodeFeeRecipient, CPMM_PROGRAM, canonicalPoolAddress, graduateMarketIx, launchPoolAddress, marketPoolAddress, migrateIx, priceAccounts, retireMarketIx } from "./graduation.js";
 import { installLogRedaction } from "./logredact.js";
 
 export const PERPS_PROGRAM = address(process.env.PERPS_PROGRAM_ID ?? "DsZ69w3q25nRmAzJCRBMLbwZWN6NyVbYipTWsCAUsg1F");
@@ -107,13 +107,22 @@ class Reader {
   i64() { const v = this.view().getBigInt64(this.o, true); this.o += 8; return v; }
   /** Reads a u64, or 0 when the account is too short to hold it (not yet resized). */
   u64OrZero() { return this.o + 8 <= this.d.byteLength ? this.u64() : 0n; }
+  /** A pubkey, or null when the account is too short to hold it or it is all zeros. */
+  pubkeyOrNull(): Address | null {
+    if (this.o + 32 > this.d.byteLength) return null;
+    const b = this.d.subarray(this.o, this.o + 32);
+    const a = this.pubkey();
+    return b.every((x) => x === 0) ? null : a;
+  }
   u128() { const lo = this.u64(); const hi = this.u64(); return (hi << 64n) | lo; }
   i128() { const lo = this.u64(); const hi = this.i64(); return (hi << 64n) + lo; }
 }
 
 export interface OrderRequest { key: Address; owner: Address; market: Address; side: number; kind: number; requestSlot: bigint; rentPayer: Address }
 export interface Position { key: Address; owner: Address; market: Address; side: number; collateral: bigint; sizeUsd: bigint; entryQ64: bigint }
-export interface Market { key: Address; mint: Address; curve: Address; tier: number; reduceOnly: boolean; adlMode: boolean; bandAnchorQ64: bigint; creatorFeesLocked: bigint }
+export interface Market { key: Address; mint: Address; curve: Address; tier: number; reduceOnly: boolean; adlMode: boolean; bandAnchorQ64: bigint; creatorFeesLocked: bigint;
+  /** The Raydium pool fixed at graduate_market; null when none is stored (Tier 0, graduated before the field, or not yet resized). */
+  pool: Address | null }
 
 export function decodeOrder(key: Address, d: Uint8Array): OrderRequest {
   const r = new Reader(d);
@@ -141,7 +150,8 @@ export function decodeMarket(key: Address, d: Uint8Array): Market {
   r.u64(); r.i128(); r.u64(); r.u64(); // band_anchor_slot, trader_net_pnl, insurance, creator_fees
   const reduceOnly = r.bool(), adlMode = r.bool();
   r.u8(); // bump
-  return { key, mint, curve, tier, reduceOnly, adlMode, bandAnchorQ64, creatorFeesLocked: r.u64OrZero() };
+  const creatorFeesLocked = r.u64OrZero();
+  return { key, mint, curve, tier, reduceOnly, adlMode, bandAnchorQ64, creatorFeesLocked, pool: r.pubkeyOrNull() };
 }
 
 /**
@@ -444,7 +454,7 @@ export class Keeper {
 
   /** Graduated markets price from their Raydium pool, passed as remaining accounts. */
   private async poolTail(m: Market) {
-    return m.tier >= 1 ? priceAccounts(m.mint) : [];
+    return m.tier >= 1 ? priceAccounts(m.mint, await marketPoolAddress(m.mint, m.pool)) : [];
   }
 
   private async launchCurves(): Promise<CurveState[]> {
@@ -506,8 +516,12 @@ export class Keeper {
     for (const m of this.markets.values()) {
       if (m.tier !== 0 || !migrated.has(m.curve)) continue;
       await this.tracked(`graduate:${m.key}`, async () => {
-        await this.sendIx(await graduateMarketIx(m.key, m.curve, m.mint));
+        // A curve that migrated before the launch program's pool PDA existed sits in Raydium's canonical pool.
+        const launchPool = await this.rpc.getAccountInfo(await launchPoolAddress(m.mint), { encoding: "base64" }).send();
+        const legacy = launchPool.value === null || launchPool.value.owner !== CPMM_PROGRAM;
+        await this.sendIx(await graduateMarketIx(m.key, m.curve, m.mint, legacy));
         m.tier = 1;
+        m.pool = legacy ? await canonicalPoolAddress(m.mint) : await launchPoolAddress(m.mint); // what graduate_market stored
         console.log(`[keeper] market ${m.key} now prices from its Raydium pool`);
       });
     }

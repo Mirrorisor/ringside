@@ -154,7 +154,7 @@ const st: {
   slot: bigint; vaultUsdc: number; walletSol: number; traderSol: number; traderUsdc: number; walletTokens: number;
   hist: { spot: number; mark: number; lo: number; hi: number }[]; mode: "perp" | "spot"; side: 0 | 1; busy: boolean;
   /** Raydium pool of a graduated token: vault balances and the raw ObservationState. */
-  pool: { tokens: bigint; sol: bigint; obs: Buffer } | null;
+  pool: { addr: PublicKey; tokens: bigint; sol: bigint; obs: Buffer } | null;
   /** Curves this wallet created, with each one's perp market (null when it has none). */
   mine: { curve: any; market: any | null }[];
 } = {
@@ -198,9 +198,30 @@ const clampBand = (p: bigint, a: bigint) => {
   return p < lo ? lo : p > hi ? hi : p;
 };
 // --- Raydium pool (graduated tokens) ----------------------------------------
-function poolKeys(mint: PublicKey) {
-  const [t0, t1] = mint.toBuffer().compare(NATIVE_MINT.toBuffer()) < 0 ? [mint, NATIVE_MINT] : [NATIVE_MINT, mint];
-  const pool = pda([enc("pool"), AMM_CONFIG.toBuffer(), t0.toBuffer(), t1.toBuffer()], CPMM);
+const orderedMints = (mint: PublicKey) => (mint.toBuffer().compare(NATIVE_MINT.toBuffer()) < 0 ? [mint, NATIVE_MINT] : [NATIVE_MINT, mint]);
+/** migrate creates the pool at a PDA of the launch program, so nobody can create it first (mirrors launch_pool_address). */
+const launchPool = (mint: PublicKey) => pda([enc("raydium_pool"), mint.toBuffer()], launch.programId);
+/** Raydium's canonical pool address: only tokens that graduated before launchPool existed live there. */
+const canonicalPool = (mint: PublicKey) => {
+  const [t0, t1] = orderedMints(mint);
+  return pda([enc("pool"), AMM_CONFIG.toBuffer(), t0.toBuffer(), t1.toBuffer()], CPMM);
+};
+const MARKET_POOL_OFFSET = 228; // Market::pool is appended after the pre-`pool` layout (228 bytes incl. discriminator)
+/**
+ * The pool a token trades in: the one its market stored at graduation, else the launch program's pool when that
+ * exists, else Raydium's canonical one (graduated before either). Read from raw bytes because the IDL may predate the field.
+ */
+async function resolvePool(mint: PublicKey, marketData: Buffer | null): Promise<PublicKey> {
+  if (marketData && marketData.length >= MARKET_POOL_OFFSET + 32) {
+    const stored = new PublicKey(marketData.subarray(MARKET_POOL_OFFSET, MARKET_POOL_OFFSET + 32));
+    if (!stored.equals(PublicKey.default)) return stored;
+  }
+  const ours = launchPool(mint);
+  const info = await connection.getAccountInfo(ours);
+  return info && info.owner.equals(CPMM) ? ours : canonicalPool(mint);
+}
+function poolKeys(mint: PublicKey, pool: PublicKey) {
+  const [t0] = orderedMints(mint);
   const vault = (m: PublicKey) => pda([enc("pool_vault"), pool.toBuffer(), m.toBuffer()], CPMM);
   return {
     pool, tokenVault: vault(mint), solVault: vault(NATIVE_MINT), tokenIs0: t0.equals(mint),
@@ -243,7 +264,7 @@ function spotNow(): bigint {
 const perpSpot = () => (graduated() ? spotNow() : spotQ(st.curve));
 function twapNow(c: any, slot: bigint): bigint {
   if (graduated()) {
-    const k = poolKeys(c.mint);
+    const k = poolKeys(c.mint, st.pool!.addr);
     return poolTwapQ(st.pool!.obs, k.tokenIs0, (st.pool!.sol << 32n) / st.pool!.tokens, BigInt(Math.floor(Date.now() / 1000)));
   }
   return twapQ(c, slot);
@@ -337,9 +358,10 @@ async function tick() {
     st.orders = { 0: !!o0, 1: !!o1 };
     st.pool = null;
     if (st.curve?.migrated) {
-      const k = poolKeys(mint);
+      const addr = await resolvePool(mint, mI?.data ?? null);
+      const k = poolKeys(mint, addr);
       const [tv, sv, ob] = await connection.getMultipleAccountsInfo([k.tokenVault, k.solVault, k.observation]);
-      if (tv && sv && ob) st.pool = { tokens: BigInt(tokenAmount(tv.data)), sol: BigInt(tokenAmount(sv.data)), obs: ob.data };
+      if (tv && sv && ob) st.pool = { addr, tokens: BigInt(tokenAmount(tv.data)), sol: BigInt(tokenAmount(sv.data)), obs: ob.data };
     }
     if (st.curve && st.market) {
       const { mark, anchor } = markQ(st.market, st.curve, st.slot);
@@ -681,7 +703,7 @@ function tradeAccounts(mint: PublicKey) {
 
 /** Raydium CPMM swap for graduated tokens; wraps and unwraps SOL around it. */
 async function raydiumSwap(mint: PublicKey, buying: boolean, amountIn: bigint) {
-  const k = poolKeys(mint);
+  const k = poolKeys(mint, st.pool && st.selected?.equals(mint) ? st.pool.addr : await resolvePool(mint, null));
   const me = wallet.publicKey;
   const wsol = getAssociatedTokenAddressSync(NATIVE_MINT, me), tok = getAssociatedTokenAddressSync(mint, me);
   const data = Buffer.alloc(24);

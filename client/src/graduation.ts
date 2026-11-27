@@ -56,9 +56,31 @@ export interface PoolAccounts {
   token1: Address;
 }
 
-export async function poolAccounts(mint: Address): Promise<PoolAccounts> {
+/**
+ * Where `migrate` creates a token's Raydium pool: a PDA of the launch program (seeds `raydium_pool`, mint),
+ * not Raydium's canonical pool address, which anyone could create first. Mirrors `launch_pool_address`.
+ */
+export const launchPoolAddress = (mint: Address) => pda(LAUNCH_PROGRAM, [enc.encode("raydium_pool"), bytes(mint)]);
+
+/**
+ * Raydium's canonical pool address for the mint. Only tokens that graduated before `launchPoolAddress`
+ * existed live there (their markets have no stored pool); never use it for a new graduation.
+ */
+export async function canonicalPoolAddress(mint: Address): Promise<Address> {
   const [token0, token1] = orderMints(mint, WSOL_MINT);
-  const pool = await pda(CPMM_PROGRAM, [enc.encode("pool"), bytes(AMM_CONFIG), bytes(token0), bytes(token1)]);
+  return pda(CPMM_PROGRAM, [enc.encode("pool"), bytes(AMM_CONFIG), bytes(token0), bytes(token1)]);
+}
+
+/**
+ * The pool a market prices from: its stored key (`Market.pool`), or Raydium's canonical pool when none is stored
+ * (a market that graduated before the field existed). `stored` is `Market.pool`, null when unset or not yet resized.
+ */
+export const marketPoolAddress = async (mint: Address, stored: Address | null): Promise<Address> => stored ?? canonicalPoolAddress(mint);
+
+/** Every account of a token's pool. `pool` defaults to the launch program's pool PDA. */
+export async function poolAccounts(mint: Address, poolAddress?: Address): Promise<PoolAccounts> {
+  const [token0, token1] = orderMints(mint, WSOL_MINT);
+  const pool = poolAddress ?? (await launchPoolAddress(mint));
   const vault = (m: Address) => pda(CPMM_PROGRAM, [enc.encode("pool_vault"), bytes(pool), bytes(m)]);
   return {
     pool,
@@ -73,8 +95,8 @@ export async function poolAccounts(mint: Address): Promise<PoolAccounts> {
 }
 
 /** The four accounts perps reads a graduated market's price from, in program order. */
-export async function priceAccounts(mint: Address) {
-  const p = await poolAccounts(mint);
+export async function priceAccounts(mint: Address, pool?: Address) {
+  const p = await poolAccounts(mint, pool);
   return [p.pool, p.observation, p.tokenVault, p.solVault].map((a) => ({ address: a, role: AccountRole.READONLY }));
 }
 
@@ -93,7 +115,7 @@ export async function migrateIx(payer: Address, mint: Address, feeRecipient: Add
       { address: payer, role: AccountRole.WRITABLE_SIGNER },
       ro(global), w(curve), w(mint), ro(WSOL_MINT), w(await ata(curve, mint)), w(feeRecipient), w(poolCreator),
       w(await ata(poolCreator, mint)), w(await ata(poolCreator, WSOL_MINT)),
-      ro(CPMM_PROGRAM), ro(AMM_CONFIG), ro(p.authority), w(p.pool), w(p.lpMint), w(await ata(poolCreator, p.lpMint)),
+      ro(CPMM_PROGRAM), ro(AMM_CONFIG), ro(p.authority), w(p.pool) /* the program signs for it */, w(p.lpMint), w(await ata(poolCreator, p.lpMint)),
       w(vault(p.token0)), w(vault(p.token1)), w(CREATE_POOL_FEE), w(p.observation),
       ro(TOKEN_PROGRAM), ro(ATA_PROGRAM), ro(SYSTEM_PROGRAM), ro(RENT_SYSVAR),
     ],
@@ -104,10 +126,17 @@ export async function migrateIx(payer: Address, mint: Address, feeRecipient: Add
 export const registryAddress = () => pda(PERPS_PROGRAM, [enc.encode("registry")]);
 const retiredAddress = (market: Address) => pda(PERPS_PROGRAM, [enc.encode("retired"), bytes(market)]);
 
-export async function graduateMarketIx(market: Address, curve: Address, mint: Address): Promise<Instruction> {
+/**
+ * `legacyPool`: the curve migrated before the launch program's own pool PDA existed, so its pool is Raydium's
+ * canonical one. perps then also wants the (empty) launch pool address as a fifth pool account, to confirm it.
+ */
+export async function graduateMarketIx(market: Address, curve: Address, mint: Address, legacyPool = false): Promise<Instruction> {
+  const tail = legacyPool
+    ? [...(await priceAccounts(mint, await canonicalPoolAddress(mint))), ro(await launchPoolAddress(mint))]
+    : await priceAccounts(mint);
   return {
     programAddress: PERPS_PROGRAM,
-    accounts: [w(market), ro(curve), w(await registryAddress()), ro(await retiredAddress(market)), ...(await priceAccounts(mint))],
+    accounts: [w(market), ro(curve), w(await registryAddress()), ro(await retiredAddress(market)), ...tail],
     data: ixDisc("graduate_market"),
   };
 }

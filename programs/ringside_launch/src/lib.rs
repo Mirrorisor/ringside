@@ -42,6 +42,16 @@ pub const SEED_GLOBAL: &[u8] = b"global";
 pub const SEED_CURVE: &[u8] = b"curve";
 pub const SEED_DEV_LOCK: &[u8] = b"dev_lock";
 pub const SEED_POOL_CREATOR: &[u8] = b"pool_creator";
+/// The token's Raydium pool lives at a PDA of THIS program, not at Raydium's
+/// canonical pool address (which anyone can create first). Raydium accepts a
+/// non-canonical pool account when it signs, and only this program can sign
+/// for this address.
+pub const SEED_RAYDIUM_POOL: &[u8] = b"raydium_pool";
+
+/// Address of the Raydium pool `migrate` creates for `mint`.
+pub fn launch_pool_address(mint: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[SEED_RAYDIUM_POOL, mint.as_ref()], &crate::ID).0
+}
 /// Lamports kept back from the raised SOL to pay Raydium's create-pool fee
 /// (0.15 SOL) and the rent for the pool's accounts.
 pub const POOL_CREATION_RESERVE: u64 = 200_000_000;
@@ -104,7 +114,10 @@ pub mod raydium {
     pub fn order(a: Pubkey, b: Pubkey) -> (Pubkey, Pubkey) {
         if a < b { (a, b) } else { (b, a) }
     }
-    pub fn pool_address(mint: Pubkey) -> Pubkey {
+    /// Raydium's CANONICAL pool address for the mint. Anyone can create a pool
+    /// there, so Ringside does not use it for new graduations (see
+    /// `launch_pool_address`); only markets graduated before that change still read it.
+    pub fn canonical_pool_address(mint: Pubkey) -> Pubkey {
         let (t0, t1) = order(mint, anchor_spl::token::spl_token::native_mint::ID);
         Pubkey::find_program_address(&[POOL_SEED, AMM_CONFIG.as_ref(), t0.as_ref(), t1.as_ref()], &CPMM_PROGRAM).0
     }
@@ -492,7 +505,7 @@ pub mod ringside_launch {
         migrate_tokens(&ctx.accounts, tokens_to_pool, &[&[SEED_CURVE, mint.as_ref(), &[curve_bump]]])?;
         let wsol = anchor_spl::token::spl_token::native_mint::ID;
         let (amount_0, amount_1) = if mint < wsol { (tokens_to_pool, pool_sol) } else { (pool_sol, tokens_to_pool) };
-        create_raydium_pool(&ctx.accounts, mint < wsol, amount_0, amount_1, creator_seeds)?;
+        create_raydium_pool(&ctx.accounts, mint < wsol, amount_0, amount_1, creator_seeds, ctx.bumps.pool_state)?;
         let lp_amount = burn_lp_and_sweep(&ctx.accounts, creator_seeds)?;
 
         emit!(Migrated { mint, sol_to_pool: pool_sol, tokens_to_pool, pool: ctx.accounts.pool_state.key(), lp_burned: lp_amount });
@@ -792,6 +805,15 @@ pub struct InitializeGlobal<'info> {
     pub authority: Signer<'info>,
     #[account(init, payer = authority, space = 8 + Global::INIT_SPACE, seeds = [SEED_GLOBAL], bump)]
     pub global: Account<'info, Global>,
+    /// This program's ProgramData account, which the upgradeable loader keeps at
+    /// the PDA of the program id and which names the upgrade authority. Only that
+    /// authority may initialize: whoever calls first sets the fee recipients and
+    /// becomes admin.
+    #[account(
+        seeds = [crate::ID.as_ref()], bump, seeds::program = anchor_lang::solana_program::bpf_loader_upgradeable::ID,
+        constraint = program_data.upgrade_authority_address == Some(authority.key()) @ LaunchError::NotUpgradeAuthority
+    )]
+    pub program_data: Account<'info, ProgramData>,
     pub system_program: Program<'info, System>,
 }
 
@@ -1029,9 +1051,10 @@ fn migrate_tokens<'info>(a: &Migrate<'info>, tokens_to_pool: u64, curve_seeds: &
     )
 }
 
-/// Raydium CPMM initialize, signed by the pool-creator PDA.
+/// Raydium CPMM initialize, signed by the pool-creator PDA and by the pool
+/// account itself (a PDA of this program, see `SEED_RAYDIUM_POOL`).
 #[inline(never)]
-fn create_raydium_pool<'info>(a: &Migrate<'info>, mint_first: bool, amount_0: u64, amount_1: u64, creator_seeds: &[&[&[u8]]]) -> Result<()> {
+fn create_raydium_pool<'info>(a: &Migrate<'info>, mint_first: bool, amount_0: u64, amount_1: u64, creator_seeds: &[&[&[u8]]], pool_bump: u8) -> Result<()> {
     let (mint_0, mint_1) = if mint_first { (a.mint.to_account_info(), a.wsol_mint.to_account_info()) } else { (a.wsol_mint.to_account_info(), a.mint.to_account_info()) };
     let (creator_0, creator_1) = if mint_first {
         (a.creator_token.to_account_info(), a.creator_wsol.to_account_info())
@@ -1042,7 +1065,7 @@ fn create_raydium_pool<'info>(a: &Migrate<'info>, mint_first: bool, amount_0: u6
         AccountMeta::new(a.pool_creator.key(), true),
         AccountMeta::new_readonly(a.amm_config.key(), false),
         AccountMeta::new_readonly(a.cpmm_authority.key(), false),
-        AccountMeta::new(a.pool_state.key(), false),
+        AccountMeta::new(a.pool_state.key(), true),
         AccountMeta::new_readonly(mint_0.key(), false),
         AccountMeta::new_readonly(mint_1.key(), false),
         AccountMeta::new(a.lp_mint.key(), false),
@@ -1072,10 +1095,12 @@ fn create_raydium_pool<'info>(a: &Migrate<'info>, mint_first: bool, amount_0: u6
         a.observation_state.to_account_info(), a.token_program.to_account_info(), a.associated_token_program.to_account_info(),
         a.system_program.to_account_info(), a.rent.to_account_info(), a.cpmm_program.to_account_info(),
     ];
+    let mint_key = a.mint.key();
+    let pool_seeds: &[&[u8]] = &[SEED_RAYDIUM_POOL, mint_key.as_ref(), &[pool_bump]];
     anchor_lang::solana_program::program::invoke_signed(
         &anchor_lang::solana_program::instruction::Instruction { program_id: raydium::CPMM_PROGRAM, accounts: metas, data },
         &infos,
-        creator_seeds,
+        &[creator_seeds[0], pool_seeds],
     )?;
     Ok(())
 }
@@ -1152,8 +1177,9 @@ pub struct Migrate<'info> {
     /// CHECK: Raydium vault and LP mint authority PDA.
     #[account(seeds = [raydium::AUTH_SEED], bump, seeds::program = raydium::CPMM_PROGRAM)]
     pub cpmm_authority: UncheckedAccount<'info>,
-    /// CHECK: pool PDA, checked against the mint.
-    #[account(mut, address = raydium::pool_address(mint.key()))]
+    /// CHECK: this program's pool PDA for the mint (`launch_pool_address`); it
+    /// signs Raydium's initialize, so nobody else can create the pool first.
+    #[account(mut, seeds = [SEED_RAYDIUM_POOL, mint.key().as_ref()], bump)]
     pub pool_state: UncheckedAccount<'info>,
     /// CHECK: created by Raydium.
     #[account(mut, seeds = [raydium::POOL_LP_MINT_SEED, pool_state.key().as_ref()], bump, seeds::program = raydium::CPMM_PROGRAM)]
@@ -1308,6 +1334,8 @@ pub enum LaunchError {
     CreatorFeesLocked,
     #[msg("Creator fees can be forfeited only 30 days after launch, if the curve has not graduated")]
     NotForfeitable,
+    #[msg("Only the program's upgrade authority can initialize it")]
+    NotUpgradeAuthority,
 }
 
 #[cfg(test)]

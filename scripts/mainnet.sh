@@ -38,13 +38,15 @@ cat <<'MSG'
 ✓ Mainnet build is clean. Remaining steps (see the spec's Mainnet launch checklist):
 
   1. Audits signed off on exactly this build (compare the .so hashes: sha256sum target/deploy/*.so).
-  2. Deploy each program with a funded deployer:
+  2. Deploy each program with a funded deployer (the deployer key is the upgrade authority until step 4):
        solana program deploy target/deploy/ringside_launch.so --program-id target/deploy/ringside_launch-keypair.json -u mainnet-beta
        solana program deploy target/deploy/ringside_perps.so  --program-id target/deploy/ringside_perps-keypair.json  -u mainnet-beta
-  3. Move both upgrade authorities to the Squads multisig:
-       solana program set-upgrade-authority <PROGRAM_ID> --new-upgrade-authority <SQUADS_VAULT> -u mainnet-beta
-  4. Configure (dry run first, then CONFIRM=yes):
+  3. Configure FIRST (dry run, then CONFIRM=yes), with the deployer key: initialize_global and
+     initialize_vault accept only the programs' upgrade authority, and the script checks every field
+     of anything that already exists:
        cd client && ANCHOR_PROVIDER_URL=<mainnet RPC> FEE_RECIPIENT=<treasury> INSURANCE_RECIPIENT=<insurance> \
-         npx tsx scripts/init-mainnet.ts
+         MULTISIG=<SQUADS_VAULT> npx tsx scripts/init-mainnet.ts
+  4. Then move both upgrade authorities to the Squads multisig:
+       solana program set-upgrade-authority <PROGRAM_ID> --new-upgrade-authority <SQUADS_VAULT> -u mainnet-beta
   5. Seed the vault, start two keepers (PYTH_API_KEY, NETWORK=mainnet) and the relayer, then open the beta.
 MSG

@@ -35,6 +35,28 @@ fn perps_entry(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     perps::entry(program_id, accounts, data)
 }
 
+/// Creates the ProgramData account the upgradeable loader keeps for a deployed
+/// program (at the PDA of the program id, owned by the loader), naming
+/// `authority` as upgrade authority. The programs run natively in program-test,
+/// which creates none of its own; their `initialize_*` instructions read it
+/// exactly as on chain (same code, same account layout).
+fn program_data_account(authority: Option<Pubkey>) -> Account {
+    use solana_sdk::bpf_loader_upgradeable::{self, UpgradeableLoaderState};
+    let mut data = bincode::serialize(&UpgradeableLoaderState::ProgramData { slot: 0, upgrade_authority_address: authority }).unwrap();
+    data.extend_from_slice(&[0u8; 32]); // stand-in for the ELF bytes
+    Account { lamports: 1_000_000_000, data, owner: bpf_loader_upgradeable::id(), executable: false, rent_epoch: 0 }
+}
+
+/// Changes a running bank's upgrade authority for `program_id` (None = frozen).
+fn set_upgrade_authority(ctx: &mut ProgramTestContext, program_id: Pubkey, authority: Option<Pubkey>) {
+    ctx.set_account(&program_data_of(program_id), &solana_sdk::account::AccountSharedData::from(program_data_account(authority)));
+}
+
+/// The ProgramData address of `program_id`.
+fn program_data_of(program_id: Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[program_id.as_ref()], &solana_sdk::bpf_loader_upgradeable::id()).0
+}
+
 struct Env {
     ctx: ProgramTestContext,
     authority: Keypair,
@@ -54,6 +76,9 @@ async fn setup() -> Env {
     let (fee_recipient, insurance, migration) = (Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique());
     for k in [authority.pubkey(), fee_recipient, insurance, migration] {
         pt.add_account(k, Account { lamports: 100 * SOL, owner: system_program::ID, ..Account::default() });
+    }
+    for id in [launch::ID, perps::ID] {
+        pt.add_account(program_data_of(id), program_data_account(Some(authority.pubkey())));
     }
     let ctx = pt.start_with_context().await;
     Env { ctx, authority, fee_recipient, insurance, migration, usdc_mint: Keypair::new() }
@@ -207,7 +232,7 @@ async fn launch_trade_and_perps_end_to_end() {
     env.send(
         &[Instruction {
             program_id: launch::ID,
-            accounts: launch::accounts::InitializeGlobal { authority: authority.pubkey(), global, system_program: system_program::ID }
+            accounts: launch::accounts::InitializeGlobal { authority: authority.pubkey(), global, program_data: program_data_of(launch::ID), system_program: system_program::ID }
                 .to_account_metas(None),
             data: launch::instruction::InitializeGlobal {
                 params: launch::GlobalParams {
@@ -321,6 +346,7 @@ async fn launch_trade_and_perps_end_to_end() {
                     authority: authority.pubkey(),
                     vault,
                     usdc_mint: usdc.pubkey(),
+                    program_data: program_data_of(perps::ID),
                     vault_usdc,
                     token_program: spl_token::ID,
                     system_program: system_program::ID,
@@ -818,7 +844,7 @@ async fn launch_only() -> Launched {
     env.send(
         &[Instruction {
             program_id: launch::ID,
-            accounts: launch::accounts::InitializeGlobal { authority: authority.pubkey(), global, system_program: system_program::ID }
+            accounts: launch::accounts::InitializeGlobal { authority: authority.pubkey(), global, program_data: program_data_of(launch::ID), system_program: system_program::ID }
                 .to_account_metas(None),
             data: launch::instruction::InitializeGlobal {
                 params: launch::GlobalParams {
@@ -1238,6 +1264,7 @@ async fn perps_with_accrued_fees(l: &mut Launched) -> PerpsFx {
                     accounts: perps::accounts::InitializeVault {
                         authority: authority.pubkey(),
                         vault,
+                        program_data: program_data_of(perps::ID),
                         usdc_mint: usdc.pubkey(),
                         vault_usdc,
                         token_program: spl_token::ID,
@@ -1636,8 +1663,8 @@ async fn resize_market_grows_old_account_and_is_noop_on_new_one() {
     assert_eq!((acc.data.len(), acc.lamports), (full_len, lamports_new));
     assert_eq!(acc.data, data_new);
 
-    // Old layout: Market has no slack, so it no longer deserializes until resized.
-    l.env.shrink_account(market, 8).await;
+    // Old layout (before `pool` was appended): Market has no slack, so it no longer deserializes until resized.
+    l.env.shrink_account(market, 32).await;
     let short = l.env.ctx.banks_client.get_account(market).await.unwrap().unwrap();
     assert!(perps::Market::try_deserialize(&mut short.data.as_slice()).is_err(), "old-size market cannot be read");
     l.env.warp(1).await;
@@ -1645,10 +1672,11 @@ async fn resize_market_grows_old_account_and_is_noop_on_new_one() {
     let grown = l.env.ctx.banks_client.get_account(market).await.unwrap().unwrap();
     assert_eq!(grown.data.len(), full_len);
     assert_eq!(grown.lamports, lamports_new, "payer funded the rent for the extra bytes");
-    assert_eq!(&grown.data[..full_len - 8], &short.data[..]);
-    assert_eq!(&grown.data[full_len - 8..], &[0u8; 8]);
+    assert_eq!(&grown.data[..full_len - 32], &short.data[..]);
+    assert_eq!(&grown.data[full_len - 32..], &[0u8; 32]);
     let after: perps::Market = l.env.get(market).await;
-    assert_eq!(after.creator_fees_locked, 0, "new field reads 0");
+    assert_eq!(after.pool, Pubkey::default(), "new field reads zero: no stored pool");
+    assert_eq!(after.creator_fees_locked, before.creator_fees_locked);
     assert_eq!((after.creator_fees, after.insurance, after.curve), (before.creator_fees, before.insurance, before.curve));
     // The grown market is usable: the early share is claimable.
     let (creator, curve) = (l.creator.insecure_clone(), l.curve);
@@ -1662,7 +1690,7 @@ async fn resize_market_grows_old_account_and_is_noop_on_new_one() {
     assert_eq!(custom_error(e), anchor_lang::error::ErrorCode::AccountDiscriminatorMismatch as u32);
     let fake = Pubkey::new_unique();
     let mut copy = l.env.ctx.banks_client.get_account(market).await.unwrap().unwrap();
-    copy.data.truncate(full_len - 8);
+    copy.data.truncate(full_len - 32);
     l.env.ctx.set_account(&fake, &solana_sdk::account::AccountSharedData::from(copy));
     let e = l.env.send(&[resize_market_ix(payer, fake)], &[]).await.unwrap_err();
     assert_eq!(custom_error(e), anchor_lang::error::ErrorCode::ConstraintSeeds as u32);
@@ -1685,4 +1713,129 @@ async fn perps_claim_rejects_another_tokens_curve() {
     assert_eq!(l.env.get::<perps::Market>(fx.market).await.creator_fees, early);
     // The right curve works at that point.
     l.env.send(&[perps_claim_ix(creator.pubkey(), &fx, curve)], &[&creator]).await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Initialization is limited to the program's upgrade authority
+// ---------------------------------------------------------------------------
+
+fn global_params(env: &Env) -> launch::GlobalParams {
+    launch::GlobalParams {
+        fee_recipient: env.fee_recipient,
+        insurance_recipient: env.insurance,
+        migration_authority: env.migration,
+        launch_fee_lamports: SOL / 50,
+        graduation_fee_lamports: 3 * SOL / 2,
+        protocol_fee_bps: 50,
+        creator_fee_bps: 30,
+        insurance_fee_bps: 20,
+    }
+}
+
+fn init_global_ix(env: &Env, signer: Pubkey, program_data: Pubkey) -> Instruction {
+    let (global, _) = Pubkey::find_program_address(&[launch::SEED_GLOBAL], &launch::ID);
+    Instruction {
+        program_id: launch::ID,
+        accounts: launch::accounts::InitializeGlobal { authority: signer, global, program_data, system_program: system_program::ID }
+            .to_account_metas(None),
+        data: launch::instruction::InitializeGlobal { params: global_params(env) }.data(),
+    }
+}
+
+fn init_vault_ix(signer: Pubkey, usdc: Pubkey, program_data: Pubkey) -> Instruction {
+    let (vault, _) = Pubkey::find_program_address(&[perps::SEED_VAULT], &perps::ID);
+    let (vault_usdc, _) = Pubkey::find_program_address(&[perps::SEED_VAULT_USDC], &perps::ID);
+    Instruction {
+        program_id: perps::ID,
+        accounts: perps::accounts::InitializeVault {
+            authority: signer, vault, usdc_mint: usdc, program_data, vault_usdc,
+            token_program: spl_token::ID, system_program: system_program::ID,
+        }
+        .to_account_metas(None),
+        data: perps::instruction::InitializeVault { price_authority: signer }.data(),
+    }
+}
+
+async fn make_usdc(env: &mut Env) -> Pubkey {
+    let usdc = env.usdc_mint.insecure_clone();
+    let rent = env.ctx.banks_client.get_rent().await.unwrap();
+    let payer = env.ctx.payer.pubkey();
+    env.send(
+        &[
+            system_instruction::create_account(&payer, &usdc.pubkey(), rent.minimum_balance(82), 82, &spl_token::ID),
+            spl_token::instruction::initialize_mint(&spl_token::ID, &usdc.pubkey(), &payer, None, 6).unwrap(),
+        ],
+        &[&usdc],
+    )
+    .await
+    .unwrap();
+    usdc.pubkey()
+}
+
+const LAUNCH_NOT_UPGRADE_AUTH: u32 = 6000 + launch::LaunchError::NotUpgradeAuthority as u32;
+const PERPS_NOT_UPGRADE_AUTH: u32 = 6000 + perps::PerpsError::NotUpgradeAuthority as u32;
+
+#[tokio::test]
+async fn initialize_global_only_by_the_upgrade_authority() {
+    let mut env = setup().await;
+    let attacker = Keypair::new();
+    env.fund(attacker.pubkey(), 10 * SOL).await;
+    let launch_pd = program_data_of(launch::ID);
+
+    // A stranger who signs for themselves is refused...
+    let ix = init_global_ix(&env, attacker.pubkey(), launch_pd);
+    assert_eq!(custom_error(env.send(&[ix], &[&attacker]).await.unwrap_err()), LAUNCH_NOT_UPGRADE_AUTH);
+    // ...as is one who passes the other program's ProgramData (its authority is the real one, so
+    // only the address check catches this) or an account of their own making.
+    let ix = init_global_ix(&env, attacker.pubkey(), program_data_of(perps::ID));
+    assert!(env.send(&[ix], &[&attacker]).await.is_err());
+    let fake = Keypair::new();
+    let ix = init_global_ix(&env, attacker.pubkey(), fake.pubkey());
+    assert!(env.send(&[ix], &[&attacker]).await.is_err());
+    // The real upgrade authority's address is not enough without its signature.
+    let real = env.authority.pubkey();
+    let mut ix = init_global_ix(&env, real, launch_pd);
+    ix.accounts[0].is_signer = false;
+    assert!(env.send(&[ix], &[]).await.is_err());
+    let (global, _) = Pubkey::find_program_address(&[launch::SEED_GLOBAL], &launch::ID);
+    assert!(env.ctx.banks_client.get_account(global).await.unwrap().is_none(), "nothing was initialized");
+
+    // A program whose upgrade authority was dropped (frozen) cannot be initialized by anyone.
+    set_upgrade_authority(&mut env.ctx, launch::ID, None);
+    let authority = env.authority.insecure_clone();
+    let ix = init_global_ix(&env, authority.pubkey(), launch_pd);
+    assert_eq!(custom_error(env.send(&[ix], &[&authority]).await.unwrap_err()), LAUNCH_NOT_UPGRADE_AUTH);
+
+    // The upgrade authority succeeds, and becomes admin.
+    set_upgrade_authority(&mut env.ctx, launch::ID, Some(authority.pubkey()));
+    env.warp(1).await;
+    let ix = init_global_ix(&env, authority.pubkey(), launch_pd);
+    env.send(&[ix], &[&authority]).await.unwrap();
+    let g: launch::Global = env.get(global).await;
+    assert_eq!(g.authority, authority.pubkey());
+    assert_eq!(g.fee_recipient, env.fee_recipient);
+}
+
+#[tokio::test]
+async fn initialize_vault_only_by_the_upgrade_authority() {
+    let mut env = setup().await;
+    let attacker = Keypair::new();
+    env.fund(attacker.pubkey(), 10 * SOL).await;
+    let usdc = make_usdc(&mut env).await;
+    let perps_pd = program_data_of(perps::ID);
+
+    let ix = init_vault_ix(attacker.pubkey(), usdc, perps_pd);
+    assert_eq!(custom_error(env.send(&[ix], &[&attacker]).await.unwrap_err()), PERPS_NOT_UPGRADE_AUTH);
+    // The launch program's ProgramData names the real authority too, but sits at the wrong address.
+    let ix = init_vault_ix(env.authority.pubkey(), usdc, program_data_of(launch::ID));
+    let authority = env.authority.insecure_clone();
+    assert!(env.send(&[ix], &[&authority]).await.is_err());
+    let (vault, _) = Pubkey::find_program_address(&[perps::SEED_VAULT], &perps::ID);
+    assert!(env.ctx.banks_client.get_account(vault).await.unwrap().is_none(), "nothing was initialized");
+
+    let ix = init_vault_ix(authority.pubkey(), usdc, perps_pd);
+    env.send(&[ix], &[&authority]).await.unwrap();
+    let v: perps::Vault = env.get(vault).await;
+    assert_eq!(v.authority, authority.pubkey());
+    assert_eq!(v.usdc_mint, usdc);
 }

@@ -3598,6 +3598,7 @@ version = "0.1.0"
 dependencies = [
  "anchor-lang",
  "anchor-spl",
+ "bincode",
  "ringside_launch",
  "ringside_perps",
  "solana-program-test",

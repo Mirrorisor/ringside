@@ -73,6 +73,11 @@ async function main() {
   const step = (s: string) => console.log(`\n▸ ${s}`);
   console.log(`Wallet ${me.toBase58()}  balance ${(await connection.getBalance(me)) / LAMPORTS_PER_SOL} SOL`);
 
+  // initialize_global / initialize_vault accept only the programs' upgrade authority (the deployer's key).
+  const BPF_UPGRADEABLE = new PublicKey("BPFLoaderUpgradeab1e11111111111111111111111");
+  const launchProgramData = pda([launch.programId.toBuffer()], BPF_UPGRADEABLE);
+  const perpsProgramData = pda([perps.programId.toBuffer()], BPF_UPGRADEABLE);
+
   // 1. Launch global config ---------------------------------------------------
   const global = pda([enc("global")], launch.programId);
   if (!(await connection.getAccountInfo(global))) {
@@ -88,7 +93,7 @@ async function main() {
         creatorFeeBps: 30,
         insuranceFeeBps: 20,
       })
-      .accountsPartial({ authority: me, global, systemProgram: SystemProgram.programId })
+      .accountsPartial({ authority: me, global, programData: launchProgramData, systemProgram: SystemProgram.programId })
       .rpc();
   }
 
@@ -106,7 +111,7 @@ async function main() {
     step("Initialising the perps vault");
     await perps.methods
       .initializeVault(me)
-      .accountsPartial({ authority: me, vault, usdcMint, vaultUsdc, tokenProgram: TOKEN_PROGRAM_ID, systemProgram: SystemProgram.programId })
+      .accountsPartial({ authority: me, vault, usdcMint, programData: perpsProgramData, vaultUsdc, tokenProgram: TOKEN_PROGRAM_ID, systemProgram: SystemProgram.programId })
       .rpc();
     await mintTo(connection, payer, usdcMint, myUsdc, payer, 10_000 * USDC);
     const lp = pda([enc("lp"), me.toBuffer()], perps.programId);
