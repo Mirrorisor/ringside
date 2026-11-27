@@ -59,10 +59,19 @@ jobs:
             echo "::error::A program function overflows the 4 KB SBF stack frame"
             exit 1
           fi
+      # Always saved, so the IDLs can be taken from CI when no local machine can
+      # run Anchor's IDL step (it needs a nightly toolchain).
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: idl
+          path: target/idl/*.json
+          if-no-files-found: ignore
       - name: Committed IDLs match the source
         run: |
           if ! git diff --exit-code --stat -- target/idl; then
-            echo "::error::target/idl is stale: run anchor build and commit target/idl"
+            git diff -- target/idl | head -150
+            echo "::error::target/idl is stale: run anchor build and commit target/idl (or take the idl artifact from this run)"
             exit 1
           fi
 
