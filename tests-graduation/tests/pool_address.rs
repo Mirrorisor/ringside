@@ -158,8 +158,8 @@ async fn market_graduated_before_the_pool_was_stored_keeps_the_canonical_pool() 
 
     // Now blank the stored pool, as on a market that graduated before the field existed.
     let mut mk = f.ctx.banks_client.get_account(f.market).await.unwrap().unwrap();
-    let n = mk.data.len();
-    mk.data[n - 32..].fill(0);
+    // (`pool` sits at 228..260 of the account; later fields follow it.)
+    mk.data[228..260].fill(0);
     f.ctx.set_account(&f.market, &mk.into());
     assert_eq!(f.market_state().await.pool, Pubkey::default());
     f.ctx.warp_to_slot(f.ctx.banks_client.get_root_slot().await.unwrap() + 2).unwrap();

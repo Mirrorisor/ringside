@@ -434,7 +434,7 @@ async fn launch_trade_and_perps_end_to_end() {
         }
         .to_account_metas(None),
         data: perps::instruction::RequestOrder {
-            args: perps::OrderArgs { side: perps::SIDE_LONG, kind, collateral, size_usd: size, acceptable_price_q64: 0 },
+            args: perps::OrderArgs { side: perps::SIDE_LONG, kind, collateral, size_usd: size, acceptable_price_q64: if kind == perps::ORDER_INCREASE { u128::MAX } else { 1 } },
         }
         .data(),
     };
@@ -591,7 +591,7 @@ async fn launch_trade_and_perps_end_to_end() {
     env.send(&[Instruction {
         program_id: perps::ID,
         accounts: perps::accounts::RequestOrder { owner: t2.pubkey(), payer: t2.pubkey(), vault, vault_usdc, market, position: pos2, order: ord2, owner_usdc: t2_usdc, token_program: spl_token::ID, system_program: system_program::ID }.to_account_metas(None),
-        data: perps::instruction::RequestOrder { args: perps::OrderArgs { side: perps::SIDE_LONG, kind: perps::ORDER_INCREASE, collateral: 7 * USDC, size_usd: 12 * USDC, acceptable_price_q64: 0 } }.data(),
+        data: perps::instruction::RequestOrder { args: perps::OrderArgs { side: perps::SIDE_LONG, kind: perps::ORDER_INCREASE, collateral: 7 * USDC, size_usd: 12 * USDC, acceptable_price_q64: u128::MAX } }.data(),
     }], &[&t2]).await.unwrap();
     env.warp(3).await;
     let err = env.send(&[Instruction {
@@ -1351,7 +1351,7 @@ async fn perps_with_accrued_fees(l: &mut Launched) -> PerpsFx {
                 }
                 .to_account_metas(None),
                 data: perps::instruction::RequestOrder {
-                    args: perps::OrderArgs { side: perps::SIDE_LONG, kind: perps::ORDER_INCREASE, collateral: 4_300_000, size_usd: 8 * USDC, acceptable_price_q64: 0 },
+                    args: perps::OrderArgs { side: perps::SIDE_LONG, kind: perps::ORDER_INCREASE, collateral: 4_300_000, size_usd: 8 * USDC, acceptable_price_q64: u128::MAX },
                 }
                 .data(),
             }],
@@ -1663,8 +1663,9 @@ async fn resize_market_grows_old_account_and_is_noop_on_new_one() {
     assert_eq!((acc.data.len(), acc.lamports), (full_len, lamports_new));
     assert_eq!(acc.data, data_new);
 
-    // Old layout (before `pool` was appended): Market has no slack, so it no longer deserializes until resized.
-    l.env.shrink_account(market, 32).await;
+    // Old layout (before `pool`, `grad_price_q64` and the volume window were appended): Market has no slack, so it no longer
+    // deserializes until resized.
+    l.env.shrink_account(market, 64).await;
     let short = l.env.ctx.banks_client.get_account(market).await.unwrap().unwrap();
     assert!(perps::Market::try_deserialize(&mut short.data.as_slice()).is_err(), "old-size market cannot be read");
     l.env.warp(1).await;
@@ -1672,10 +1673,11 @@ async fn resize_market_grows_old_account_and_is_noop_on_new_one() {
     let grown = l.env.ctx.banks_client.get_account(market).await.unwrap().unwrap();
     assert_eq!(grown.data.len(), full_len);
     assert_eq!(grown.lamports, lamports_new, "payer funded the rent for the extra bytes");
-    assert_eq!(&grown.data[..full_len - 32], &short.data[..]);
-    assert_eq!(&grown.data[full_len - 32..], &[0u8; 32]);
+    assert_eq!(&grown.data[..full_len - 64], &short.data[..]);
+    assert_eq!(&grown.data[full_len - 64..], &[0u8; 64]);
     let after: perps::Market = l.env.get(market).await;
     assert_eq!(after.pool, Pubkey::default(), "new field reads zero: no stored pool");
+    assert_eq!((after.grad_price_q64, after.vol_snap_slot, after.vol_snap_fees), (0, 0, 0), "the later fields read zero too");
     assert_eq!(after.creator_fees_locked, before.creator_fees_locked);
     assert_eq!((after.creator_fees, after.insurance, after.curve), (before.creator_fees, before.insurance, before.curve));
     // The grown market is usable: the early share is claimable.
@@ -1690,7 +1692,7 @@ async fn resize_market_grows_old_account_and_is_noop_on_new_one() {
     assert_eq!(custom_error(e), anchor_lang::error::ErrorCode::AccountDiscriminatorMismatch as u32);
     let fake = Pubkey::new_unique();
     let mut copy = l.env.ctx.banks_client.get_account(market).await.unwrap().unwrap();
-    copy.data.truncate(full_len - 32);
+    copy.data.truncate(full_len - 64);
     l.env.ctx.set_account(&fake, &solana_sdk::account::AccountSharedData::from(copy));
     let e = l.env.send(&[resize_market_ix(payer, fake)], &[]).await.unwrap_err();
     assert_eq!(custom_error(e), anchor_lang::error::ErrorCode::ConstraintSeeds as u32);
@@ -1838,6 +1840,349 @@ async fn initialize_vault_only_by_the_upgrade_authority() {
     let v: perps::Vault = env.get(vault).await;
     assert_eq!(v.authority, authority.pubkey());
     assert_eq!(v.usdc_mint, usdc);
+}
+
+// --- Market and order hardening (F4, F7, F11-adjacent, F13) ---------------------------
+
+fn create_market_ix(payer: Pubkey, curve: Pubkey, market: Pubkey, registry: Pubkey) -> Instruction {
+    Instruction {
+        program_id: perps::ID,
+        accounts: perps::accounts::CreateMarket { payer, curve, market, registry, system_program: system_program::ID }.to_account_metas(None),
+        data: perps::instruction::CreateMarket {}.data(),
+    }
+}
+
+fn retire_ix(payer: Pubkey, market: Pubkey, curve: Pubkey) -> Instruction {
+    let (registry, _) = Pubkey::find_program_address(&[perps::SEED_REGISTRY], &perps::ID);
+    let (retired, _) = Pubkey::find_program_address(&[perps::SEED_RETIRED, market.as_ref()], &perps::ID);
+    Instruction {
+        program_id: perps::ID,
+        accounts: perps::accounts::RetireMarket { payer, market, curve, registry, retired, system_program: system_program::ID }.to_account_metas(None),
+        data: perps::instruction::RetireMarket {}.data(),
+    }
+}
+
+fn admin_retire_ix(authority: Pubkey, market: Pubkey) -> Instruction {
+    let (vault, _) = Pubkey::find_program_address(&[perps::SEED_VAULT], &perps::ID);
+    let (registry, _) = Pubkey::find_program_address(&[perps::SEED_REGISTRY], &perps::ID);
+    let (retired, _) = Pubkey::find_program_address(&[perps::SEED_RETIRED, market.as_ref()], &perps::ID);
+    Instruction {
+        program_id: perps::ID,
+        accounts: perps::accounts::AdminRetireMarket { authority, vault, market, registry, retired, system_program: system_program::ID }.to_account_metas(None),
+        data: perps::instruction::AdminRetireMarket {}.data(),
+    }
+}
+
+fn crank_ix(fx: &PerpsFx, curve: Pubkey) -> Instruction {
+    Instruction {
+        program_id: perps::ID,
+        accounts: perps::accounts::CrankFunding { vault: fx.vault, market: fx.market, curve }.to_account_metas(None),
+        data: perps::instruction::CrankFunding {}.data(),
+    }
+}
+
+const PERPS_ERR: u32 = 6000;
+
+/// Vault with liquidity, a SOL price and a market on the launched token, with no orders.
+async fn perps_empty_market(l: &mut Launched) -> PerpsFx {
+    let authority = l.env.authority.insecure_clone();
+    let (keeper, lp) = (Keypair::new(), Keypair::new());
+    for k in [keeper.pubkey(), lp.pubkey()] {
+        l.env.fund(k, 10 * SOL).await;
+    }
+    let usdc = l.env.usdc_mint.insecure_clone();
+    let rent = l.env.ctx.banks_client.get_rent().await.unwrap();
+    let payer = l.env.ctx.payer.pubkey();
+    l.env
+        .send(
+            &[
+                system_instruction::create_account(&payer, &usdc.pubkey(), rent.minimum_balance(82), 82, &spl_token::ID),
+                spl_token::instruction::initialize_mint(&spl_token::ID, &usdc.pubkey(), &authority.pubkey(), None, 6).unwrap(),
+            ],
+            &[&usdc],
+        )
+        .await
+        .unwrap();
+    let (vault, _) = Pubkey::find_program_address(&[perps::SEED_VAULT], &perps::ID);
+    let (vault_usdc, _) = Pubkey::find_program_address(&[perps::SEED_VAULT_USDC], &perps::ID);
+    l.env
+        .send(
+            &[
+                Instruction {
+                    program_id: perps::ID,
+                    accounts: perps::accounts::InitializeVault {
+                        authority: authority.pubkey(), vault, program_data: program_data_of(perps::ID), usdc_mint: usdc.pubkey(), vault_usdc,
+                        token_program: spl_token::ID, system_program: system_program::ID,
+                    }
+                    .to_account_metas(None),
+                    data: perps::instruction::InitializeVault { price_authority: authority.pubkey() }.data(),
+                },
+                Instruction {
+                    program_id: perps::ID,
+                    accounts: perps::accounts::SetSolPrice { price_authority: authority.pubkey(), vault }.to_account_metas(None),
+                    data: perps::instruction::SetSolPrice { price_e6: 150 * USDC }.data(),
+                },
+            ],
+            &[&authority],
+        )
+        .await
+        .unwrap();
+    let lp_usdc = l.env.usdc_account(&lp.pubkey(), 10_000 * USDC).await;
+    let (lp_acc, _) = Pubkey::find_program_address(&[perps::SEED_LP, lp.pubkey().as_ref()], &perps::ID);
+    l.env
+        .send(
+            &[Instruction {
+                program_id: perps::ID,
+                accounts: perps::accounts::Liquidity { owner: lp.pubkey(), vault, vault_usdc, lp: lp_acc, owner_usdc: lp_usdc, token_program: spl_token::ID, system_program: system_program::ID }
+                    .to_account_metas(None),
+                data: perps::instruction::DepositLiquidity { amount: 10_000 * USDC }.data(),
+            }],
+            &[&lp],
+        )
+        .await
+        .unwrap();
+    let (market, _) = Pubkey::find_program_address(&[perps::SEED_MARKET, l.mint.as_ref()], &perps::ID);
+    let (registry, _) = Pubkey::find_program_address(&[perps::SEED_REGISTRY], &perps::ID);
+    let ix = create_market_ix(keeper.pubkey(), l.curve, market, registry);
+    l.env.send(&[ix], &[&keeper]).await.unwrap();
+    let creator_usdc = l.env.usdc_account(&l.creator.pubkey(), 0).await;
+    PerpsFx { vault, vault_usdc, market, creator_usdc }
+}
+
+/// A fresh trader with USDC, and instruction builders for their order on `fx.market`.
+struct Orderer {
+    trader: Keypair,
+    usdc: Pubkey,
+    keeper: Keypair,
+    keeper_usdc: Pubkey,
+    position: Pubkey,
+    order: Pubkey,
+}
+
+impl Orderer {
+    async fn new(l: &mut Launched, fx: &PerpsFx, side: u8) -> Orderer {
+        let (trader, keeper) = (Keypair::new(), Keypair::new());
+        for k in [trader.pubkey(), keeper.pubkey()] {
+            l.env.fund(k, 5 * SOL).await;
+        }
+        let usdc = l.env.usdc_account(&trader.pubkey(), 100 * USDC).await;
+        let keeper_usdc = l.env.usdc_account(&keeper.pubkey(), 0).await;
+        let (position, _) = Pubkey::find_program_address(&[perps::SEED_POSITION, trader.pubkey().as_ref(), fx.market.as_ref(), &[side]], &perps::ID);
+        let (order, _) = Pubkey::find_program_address(&[perps::SEED_ORDER, trader.pubkey().as_ref(), fx.market.as_ref(), &[side]], &perps::ID);
+        Orderer { trader, usdc, keeper, keeper_usdc, position, order }
+    }
+    fn request(&self, fx: &PerpsFx, side: u8, kind: u8, collateral: u64, size: u64, acceptable: u128) -> Instruction {
+        Instruction {
+            program_id: perps::ID,
+            accounts: perps::accounts::RequestOrder {
+                owner: self.trader.pubkey(), payer: self.trader.pubkey(), vault: fx.vault, vault_usdc: fx.vault_usdc, market: fx.market,
+                position: self.position, order: self.order, owner_usdc: self.usdc, token_program: spl_token::ID, system_program: system_program::ID,
+            }
+            .to_account_metas(None),
+            data: perps::instruction::RequestOrder { args: perps::OrderArgs { side, kind, collateral, size_usd: size, acceptable_price_q64: acceptable } }.data(),
+        }
+    }
+    fn execute(&self, fx: &PerpsFx, curve: Pubkey) -> Instruction {
+        Instruction {
+            program_id: perps::ID,
+            accounts: perps::accounts::ExecuteOrder {
+                keeper: self.keeper.pubkey(), vault: fx.vault, vault_usdc: fx.vault_usdc, market: fx.market, curve, rent_payer: self.trader.pubkey(),
+                order: self.order, position: self.position, owner_usdc: self.usdc, keeper_usdc: self.keeper_usdc, token_program: spl_token::ID,
+            }
+            .to_account_metas(None),
+            data: perps::instruction::ExecuteOrder {}.data(),
+        }
+    }
+    fn cancel(&self, fx: &PerpsFx) -> Instruction {
+        Instruction {
+            program_id: perps::ID,
+            accounts: perps::accounts::CancelOrder {
+                owner: self.trader.pubkey(), vault: fx.vault, vault_usdc: fx.vault_usdc, rent_payer: self.trader.pubkey(), order: self.order,
+                owner_usdc: self.usdc, token_program: spl_token::ID,
+            }
+            .to_account_metas(None),
+            data: perps::instruction::CancelOrder {}.data(),
+        }
+    }
+}
+
+#[tokio::test]
+async fn orders_need_a_non_zero_acceptable_price() {
+    let (mut l, fx) = perps_market().await;
+    let o = Orderer::new(&mut l, &fx, perps::SIDE_LONG).await;
+    let bad_open = o.request(&fx, perps::SIDE_LONG, perps::ORDER_INCREASE, 4_300_000, 8 * USDC, 0);
+    let err = l.env.send(&[bad_open], &[&o.trader]).await.unwrap_err();
+    assert_eq!(custom_error(err), PERPS_ERR + perps::PerpsError::AcceptablePriceRequired as u32, "open");
+    let bad_close = o.request(&fx, perps::SIDE_LONG, perps::ORDER_CLOSE, 0, 0, 0);
+    let err = l.env.send(&[bad_close], &[&o.trader]).await.unwrap_err();
+    assert_eq!(custom_error(err), PERPS_ERR + perps::PerpsError::AcceptablePriceRequired as u32, "close");
+    assert!(l.env.ctx.banks_client.get_account(o.order).await.unwrap().is_none(), "no order was created");
+    assert_eq!(l.env.token_balance(o.usdc).await, 100 * USDC, "nothing was escrowed");
+}
+
+#[tokio::test]
+async fn a_price_outside_the_bound_refunds_the_order() {
+    let (mut l, fx) = perps_market().await;
+    let o = Orderer::new(&mut l, &fx, perps::SIDE_LONG).await;
+    // A long open must fill at or below the bound: 1 is below any price.
+    let req = o.request(&fx, perps::SIDE_LONG, perps::ORDER_INCREASE, 4_300_000, 8 * USDC, 1);
+    l.env.send(&[req], &[&o.trader]).await.unwrap();
+    assert_eq!(l.env.token_balance(o.usdc).await, 100 * USDC - 4_300_000);
+    l.env.warp(5).await;
+    let exec = o.execute(&fx, l.curve);
+    l.env.send(&[exec], &[&o.keeper]).await.unwrap();
+    assert_eq!(l.env.token_balance(o.usdc).await, 100 * USDC, "refunded, not failed");
+    let p: perps::Position = l.env.get(o.position).await;
+    assert_eq!(p.size_usd, 0);
+    assert!(l.env.ctx.banks_client.get_account(o.order).await.unwrap().is_none(), "order cleared");
+}
+
+#[tokio::test]
+async fn an_expired_order_is_never_filled_and_always_refundable() {
+    let (mut l, fx) = perps_market().await;
+    let o = Orderer::new(&mut l, &fx, perps::SIDE_LONG).await;
+    let vault_before: perps::Vault = l.env.get(fx.vault).await;
+    let req = o.request(&fx, perps::SIDE_LONG, perps::ORDER_INCREASE, 4_300_000, 8 * USDC, u128::MAX);
+    l.env.send(&[req.clone()], &[&o.trader]).await.unwrap();
+    l.env.warp(perps::ORDER_EXPIRY_SLOTS + 5).await;
+    // A later fill, at a price of the filler's choosing, is refused: the order only refunds.
+    let exec = o.execute(&fx, l.curve);
+    l.env.send(&[exec], &[&o.keeper]).await.unwrap();
+    let p: perps::Position = l.env.get(o.position).await;
+    assert_eq!(p.size_usd, 0, "no position was opened");
+    assert_eq!(l.env.token_balance(o.usdc).await, 100 * USDC, "escrow back with the owner");
+    let v: perps::Vault = l.env.get(fx.vault).await;
+    assert_eq!(v.trader_collateral, vault_before.trader_collateral, "vault accounting restored");
+    assert!(l.env.ctx.banks_client.get_account(o.order).await.unwrap().is_none());
+
+    // The owner's own cancel path refunds an expired order too.
+    l.env.warp(1).await;
+    l.env.send(&[req], &[&o.trader]).await.unwrap();
+    let err = l.env.send(&[o.cancel(&fx)], &[&o.trader]).await.unwrap_err();
+    assert_eq!(custom_error(err), PERPS_ERR + perps::PerpsError::NotExpired as u32);
+    l.env.warp(perps::ORDER_EXPIRY_SLOTS + 1).await;
+    l.env.send(&[o.cancel(&fx)], &[&o.trader]).await.unwrap();
+    assert_eq!(l.env.token_balance(o.usdc).await, 100 * USDC);
+    // Just inside the expiry a fill still works (a short, which also reduces the vault's net exposure).
+    let s = Orderer::new(&mut l, &fx, perps::SIDE_SHORT).await;
+    l.env.send(&[s.request(&fx, perps::SIDE_SHORT, perps::ORDER_INCREASE, 4_300_000, 8 * USDC, 1)], &[&s.trader]).await.unwrap();
+    l.env.warp(perps::ORDER_EXPIRY_SLOTS - 20).await;
+    l.env.send(&[s.execute(&fx, l.curve)], &[&s.keeper]).await.unwrap();
+    let p: perps::Position = l.env.get(s.position).await;
+    assert_eq!(p.size_usd, 8 * USDC);
+}
+
+#[tokio::test]
+async fn market_anchor_is_the_curve_twap_not_its_instantaneous_price() {
+    let mut l = launch_only().await;
+    let trader = l.trader.insecure_clone();
+    let c0: launch::Curve = l.env.get(l.curve).await;
+    let p0 = c0.last_price_q64;
+    // The curve sits at its opening price for a window, then a large buy pumps spot in the same slot the market is created.
+    l.env.warp(perps::TWAP_WINDOW_SLOTS - 50).await;
+    let buy = (l.buy_ix)(20 * SOL);
+    let keeper = Keypair::new();
+    l.env.fund(keeper.pubkey(), 5 * SOL).await;
+    let (market, _) = Pubkey::find_program_address(&[perps::SEED_MARKET, l.mint.as_ref()], &perps::ID);
+    let (registry, _) = Pubkey::find_program_address(&[perps::SEED_REGISTRY], &perps::ID);
+    let create = create_market_ix(keeper.pubkey(), l.curve, market, registry);
+    l.env.send(&[buy, create], &[&trader, &keeper]).await.unwrap();
+    let c: launch::Curve = l.env.get(l.curve).await;
+    let m: perps::Market = l.env.get(market).await;
+    assert!(c.last_price_q64 > p0 * 2, "spot was pumped");
+    assert!(m.band_anchor_q64 >= p0 && m.band_anchor_q64 < p0 + p0 / 50, "anchor {} is the TWAP near {}, not spot {}", m.band_anchor_q64, p0, c.last_price_q64);
+}
+
+#[tokio::test]
+async fn retire_by_volume_dust_does_not_keep_a_slot_alive() {
+    let mut l = launch_only().await;
+    let trader = l.trader.insecure_clone();
+    let fx = perps_empty_market(&mut l).await;
+    let payer = Keypair::new();
+    l.env.fund(payer.pubkey(), 5 * SOL).await;
+    let m0: perps::Market = l.env.get(fx.market).await;
+    assert!(m0.vol_snap_slot > 0, "the window starts at creation");
+
+    // Dust trades every day (about 0.01 SOL, far below the volume threshold) keep the curve "recently traded".
+    let retire = retire_ix(payer.pubkey(), fx.market, l.curve);
+    let day = perps::RETIRE_IDLE_SLOTS / 7;
+    for _ in 0..6 {
+        l.env.warp(day).await;
+        l.env.send(&[(l.buy_ix)(10_000_000)], &[&trader]).await.unwrap();
+    }
+    l.env.warp(day - 10).await;
+    l.env.send(&[(l.buy_ix)(10_000_000)], &[&trader]).await.unwrap();
+    let err = l.env.send(&[retire.clone()], &[&payer]).await.unwrap_err();
+    assert_eq!(custom_error(err), PERPS_ERR + perps::PerpsError::NotRetirable as u32, "window still short");
+    l.env.warp(20).await;
+    l.env.send(&[(l.buy_ix)(10_000_000)], &[&trader]).await.unwrap();
+    let c: launch::Curve = l.env.get(l.curve).await;
+    let m: perps::Market = l.env.get(fx.market).await;
+    assert!(c.creator_fees_locked - m.vol_snap_fees < perps::RETIRE_MAX_VOLUME_FEES);
+    l.env.send(&[retire.clone()], &[&payer]).await.unwrap();
+    let m: perps::Market = l.env.get(fx.market).await;
+    assert!(m.reduce_only);
+    let reg: perps::Registry = l.env.get(Pubkey::find_program_address(&[perps::SEED_REGISTRY], &perps::ID).0).await;
+    assert_eq!(reg.live_tier0, 0, "slot freed");
+}
+
+#[tokio::test]
+async fn retire_by_volume_real_volume_keeps_the_market() {
+    let mut l = launch_only().await;
+    let trader = l.trader.insecure_clone();
+    let fx = perps_empty_market(&mut l).await;
+    let payer = Keypair::new();
+    l.env.fund(payer.pubkey(), 5 * SOL).await;
+    let retire = retire_ix(payer.pubkey(), fx.market, l.curve);
+    l.env.warp(perps::RETIRE_IDLE_SLOTS - 100).await;
+    // 10 SOL of volume in the window (creator-fee proxy ~24M lamports vs a 12M threshold).
+    l.env.send(&[(l.buy_ix)(10 * SOL)], &[&trader]).await.unwrap();
+    l.env.warp(200).await;
+    let err = l.env.send(&[retire.clone()], &[&payer]).await.unwrap_err();
+    assert_eq!(custom_error(err), PERPS_ERR + perps::PerpsError::NotRetirable as u32);
+    // A crank after the window rolls it forward, so the next window needs its own quiet week.
+    let crank = crank_ix(&fx, l.curve);
+    l.env.send(&[crank], &[]).await.unwrap();
+    let m: perps::Market = l.env.get(fx.market).await;
+    let c: launch::Curve = l.env.get(l.curve).await;
+    assert_eq!(m.vol_snap_fees, c.creator_fees_locked);
+    l.env.warp(1).await;
+    let err = l.env.send(&[retire.clone()], &[&payer]).await.unwrap_err();
+    assert_eq!(custom_error(err), PERPS_ERR + perps::PerpsError::NotRetirable as u32);
+    // Trading in the new window keeps it dust-level: retirable once that window is a week old.
+    l.env.warp(perps::RETIRE_IDLE_SLOTS - 10).await;
+    l.env.send(&[(l.buy_ix)(10_000_000)], &[&trader]).await.unwrap();
+    l.env.warp(20).await;
+    l.env.send(&[retire], &[&payer]).await.unwrap();
+}
+
+#[tokio::test]
+async fn retire_requires_no_open_interest_and_admin_retires_any_flat_market() {
+    let (mut l, fx) = perps_market().await; // $8 long open
+    let authority = l.env.authority.insecure_clone();
+    let reg_key = Pubkey::find_program_address(&[perps::SEED_REGISTRY], &perps::ID).0;
+    let err = l.env.send(&[admin_retire_ix(authority.pubkey(), fx.market)], &[&authority]).await.unwrap_err();
+    assert_eq!(custom_error(err), PERPS_ERR + perps::PerpsError::NotRetirable as u32, "open interest blocks the admin too");
+
+    let mut l2 = launch_only().await;
+    let fx2 = perps_empty_market(&mut l2).await;
+    let authority = l2.env.authority.insecure_clone();
+    let stranger = Keypair::new();
+    l2.env.fund(stranger.pubkey(), 5 * SOL).await;
+    // Not the admin: refused. The curve is brand new, so permissionless retirement is refused as well.
+    let err = l2.env.send(&[admin_retire_ix(stranger.pubkey(), fx2.market)], &[&stranger]).await.unwrap_err();
+    assert!(custom_error(err) != 0);
+    let err = l2.env.send(&[retire_ix(stranger.pubkey(), fx2.market, l2.curve)], &[&stranger]).await.unwrap_err();
+    assert_eq!(custom_error(err), PERPS_ERR + perps::PerpsError::NotRetirable as u32);
+    let before: perps::Registry = l2.env.get(reg_key).await;
+    assert_eq!(before.live_tier0, 1);
+    l2.env.send(&[admin_retire_ix(authority.pubkey(), fx2.market)], &[&authority]).await.unwrap();
+    let after: perps::Registry = l2.env.get(reg_key).await;
+    assert_eq!(after.live_tier0, 0, "slot freed at once");
+    let m: perps::Market = l2.env.get(fx2.market).await;
+    assert!(m.reduce_only);
+    l2.env.warp(1).await;
+    assert!(l2.env.send(&[admin_retire_ix(authority.pubkey(), fx2.market)], &[&authority]).await.is_err(), "retires once");
 }
 
 fn set_fees_ix(authority: Pubkey, global: Pubkey, launch_fee: u64, graduation_fee: u64) -> Instruction {

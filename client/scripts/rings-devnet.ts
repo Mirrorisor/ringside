@@ -15,6 +15,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import anchor from "@coral-xyz/anchor";
+import { acceptablePrice } from "../src/perps/order.js";
 import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction } from "@solana/web3.js";
 import { TOKEN_PROGRAM_ID, getAssociatedTokenAddressSync, getOrCreateAssociatedTokenAccount, mintTo, getAccount } from "@solana/spl-token";
 import { address } from "@solana/kit";
@@ -104,9 +105,14 @@ async function main() {
   const side = m.oiLong.gt(m.oiShort) ? 1 : 0;
   const position = pda([enc("position"), trader.publicKey.toBuffer(), market.toBuffer(), Uint8Array.from([side])], perps.programId);
   const order = pda([enc("order"), trader.publicKey.toBuffer(), market.toBuffer(), Uint8Array.from([side])], perps.programId);
+  // Orders need a price bound (the program refuses 0). These scripts bound at 50% around the market's band anchor.
+  const boundFor = async (side: number, kind: number) => {
+    const mk = await perps.account.market.fetch(market);
+    return new BN(acceptablePrice(side as 0 | 1, kind ? "close" : "open", BigInt(mk.bandAnchorQ64.toString()), 5_000).toString());
+  };
   const sponsored = async (kind: number, collateral: number, size: number) => {
     const ix = await perps.methods
-      .requestOrder({ side, kind, collateral: new BN(collateral), sizeUsd: new BN(size), acceptablePriceQ64: new BN(0) })
+      .requestOrder({ side, kind, collateral: new BN(collateral), sizeUsd: new BN(size), acceptablePriceQ64: await boundFor(side, kind) })
       .accountsPartial({ owner: trader.publicKey, payer: new PublicKey(relayer.address), vault, vaultUsdc, market, position, order, ownerUsdc: traderUsdc, tokenProgram: TOKEN_PROGRAM_ID, systemProgram: SystemProgram.programId })
       .instruction();
     const tx = new Transaction({ feePayer: new PublicKey(relayer.address), recentBlockhash: (await connection.getLatestBlockhash()).blockhash }).add(ix);

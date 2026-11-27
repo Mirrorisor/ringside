@@ -107,8 +107,17 @@ pub const WITHDRAW_DELAY_SECONDS: i64 = 24 * 3_600;
 pub const WITHDRAW_DELAY_SECONDS: i64 = 120;
 /// At most this many Tier 0 markets live at once: 40 x 0.25% budget = 10% of the vault.
 pub const DEFAULT_MAX_LIVE_TIER0: u32 = 40;
-/// A Tier 0 market whose curve hasn't traded for this long (~7 days) can be retired.
+/// Length of the volume window (~7 days) a Tier 0 market must stay quiet for to be retired.
 pub const RETIRE_IDLE_SLOTS: u64 = 7 * 24 * 3_600 * 1_000 / 400;
+/// A Tier 0 market can be retired when the curve's volume over the window is below
+/// this, measured in growth of `Curve.creator_fees_locked` (the 80% of the creator
+/// fee, which every curve trade adds to and nothing but a forfeit or a post-sellout
+/// claim lowers). At the 30 bps creator fee that is 5 SOL of gross curve volume
+/// (5e9 x 30 / 10_000 x 80% = 12e6). Devnet curves are 60x smaller (0.5 virtual SOL).
+#[cfg(not(feature = "devnet"))]
+pub const RETIRE_MAX_VOLUME_FEES: u64 = 12_000_000;
+#[cfg(feature = "devnet")]
+pub const RETIRE_MAX_VOLUME_FEES: u64 = 200_000;
 
 #[derive(Clone, Copy)]
 pub struct TierParams {
@@ -288,13 +297,18 @@ pub mod ringside_perps {
         m.oi_cap_override = 0;
         m.funding_index = 0;
         m.last_funding_ts = clock.unix_timestamp;
-        m.band_anchor_q64 = curve.last_price_q64;
+        // The curve's TWAP, not its instantaneous price: whoever calls first can't
+        // pump, create and sell back to park the band anchor far from fair value.
+        m.band_anchor_q64 = curve.twap_q64(clock.slot, TWAP_WINDOW_SLOTS);
         m.band_anchor_slot = clock.slot;
         m.trader_net_pnl = 0;
         m.insurance = 0;
         m.creator_fees = 0;
         m.creator_fees_locked = 0;
         m.pool = Pubkey::default();
+        m.grad_price_q64 = 0;
+        m.vol_snap_slot = clock.slot;
+        m.vol_snap_fees = curve.creator_fees_locked;
         m.reduce_only = false;
         m.adl_mode = false;
         m.bump = ctx.bumps.market;
@@ -307,6 +321,9 @@ pub mod ringside_perps {
     pub fn request_order(ctx: Context<RequestOrder>, args: OrderArgs) -> Result<()> {
         require!(!ctx.accounts.vault.paused, PerpsError::Paused);
         require!(args.side <= 1 && args.kind <= 1, PerpsError::BadArgs);
+        // Every order carries a price bound: an unbounded order could be filled
+        // by anyone at whatever price the market shows at that moment.
+        require!(args.acceptable_price_q64 > 0, PerpsError::AcceptablePriceRequired);
         let slot = Clock::get()?.slot;
 
         if args.kind == ORDER_INCREASE {
@@ -367,6 +384,15 @@ pub mod ringside_perps {
         let clock = Clock::get()?;
         let order = &ctx.accounts.order;
         require!(clock.slot >= order.request_slot + FILL_DELAY_SLOTS, PerpsError::TooEarly);
+        if clock.slot >= order.request_slot + ORDER_EXPIRY_SLOTS {
+            // An expired order is never filled: the price it was placed against is
+            // stale, and a late fill would let anyone choose the moment. Anyone may
+            // clear it, and the escrow always goes back to the owner (cancel_order
+            // is the owner's own route to the same refund).
+            let vault = &mut ctx.accounts.vault;
+            refund_order(vault, order, &ctx.accounts.vault_usdc, &ctx.accounts.owner_usdc, &ctx.accounts.token_program, REJECT_EXPIRED)?;
+            return Ok(());
+        }
         let vault_balance = ctx.accounts.vault_usdc.amount;
         let lp_value = lp_assets(&ctx.accounts.vault, vault_balance);
 
@@ -380,21 +406,22 @@ pub mod ringside_perps {
         let is_long = order.side == SIDE_LONG;
         let px = execution_price(mark, view.spot, is_long, order.kind == ORDER_INCREASE);
 
-        if order.acceptable_price_q64 > 0 {
-            let ok = if (order.kind == ORDER_INCREASE) == is_long {
-                px <= order.acceptable_price_q64
-            } else {
-                px >= order.acceptable_price_q64
-            };
-            if !ok {
-                // Refund instead of failing so the keeper can always clear the queue.
-                if order.collateral > 0 {
-                    vault.trader_collateral -= order.collateral;
-                    pay_from_vault(vault, &ctx.accounts.vault_usdc, &ctx.accounts.owner_usdc, &ctx.accounts.token_program, order.collateral)?;
-                }
-                emit!(OrderRejected { owner: order.owner, market: order.market, reason: 0 });
-                return Ok(());
-            }
+        // Always bounded: request_order refuses a zero price.
+        let within = if (order.kind == ORDER_INCREASE) == is_long {
+            px <= order.acceptable_price_q64
+        } else {
+            px >= order.acceptable_price_q64
+        };
+        if !within {
+            // Refund instead of failing so the keeper can always clear the queue.
+            refund_order(vault, order, &ctx.accounts.vault_usdc, &ctx.accounts.owner_usdc, &ctx.accounts.token_program, REJECT_PRICE)?;
+            return Ok(());
+        }
+        // A graduated pool has no price history yet: it is priced at the curve's
+        // final price, which is fine for closing but not for taking on new risk.
+        if order.kind == ORDER_INCREASE && view.warming {
+            refund_order(vault, order, &ctx.accounts.vault_usdc, &ctx.accounts.owner_usdc, &ctx.accounts.token_program, REJECT_WARMUP)?;
+            return Ok(());
         }
 
         if order.kind == ORDER_INCREASE {
@@ -515,6 +542,9 @@ pub mod ringside_perps {
         let view = price_view(&ctx.accounts.market, &ctx.accounts.curve, ctx.remaining_accounts, clock.slot, clock.unix_timestamp)?;
         accrue_funding(&mut ctx.accounts.market, &ctx.accounts.vault, view.sol_reserve, clock.unix_timestamp)?;
         mark_price(&mut ctx.accounts.market, &view, clock.slot);
+        if ctx.accounts.market.tier == 0 {
+            roll_volume_window(&mut ctx.accounts.market, &ctx.accounts.curve, clock.slot);
+        }
         Ok(())
     }
 
@@ -528,8 +558,13 @@ pub mod ringside_perps {
             let reg = &mut ctx.accounts.registry;
             reg.live_tier0 = reg.live_tier0.saturating_sub(1);
         }
+        let was_retired = !ctx.accounts.retired.data_is_empty();
         let m = &mut ctx.accounts.market;
         m.tier = 1;
+        // The curve's final price: where the pool opens, and what the market is
+        // priced at (opens blocked) until the pool has a full TWAP window of history.
+        let c = &ctx.accounts.curve;
+        m.grad_price_q64 = ((c.virtual_sol as u128) << 64) / c.virtual_tokens as u128;
         // Fix the pool once. Curves migrate into ringside_launch's own pool PDA.
         // The one exception is a curve that migrated before that change: its
         // pool is Raydium's canonical one, accepted only while the launch PDA
@@ -555,25 +590,43 @@ pub mod ringside_perps {
         // sellout itself (nobody can push it), and migrate opens the pool at
         // exactly that price. Any pool trading since is then followed at most
         // 15% per window.
-        let c = &ctx.accounts.curve;
-        m.band_anchor_q64 = ((c.virtual_sol as u128) << 64) / c.virtual_tokens as u128;
+        m.band_anchor_q64 = m.grad_price_q64;
         m.band_anchor_slot = clock.slot;
-        m.reduce_only = m.adl_mode;
+        // Keep an admin's reduce-only setting. Retirement also sets the flag, and
+        // that one ends here: the market is live again at Tier 1.
+        m.reduce_only = m.adl_mode || (m.reduce_only && !was_retired);
         emit!(MarketGraduated { mint: m.mint, pool: ctx.remaining_accounts[0].key(), price_q64: view.twap });
         Ok(())
     }
 
     /// Permissionless: frees the Tier 0 slot of a dead launch. Allowed when the
-    /// curve hasn't sold out, hasn't traded for ~7 days and the market has no
-    /// open interest. The market becomes reduce-only (it can still graduate later).
+    /// curve hasn't sold out, the market has no open interest and the curve has
+    /// been quiet: either no trade at all for ~7 days, or less than
+    /// RETIRE_MAX_VOLUME_FEES of volume (creator-fee growth, see `roll_volume_window`)
+    /// over a window of at least ~7 days. Dust trades therefore don't keep a slot
+    /// alive. The market becomes reduce-only (it can still graduate later).
     pub fn retire_market(ctx: Context<RetireMarket>) -> Result<()> {
         let slot = Clock::get()?.slot;
         let m = &mut ctx.accounts.market;
         let c = &ctx.accounts.curve;
         require!(
-            m.tier == 0 && !c.complete && m.oi_long == 0 && m.oi_short == 0 && slot.saturating_sub(c.last_slot) >= RETIRE_IDLE_SLOTS,
+            m.tier == 0 && !c.complete && m.oi_long == 0 && m.oi_short == 0 && (slot.saturating_sub(c.last_slot) >= RETIRE_IDLE_SLOTS || volume_window_quiet(m, c, slot)),
             PerpsError::NotRetirable
         );
+        m.reduce_only = true;
+        let reg = &mut ctx.accounts.registry;
+        reg.live_tier0 = reg.live_tier0.saturating_sub(1);
+        ctx.accounts.retired.market = m.key();
+        ctx.accounts.retired.bump = ctx.bumps.retired;
+        Ok(())
+    }
+
+    /// Admin: retires any Tier 0 market with no open interest at once, whatever
+    /// its volume or the state of its curve (spam, or a market the admin wants
+    /// off). Same effects as `retire_market`.
+    pub fn admin_retire_market(ctx: Context<AdminRetireMarket>) -> Result<()> {
+        let m = &mut ctx.accounts.market;
+        require!(m.tier == 0 && m.oi_long == 0 && m.oi_short == 0, PerpsError::NotRetirable);
         m.reduce_only = true;
         let reg = &mut ctx.accounts.registry;
         reg.live_tier0 = reg.live_tier0.saturating_sub(1);
@@ -773,13 +826,23 @@ pub struct PriceView {
     pub spot: u128,
     /// SOL backing the price (virtual curve SOL, or the pool's SOL), sizing OI caps.
     pub sol_reserve: u64,
+    /// True while a graduated market's pool has no observation history covering
+    /// the TWAP window: `twap` is then the fixed fallback price, not the pool's.
+    pub warming: bool,
 }
 
 pub fn price_view(m: &Market, curve: &Curve, rem: &[AccountInfo], slot: u64, now: i64) -> Result<PriceView> {
     if m.tier == 0 {
-        return Ok(PriceView { twap: curve.twap_q64(slot, TWAP_WINDOW_SLOTS), spot: curve.last_price_q64, sol_reserve: curve.virtual_sol_lamports() });
+        return Ok(PriceView { twap: curve.twap_q64(slot, TWAP_WINDOW_SLOTS), spot: curve.last_price_q64, sol_reserve: curve.virtual_sol_lamports(), warming: false });
     }
-    pool_view(curve.mint, expected_pool(m, curve.mint), rem, now)
+    pool_view(curve.mint, expected_pool(m, curve.mint), warmup_price(m), rem, now)
+}
+
+/// The price a graduated market keeps until its pool has TWAP history: the
+/// curve's final price stored at `graduate_market`. Markets that graduated
+/// before it was stored use their band anchor, the last banded mark.
+pub fn warmup_price(m: &Market) -> u128 {
+    if m.grad_price_q64 > 0 { m.grad_price_q64 } else { m.band_anchor_q64 }
 }
 
 /// The pool a Tier 1+ market must price from: the key stored at graduation or,
@@ -796,10 +859,24 @@ fn token_amount(a: &AccountInfo) -> Result<u64> {
     Ok(u64::from_le_bytes(d[64..72].try_into().unwrap()))
 }
 
+/// Raydium PoolState offsets (8-byte discriminator, then packed): the fee fields
+/// that sit in the vaults but are not pool liquidity. protocol and fund fees are
+/// u64 pairs at 349/365 (token 0, token 1 each); the creator fees are the pair at
+/// 397. Older pool accounts hold zeros at 397 (padding there).
+const POOL_FEES_END: usize = 413;
+pub fn pool_fee_total(d: &[u8], token_1: bool) -> u64 {
+    let at = |o: usize| u64::from_le_bytes(d[o + if token_1 { 8 } else { 0 }..o + if token_1 { 16 } else { 8 }].try_into().unwrap());
+    at(341).saturating_add(at(357)).saturating_add(at(397))
+}
+
 /// Reads a graduated token's price from its Raydium CPMM pool. remaining
 /// accounts: [pool_state, observation_state, token vault, wSOL vault]; the pool
 /// must be `pool_key` and the rest are PDAs of Raydium derived from it.
-pub fn pool_view(mint: Pubkey, pool_key: Pubkey, rem: &[AccountInfo], now: i64) -> Result<PriceView> {
+/// Vault balances are net of the pool's accrued protocol, fund and creator fees,
+/// as Raydium itself prices. The mark never takes the pool's instantaneous
+/// price: `twap` comes from the observation history only, or is `warm_price`
+/// (flagged `warming`) while that history does not yet cover the window.
+pub fn pool_view(mint: Pubkey, pool_key: Pubkey, warm_price: u128, rem: &[AccountInfo], now: i64) -> Result<PriceView> {
     require!(rem.len() >= 4, PerpsError::BadPool);
     let (pool, obs, tok_vault, sol_vault) = (&rem[0], &rem[1], &rem[2], &rem[3]);
     let wsol = anchor_spl::token::spl_token::native_mint::ID;
@@ -807,12 +884,21 @@ pub fn pool_view(mint: Pubkey, pool_key: Pubkey, rem: &[AccountInfo], now: i64) 
     require!(*pool.key == pool_key && *pool.owner == raydium::CPMM_PROGRAM, PerpsError::BadPool);
     require!(*obs.key == raydium::observation_address(*pool.key) && *obs.owner == raydium::CPMM_PROGRAM, PerpsError::BadPool);
     require!(*tok_vault.key == vault_pda(&mint) && *sol_vault.key == vault_pda(&wsol), PerpsError::BadPool);
-    let tokens = token_amount(tok_vault)?;
-    let sol = token_amount(sol_vault)?;
+    let token_is_0 = mint < wsol;
+    let (tok_fees, sol_fees) = {
+        let d = pool.try_borrow_data()?;
+        require!(d.len() >= POOL_FEES_END, PerpsError::BadPool);
+        (pool_fee_total(&d, !token_is_0), pool_fee_total(&d, token_is_0))
+    };
+    let tokens = token_amount(tok_vault)?.saturating_sub(tok_fees);
+    let sol = token_amount(sol_vault)?.saturating_sub(sol_fees);
     require!(tokens > 0 && sol > 0, PerpsError::BadPool);
     let spot_x32 = ((sol as u128) << 32) / tokens as u128;
-    let twap_x32 = pool_twap_x32(&obs.try_borrow_data()?, mint < wsol, spot_x32, now as u64);
-    Ok(PriceView { twap: twap_x32 << 32, spot: spot_x32 << 32, sol_reserve: sol })
+    let twap_x32 = pool_twap_x32(&obs.try_borrow_data()?, token_is_0, now as u64);
+    Ok(match twap_x32 {
+        Some(t) => PriceView { twap: t << 32, spot: spot_x32 << 32, sol_reserve: sol, warming: false },
+        None => PriceView { twap: warm_price, spot: spot_x32 << 32, sol_reserve: sol, warming: true },
+    })
 }
 
 /// TWAP of the token's price in lamports per base unit (x32) over
@@ -820,15 +906,19 @@ pub fn pool_view(mint: Pubkey, pool_key: Pubkey, rem: &[AccountInfo], now: i64) 
 /// disc 8 | initialized u8 | observation_index u16 | pool 32 |
 /// 100 x (block_timestamp u64, cum_token_0_price_x32 u128, cum_token_1_price_x32 u128) | padding.
 /// Observation k holds the cumulative price up to its own timestamp (written
-/// at most every 15 s, on swaps, with the pre-swap price). The cumulative is
-/// extended to `now` at the current spot, then differenced against the newest
-/// observation at least POOL_TWAP_SECONDS old (or the oldest one, while the
-/// pool is younger). No history yet means spot.
-pub fn pool_twap_x32(d: &[u8], token_is_0: bool, spot_x32: u128, now: u64) -> u128 {
+/// at most every 15 s, on swaps, with the pre-swap price; the first swap only
+/// stamps a zero cumulative). The cumulative is extended from the newest
+/// observation to `now` at the last observed price, the average over the newest
+/// observed interval, never at the live pool price, so a stale newest
+/// observation or a donation to the vaults cannot move it. It is then
+/// differenced against the newest observation at least POOL_TWAP_SECONDS old.
+/// Returns None while the history cannot do that: no such observation (the
+/// history does not cover the window yet) or no interval to take a price from.
+pub fn pool_twap_x32(d: &[u8], token_is_0: bool, now: u64) -> Option<u128> {
     const N: usize = 100;
     const BASE: usize = 8 + 1 + 2 + 32;
     if d.len() < BASE + N * 40 || d[8] == 0 {
-        return spot_x32;
+        return None;
     }
     let latest = u16::from_le_bytes([d[9], d[10]]) as usize % N;
     let ts = |k: usize| u64::from_le_bytes(d[BASE + k * 40..BASE + k * 40 + 8].try_into().unwrap());
@@ -837,28 +927,23 @@ pub fn pool_twap_x32(d: &[u8], token_is_0: bool, spot_x32: u128, now: u64) -> u1
         u128::from_le_bytes(d[o..o + 16].try_into().unwrap())
     };
     let t_latest = ts(latest);
-    if t_latest == 0 || t_latest > now {
-        return spot_x32;
+    let prev = (latest + N - 1) % N;
+    let t_prev = ts(prev);
+    if t_latest == 0 || t_latest > now || t_prev == 0 || t_prev >= t_latest {
+        return None;
     }
-    let cum_now = cum(latest).wrapping_add(spot_x32.wrapping_mul((now - t_latest) as u128));
+    let last_price = cum(latest).wrapping_sub(cum(prev)) / (t_latest - t_prev) as u128;
+    let cum_now = cum(latest).wrapping_add(last_price.wrapping_mul((now - t_latest) as u128));
     let cutoff = now.saturating_sub(POOL_TWAP_SECONDS);
-    let (mut best, mut oldest): (Option<(u64, u128)>, Option<(u64, u128)>) = (None, None);
+    let mut start: Option<(u64, u128)> = None;
     for k in 0..N {
         let t = ts(k);
-        if t == 0 || t > now {
-            continue; // unused slot
-        }
-        if t <= cutoff && best.map_or(true, |b| t > b.0) {
-            best = Some((t, cum(k)));
-        }
-        if oldest.map_or(true, |o| t < o.0) {
-            oldest = Some((t, cum(k)));
+        if t != 0 && t <= cutoff && t <= t_latest && start.map_or(true, |b| t > b.0) {
+            start = Some((t, cum(k)));
         }
     }
-    match best.or(oldest) {
-        Some((t, c)) if now > t => cum_now.wrapping_sub(c) / (now - t) as u128,
-        _ => spot_x32,
-    }
+    let (t, c) = start?;
+    Some(cum_now.wrapping_sub(c) / (now - t) as u128)
 }
 
 /// TWAP clamped to +/-15% of the band anchor. The anchor moves at most 15%
@@ -881,6 +966,36 @@ pub fn mark_price(m: &mut Market, view: &PriceView, slot: u64) -> (u128, bool) {
 
 fn clamp_band(price: u128, anchor: u128) -> u128 {
     price.clamp(anchor * (BPS - BAND_BPS) / BPS, anchor * (BPS + BAND_BPS) / BPS)
+}
+
+/// The curve's volume proxy: `creator_fees_locked` grows with every curve trade
+/// (80% of the creator fee) and only falls on a forfeit or a post-sellout claim.
+/// Cheap to read, no per-trade hook needed in the launch program, and wash
+/// volume costs its fees.
+///
+/// A Tier 0 market keeps a window start (slot and proxy value). It is retirable
+/// once the window is at least RETIRE_IDLE_SLOTS old and the proxy grew by less
+/// than RETIRE_MAX_VOLUME_FEES. A proxy that fell (forfeit) is never "quiet".
+pub fn volume_window_quiet(m: &Market, c: &Curve, slot: u64) -> bool {
+    m.vol_snap_slot > 0
+        && slot.saturating_sub(m.vol_snap_slot) >= RETIRE_IDLE_SLOTS
+        && c.creator_fees_locked >= m.vol_snap_fees
+        && c.creator_fees_locked - m.vol_snap_fees < RETIRE_MAX_VOLUME_FEES
+}
+
+/// Run by `crank_funding`: starts the window if there is none (markets created
+/// before it existed), restarts it after the proxy fell, and rolls it forward
+/// when a full window has passed with enough volume (a quiet window is left
+/// alone so the market stays retirable).
+pub fn roll_volume_window(m: &mut Market, c: &Curve, slot: u64) {
+    let f = c.creator_fees_locked;
+    let restart = m.vol_snap_slot == 0
+        || f < m.vol_snap_fees
+        || (slot.saturating_sub(m.vol_snap_slot) >= RETIRE_IDLE_SLOTS && f - m.vol_snap_fees >= RETIRE_MAX_VOLUME_FEES);
+    if restart {
+        m.vol_snap_slot = slot;
+        m.vol_snap_fees = f;
+    }
 }
 
 /// Quanto PnL in USDC (6 dp): notional x (mark / entry - 1), sign by side.
@@ -939,6 +1054,30 @@ fn settle_close(p: &Position, m: &Market, mark: u128, fee: u64) -> Result<(u64, 
     let realized = gross.max(-(p.collateral as i128));
     let equity = (p.collateral as i128 + realized - fee as i128).max(0);
     Ok((equity as u64, realized))
+}
+
+/// `OrderRejected.reason`: the fill price was outside the order's bound.
+pub const REJECT_PRICE: u8 = 0;
+/// The order had expired.
+pub const REJECT_EXPIRED: u8 = 1;
+/// A new open or increase on a pool with no price history yet.
+pub const REJECT_WARMUP: u8 = 2;
+
+/// Returns an order's escrowed collateral to its owner and reports the rejection.
+fn refund_order<'info>(
+    vault: &mut Account<'info, Vault>,
+    order: &OrderRequest,
+    vault_usdc: &Account<'info, TokenAccount>,
+    owner_usdc: &Account<'info, TokenAccount>,
+    token_program: &Program<'info, Token>,
+    reason: u8,
+) -> Result<()> {
+    if order.collateral > 0 {
+        vault.trader_collateral -= order.collateral;
+        pay_from_vault(vault, vault_usdc, owner_usdc, token_program, order.collateral)?;
+    }
+    emit!(OrderRejected { owner: order.owner, market: order.market, reason });
+    Ok(())
 }
 
 fn reset_position(p: &mut Position) {
@@ -1117,6 +1256,16 @@ pub struct Market {
     /// graduated before this field existed, whose pool is Raydium's
     /// canonical address for the mint (see `expected_pool`).
     pub pool: Pubkey,
+    /// The curve's final price (Q64.64), set at `graduate_market`: what a
+    /// graduated market is priced at until its pool has TWAP history. APPENDED
+    /// after `pool`. Zero for Tier 0 markets and for markets that graduated before
+    /// it existed (they fall back to the band anchor, see `warmup_price`).
+    pub grad_price_q64: u128,
+    /// Start of the retirement volume window: slot and the curve's
+    /// `creator_fees_locked` then. APPENDED after `grad_price_q64`. Zero slot =
+    /// not started (the keeper's `crank_funding` starts it).
+    pub vol_snap_slot: u64,
+    pub vol_snap_fees: u64,
 }
 
 #[account]
@@ -1252,6 +1401,21 @@ pub struct RetireMarket<'info> {
     #[account(mut, seeds = [SEED_REGISTRY], bump = registry.bump)]
     pub registry: Box<Account<'info, Registry>>,
     #[account(init, payer = payer, space = 8 + Retired::INIT_SPACE, seeds = [SEED_RETIRED, market.key().as_ref()], bump)]
+    pub retired: Box<Account<'info, Retired>>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct AdminRetireMarket<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(seeds = [SEED_VAULT], bump = vault.bump, has_one = authority)]
+    pub vault: Box<Account<'info, Vault>>,
+    #[account(mut)]
+    pub market: Box<Account<'info, Market>>,
+    #[account(mut, seeds = [SEED_REGISTRY], bump = registry.bump)]
+    pub registry: Box<Account<'info, Registry>>,
+    #[account(init, payer = authority, space = 8 + Retired::INIT_SPACE, seeds = [SEED_RETIRED, market.key().as_ref()], bump)]
     pub retired: Box<Account<'info, Retired>>,
     pub system_program: Program<'info, System>,
 }
@@ -1696,7 +1860,7 @@ pub enum PerpsError {
     WithdrawalLocked,
     #[msg("Too many Tier 0 markets are live; retire idle ones or wait for graduations")]
     MarketLimit,
-    #[msg("Market can't be retired: it has open interest, its curve sold out, or it traded in the last 7 days")]
+    #[msg("Market can't be retired: it has open interest, its curve sold out, or its curve volume over the last 7 days is above the threshold")]
     NotRetirable,
     #[msg("Deprecated, unused: the 7-day creator fee lock was replaced by the 20/80 split")]
     CreatorFeesLocked,
@@ -1704,6 +1868,8 @@ pub enum PerpsError {
     NotForfeitable,
     #[msg("Only the program's upgrade authority can initialize it")]
     NotUpgradeAuthority,
+    #[msg("Every order needs a non-zero acceptable price")]
+    AcceptablePriceRequired,
 }
 
 #[cfg(test)]
@@ -1733,6 +1899,7 @@ mod tests {
             oi_long: 0, oi_short: 0, oi_cap_override: 0, funding_index: 0, last_funding_ts: 0,
             band_anchor_q64: entry, band_anchor_slot: 0, trader_net_pnl: 0, insurance: 0, creator_fees: 0,
             reduce_only: false, adl_mode: false, bump: 0, creator_fees_locked: 0, pool: Pubkey::default(),
+            grad_price_q64: 0, vol_snap_slot: 0, vol_snap_fees: 0,
         };
         let (payout, realized) = settle_close(&p, &m, entry / 10, 3_000_000).unwrap();
         assert_eq!(payout, 0);
@@ -1819,12 +1986,19 @@ mod oracle_tests {
 
     #[test]
     fn pool_twap_averages_the_last_five_minutes() {
-        // Price 100 for a long time, then 200 for the last 60 s: TWAP over 300 s
-        // is (240*100 + 60*200)/300 = 120.
+        // Steps are (time, price from then on); each observation closes the previous step's
+        // interval. The newest interval (2140..2200) was at 100, so the extension to 2260 is at 100.
         let steps: Vec<(u64, u128)> = (0..20).map(|k| (1_000 + k * 60, 100)).chain([(2_200, 200)]).collect();
         let d = observations(&steps);
-        let twap = pool_twap_x32(&d, true, 200, 2_260);
-        assert!((119..=121).contains(&twap), "twap {twap}");
+        assert_eq!(pool_twap_x32(&d, true, 2_260), Some(100));
+        // One more observation: the price was 200 over 2200..2230. The TWAP over
+        // the last 300 s (start obs 1960) mixes the 100 and 200 intervals, and the
+        // extension to 2260 uses the last observed price (200), not the live one.
+        let mut steps2 = steps.clone();
+        steps2.push((2_230, 100));
+        let d = observations(&steps2);
+        // cum(2230) - cum(1960) = 100*(2200-1960) + 200*30 = 30_000; + 30 s at 200 = 36_000; / 300
+        assert_eq!(pool_twap_x32(&d, true, 2_260), Some(120));
     }
 
     #[test]
@@ -1833,20 +2007,89 @@ mod oracle_tests {
         steps.push((2_200, 10_000)); // 100x pump...
         steps.push((2_215, 100)); // ...back by the next observation (15 s)
         let d = observations(&steps);
-        let twap = pool_twap_x32(&d, true, 100, 2_260);
-        // (240*100 + 15*10_000 + 45*100) / 300
-        assert_eq!(twap, 595);
-        // The TWAP alone moves ~6x; the band is what holds the mark to +15%.
+        let twap = pool_twap_x32(&d, true, 2_260).unwrap();
+        // cum(2215)-cum(1960): 100*240 + 10_000*15 = 174_000; the newest interval
+        // (2200..2215) averaged 10_000, and the 45 s extension uses it: +450_000
+        assert_eq!(twap, (174_000 + 450_000) / 300);
+        // The TWAP alone moves ~20x; the band is what holds the mark to +15%.
         let mark = clamp_band(twap << 32, 100u128 << 32);
         assert!(mark <= (115u128 << 32), "mark {}", mark >> 32);
     }
 
     #[test]
-    fn no_history_falls_back_to_spot() {
+    fn no_or_short_history_has_no_twap() {
         let mut d = vec![0u8; 8 + 1 + 2 + 32 + 100 * 40 + 32];
-        assert_eq!(pool_twap_x32(&d, true, 77, 5_000), 77);
+        assert_eq!(pool_twap_x32(&d, true, 5_000), None);
         d[8] = 1;
-        assert_eq!(pool_twap_x32(&d, true, 77, 5_000), 77);
+        assert_eq!(pool_twap_x32(&d, true, 5_000), None, "initialized but empty");
+        // Raydium's first observation only (zero cumulative at the first swap).
+        let d = observations(&[(1_000, 100)]);
+        assert_eq!(pool_twap_x32(&d, true, 5_000), None, "no interval to price from");
+        // Two observations but none old enough to cover the window.
+        let d = observations(&[(4_900, 100), (4_950, 100)]);
+        assert_eq!(pool_twap_x32(&d, true, 5_000), None, "history shorter than 300 s");
+        // Covered once an observation is 300 s old.
+        let d = observations(&[(4_600, 100), (4_650, 100)]);
+        assert_eq!(pool_twap_x32(&d, true, 4_900), Some(100));
+    }
+
+    #[test]
+    fn a_stale_newest_observation_extends_at_the_last_observed_price() {
+        let d = observations(&[(1_000, 100), (1_100, 100), (1_200, 100)]);
+        // Nothing for an hour: the TWAP is the last observed price, whatever the pool shows now.
+        assert_eq!(pool_twap_x32(&d, true, 4_800), Some(100));
+    }
+
+    #[test]
+    fn pool_fee_total_reads_raydium_fee_fields() {
+        let mut d = vec![0u8; 637];
+        let put = |d: &mut Vec<u8>, o: usize, v: u64| d[o..o + 8].copy_from_slice(&v.to_le_bytes());
+        put(&mut d, 341, 1); put(&mut d, 349, 2); // protocol 0 / 1
+        put(&mut d, 357, 10); put(&mut d, 365, 20); // fund 0 / 1
+        put(&mut d, 397, 100); put(&mut d, 405, 200); // creator 0 / 1
+        assert_eq!(pool_fee_total(&d, false), 111);
+        assert_eq!(pool_fee_total(&d, true), 222);
+    }
+
+    #[test]
+    fn retirement_windows() {
+        let mut m = Market {
+            mint: Pubkey::default(), curve: Pubkey::default(), creator: Pubkey::default(), tier: 0, created_slot: 0,
+            oi_long: 0, oi_short: 0, oi_cap_override: 0, funding_index: 0, last_funding_ts: 0,
+            band_anchor_q64: 1, band_anchor_slot: 0, trader_net_pnl: 0, insurance: 0, creator_fees: 0,
+            reduce_only: false, adl_mode: false, bump: 0, creator_fees_locked: 0, pool: Pubkey::default(),
+            grad_price_q64: 0, vol_snap_slot: 0, vol_snap_fees: 0,
+        };
+        use ringside_launch::{Curve, Observation, OBSERVATIONS};
+        let mut c = Curve {
+            mint: Pubkey::default(), creator: Pubkey::default(), name: String::new(), symbol: String::new(), uri: String::new(),
+            virtual_sol: 1, virtual_tokens: 1, real_sol: 0, real_tokens: 0, creator_fees_owed: 0, dev_locked_tokens: 0, dev_unlock_ts: 0,
+            complete: false, migrated: false, created_slot: 0, created_ts: 0, price_cumulative: 0, last_price_q64: 0, last_slot: 0,
+            observations: [Observation::default(); OBSERVATIONS], obs_index: 0, obs_count: 1, bump: 0, creator_fees_locked: 0,
+        };
+        // No window started: not quiet, and a crank starts it.
+        assert!(!volume_window_quiet(&m, &c, 10 * RETIRE_IDLE_SLOTS));
+        roll_volume_window(&mut m, &c, 1_000);
+        assert_eq!((m.vol_snap_slot, m.vol_snap_fees), (1_000, 0));
+        // Not old enough.
+        assert!(!volume_window_quiet(&m, &c, 1_000 + RETIRE_IDLE_SLOTS - 1));
+        // Dust below the threshold keeps it quiet.
+        c.creator_fees_locked = RETIRE_MAX_VOLUME_FEES - 1;
+        assert!(volume_window_quiet(&m, &c, 1_000 + RETIRE_IDLE_SLOTS));
+        // At the threshold it is active; a crank after a full window restarts the window.
+        c.creator_fees_locked = RETIRE_MAX_VOLUME_FEES;
+        assert!(!volume_window_quiet(&m, &c, 1_000 + RETIRE_IDLE_SLOTS));
+        roll_volume_window(&mut m, &c, 1_000 + RETIRE_IDLE_SLOTS);
+        assert_eq!((m.vol_snap_slot, m.vol_snap_fees), (1_000 + RETIRE_IDLE_SLOTS, RETIRE_MAX_VOLUME_FEES));
+        // A quiet full window is left alone, so the market stays retirable.
+        let (s0, f0) = (m.vol_snap_slot, m.vol_snap_fees);
+        roll_volume_window(&mut m, &c, s0 + 5 * RETIRE_IDLE_SLOTS);
+        assert_eq!((m.vol_snap_slot, m.vol_snap_fees), (s0, f0));
+        // A fall in the proxy (forfeit) is never quiet and restarts the window.
+        c.creator_fees_locked = 0;
+        assert!(!volume_window_quiet(&m, &c, s0 + 5 * RETIRE_IDLE_SLOTS));
+        roll_volume_window(&mut m, &c, s0 + 5 * RETIRE_IDLE_SLOTS);
+        assert_eq!((m.vol_snap_slot, m.vol_snap_fees), (s0 + 5 * RETIRE_IDLE_SLOTS, 0));
     }
 }
 
@@ -1864,7 +2107,7 @@ mod layout_fixture {
         Market {
             mint: k(1), curve: k(2), creator: k(3), tier: 1, created_slot: 9, oi_long: 10, oi_short: 11, oi_cap_override: 12,
             funding_index: -13, last_funding_ts: 14, band_anchor_q64: 15u128 << 64, band_anchor_slot: 16, trader_net_pnl: -17,
-            insurance: 18, creator_fees: 19, reduce_only: true, adl_mode: true, bump: 254, creator_fees_locked: 20, pool: k(21),
+            insurance: 18, creator_fees: 19, reduce_only: true, adl_mode: true, bump: 254, creator_fees_locked: 20, pool: k(21), grad_price_q64: (22u128 << 64) + 1, vol_snap_slot: 23, vol_snap_fees: 24,
         }.try_serialize(&mut out).unwrap();
         println!("MARKET {}", out.iter().map(|b| format!("{b:02x}")).collect::<String>());
         let mut out = Vec::new();
@@ -1880,7 +2123,7 @@ mod layout_fixture {
     /// predate the `pool` field. Update both together.
     #[test]
     fn market_account_size_matches_resize_script() {
-        assert_eq!(8 + Market::INIT_SPACE, 260);
+        assert_eq!(8 + Market::INIT_SPACE, 292);
     }
 
 }

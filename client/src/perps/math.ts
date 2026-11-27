@@ -142,3 +142,11 @@ export function fundingOwed(side: number, sizeUsd: bigint, fundingSnapshot: bigi
   const owed = (sizeUsd * (index - fundingSnapshot)) / FUNDING_SCALE;
   return side === SIDE_LONG ? owed : -owed;
 }
+
+/** Slippage the app offers on a perp order: default 1%, at most 5%. */
+export const DEFAULT_SLIPPAGE_BPS = 100, MAX_SLIPPAGE_BPS = 500;
+/** Parses a percent the user typed ("1", "0.5") to whole bps within 1..MAX_SLIPPAGE_BPS; anything else is the default. */
+export function slippageBpsFromPercent(pct: number): number {
+  if (!Number.isFinite(pct) || pct <= 0) return DEFAULT_SLIPPAGE_BPS;
+  return Math.min(Math.max(Math.round(pct * 100), 1), MAX_SLIPPAGE_BPS);
+}

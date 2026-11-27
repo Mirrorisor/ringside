@@ -18,6 +18,7 @@
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 import anchor from "@coral-xyz/anchor";
+import { acceptablePrice } from "../src/perps/order.js";
 import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SystemProgram } from "@solana/web3.js";
 import {
   ASSOCIATED_TOKEN_PROGRAM_ID,
@@ -131,13 +132,17 @@ async function main() {
     const market = pda([enc("market"), mintKey.toBuffer()], perps.programId);
     const position = pda([enc("position"), me.toBuffer(), market.toBuffer(), Uint8Array.from([side])], perps.programId);
     const order = pda([enc("order"), me.toBuffer(), market.toBuffer(), Uint8Array.from([side])], perps.programId);
-    const request = (kind: number, collateral: number, size: number) =>
-      retry("request order", () =>
+    const request = async (kind: number, collateral: number, size: number) => {
+      // Orders need a price bound (the program refuses 0): 50% around the market's band anchor.
+      const mk = await perps.account.market.fetch(market);
+      const bound = new BN(acceptablePrice(side as 0 | 1, kind ? "close" : "open", BigInt(mk.bandAnchorQ64.toString()), 5_000).toString());
+      return retry("request order", () =>
         perps.methods
-          .requestOrder({ side, kind, collateral: new BN(collateral), sizeUsd: new BN(size), acceptablePriceQ64: new BN(0) })
+          .requestOrder({ side, kind, collateral: new BN(collateral), sizeUsd: new BN(size), acceptablePriceQ64: bound })
           .accountsPartial({ owner: me, payer: me, vault, vaultUsdc, market, position, order, ownerUsdc: myUsdc, tokenProgram: TOKEN_PROGRAM_ID, systemProgram: SystemProgram.programId })
           .rpc(),
       );
+    };
     const execute = async () => {
       for (let i = 0; i < 30; i++) {
         await sleep(2_000); // fill delay is 2 slots (~0.8 s); go easy on the public RPC

@@ -12,6 +12,12 @@ export interface MarketAcc {
   reduceOnly: boolean; adlMode: boolean; bump: number;
   /** Locked 80% of creator fees (docs/creator-fee-lock.md). Absent until the IDL is regenerated from the upgraded program. */
   creatorFeesLocked?: BN;
+  /** Appended fields; absent until the IDL is regenerated from the upgraded program. `pool` is all zeros before graduation. */
+  pool?: PublicKey;
+  /** The curve's final price (Q64.64) a graduated market is priced at until its pool has TWAP history (0 on older markets). */
+  gradPriceQ64?: BN;
+  /** Start of the retirement volume window: slot, and the curve's creator_fees_locked then. */
+  volSnapSlot?: BN; volSnapFees?: BN;
 }
 export interface PositionAcc {
   owner: PublicKey; market: PublicKey; side: number; collateral: BN; sizeUsd: BN; entryPriceQ64: BN; fundingSnapshot: BN; openedSlot: BN; bump: number;

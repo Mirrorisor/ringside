@@ -144,10 +144,12 @@ select{width:100%;min-height:42px;font-size:16px;border:1px solid var(--line);bo
         <div class="seg" style="margin-top:10px" role="group" aria-label="Side"><button id="sLong" aria-pressed="true">Long</button><button id="sShort" aria-pressed="false">Short</button></div>
         <label for="col">Collateral (USDC)</label><input id="col" class="num" inputmode="decimal" value="2.6">
         <label for="lev">Leverage <b id="levV"></b> · <span id="levMax">Tier 0 max 2x</span></label><input type="range" id="lev" min="1" max="1.98" step="0.01" value="1.9" style="padding:0">
+        <label for="slip">Slippage (%, max 5)</label><input id="slip" class="num" inputmode="decimal" value="1">
         <div class="rows">
           <div><span>Size</span><span id="pSize">–</span></div>
           <div><span id="pFeeL">Open fee (0.30%)</span><span id="pFee">–</span></div>
           <div><span>Fill price (worse of mark/spot)</span><span id="pPx">–</span></div>
+          <div><span>Price limit (order is refunded outside it)</span><span id="pLimit">–</span></div>
           <div><span>Your cap / side room</span><span id="pCap">–</span></div>
         </div>
         <button class="long" id="open" style="width:100%;margin-top:12px">Open long</button>

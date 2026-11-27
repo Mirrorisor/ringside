@@ -27,7 +27,7 @@ import { buildBuy, buildSell, PumpTradeError, type BuiltTrade, type BuyQuote, ty
 import { PublicKey } from "@solana/web3.js";
 import type { Idl } from "../perps/anchor.js";
 import type { MarketAcc, PositionAcc, VaultAcc } from "../perps/accounts.js";
-import { checkIncreaseCaps, clampTier, fundingOwed, maxSizeForCollateral, mulBps, projectedFundingIndex, tierParams } from "../perps/math.js";
+import { MAX_SLIPPAGE_BPS, checkIncreaseCaps, clampTier, fundingOwed, maxSizeForCollateral, mulBps, projectedFundingIndex, tierParams } from "../perps/math.js";
 import { buildOrderInstruction } from "../perps/order.js";
 import { cappedLeverage, perpsGateFromEnv } from "./perps.js";
 import type { CopyIntent, LeaderExitPort } from "./ports.js";
@@ -344,7 +344,13 @@ async function buildPerp(deps: BuildDeps, i: PerpIntent, follower: string): Prom
   // the transaction's fee payer: sponsor.ts refuses a fee payer that appears in any instruction's accounts.
   const feePayer = deps.sponsor ? new PublicKey(deps.sponsor) : owner;
   const base = { idl: pd.idl, trader: owner, payer: owner, mint, usdcMint: vault.usdcMint };
-  const bound = state.referencePriceQ64 !== undefined ? { referencePriceQ64: state.referencePriceQ64, slippageBps: i.slippageBps } : {};
+  // The program refuses an order with no price bound, so a build without a reference price is refused here too
+  // (when the order is built, after the checks above it). Perp orders offer at most 5% slippage, whatever the
+  // follower's general copy setting is.
+  const bound = () => {
+    if (state.referencePriceQ64 === undefined || state.referencePriceQ64 <= 0n) throw new BuildError("venue_unavailable", "No reference price for the perp order.");
+    return { referencePriceQ64: state.referencePriceQ64, slippageBps: Math.min(i.slippageBps, MAX_SLIPPAGE_BPS) };
+  };
   const feeBps = tierParams(clampTier(market.tier)).feeBps;
   const finish = async (ixs: ReturnType<typeof buildOrderInstruction>[], sizeUsd: bigint, collateral: bigint, lamports: number): Promise<BuiltIntent> => {
     let transaction: string;
@@ -365,7 +371,7 @@ async function buildPerp(deps: BuildDeps, i: PerpIntent, follower: string): Prom
     const pos = state.positions[cside];
     if (!pos || BigInt(pos.sizeUsd.toString()) <= 0n) throw new BuildError("build_failed", "No open position to close.");
     if (state.orders[cside]) throw new BuildError("build_failed", "An order on this side is already waiting for a keeper.");
-    return finish([buildOrderInstruction({ ...base, ...bound, action: "close", side: cside })], BigInt(pos.sizeUsd.toString()), 0n, i.lamports ?? 0);
+    return finish([buildOrderInstruction({ ...base, ...bound(), action: "close", side: cside })], BigInt(pos.sizeUsd.toString()), 0n, i.lamports ?? 0);
   }
   if (i.side !== "long" && i.side !== "short") throw new BuildError("build_failed", "Unsupported side.");
   const side = i.side === "long" ? 0 : 1;
@@ -405,7 +411,7 @@ async function buildPerp(deps: BuildDeps, i: PerpIntent, follower: string): Prom
   const breach = checkIncreaseCaps(vault, market, state.solReserve, side, size, exSize, state.nowSec);
   if (breach) throw new BuildError("perp_cap", `The market cannot take this copy (${breach}).`);
 
-  return finish([buildOrderInstruction({ ...base, ...bound, action: exSize > 0n ? "increase" : "open", side, collateral, sizeUsd: size })], size, collateral, lamports);
+  return finish([buildOrderInstruction({ ...base, ...bound(), action: exSize > 0n ? "increase" : "open", side, collateral, sizeUsd: size })], size, collateral, lamports);
 }
 
 function toKitInstruction(ix: ReturnType<typeof buildOrderInstruction>): Instruction {

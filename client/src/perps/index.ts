@@ -3,5 +3,6 @@ export * from "./math.js";
 export * from "./pda.js";
 export * from "./accounts.js";
 export * from "./order.js";
+export * from "./pool.js";
 export * from "./events.js";
 export { anchor, BN } from "./anchor.js";

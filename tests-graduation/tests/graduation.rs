@@ -252,6 +252,7 @@ async fn sold_out_curve_graduates_into_a_raydium_pool_with_lp_burned() {
     assert!(!mk.reduce_only, "graduated market trades again");
     let _ = before;
     assert_eq!(mk.band_anchor_q64, curve_final, "band restarts at the curve's final price");
+    assert_eq!(mk.grad_price_q64, curve_final, "the final price is kept for pricing until the pool has history");
     let pool_spot = pool_open;
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     let twice = Transaction::new_signed_with_payer(&[ComputeBudgetInstruction::set_compute_unit_limit(300_000), grad], Some(&payer), &[&ctx.payer], bh);
@@ -280,6 +281,23 @@ async fn sold_out_curve_graduates_into_a_raydium_pool_with_lp_burned() {
             data: raydium_cp_swap::instruction::SwapBaseInput { amount_in: 300_000_000 * 1_000_000, minimum_amount_out: 1 }.data(),
         },
     ], &[&buyer]).await;
+    // The market prices from Raydium's observation history, never the live pool price: the first swap only
+    // starts the history, so a second, small swap 30 s later records the price the dump left behind.
+    clock = ctx.banks_client.get_sysvar().await.unwrap();
+    ctx.warp_to_slot(clock.slot + 5).unwrap();
+    clock = ctx.banks_client.get_sysvar().await.unwrap();
+    clock.unix_timestamp += 30;
+    ctx.set_sysvar(&clock);
+    send(&mut ctx, &[Instruction {
+        program_id: raydium::CPMM_PROGRAM,
+        accounts: raydium_cp_swap::accounts::Swap {
+            payer: buyer.pubkey(), authority: cpmm_auth, amm_config: raydium::AMM_CONFIG, pool_state: pool,
+            input_token_account: buyer_ata, output_token_account: buyer_wsol, input_vault: in_vault, output_vault: out_vault,
+            input_token_program: spl_token::ID, output_token_program: spl_token::ID, input_token_mint: m, output_token_mint: wsol,
+            observation_state: obs,
+        }.to_account_metas(None),
+        data: raydium_cp_swap::instruction::SwapBaseInput { amount_in: 1_000 * 1_000_000, minimum_amount_out: 1 }.data(),
+    }], &[&buyer]).await;
     let sol_after = token_amount(&mut ctx, sol_vault).await;
     let tok_after = token_amount(&mut ctx, tok_vault).await;
     let new_spot = ((sol_after as u128) << 64) / tok_after as u128;

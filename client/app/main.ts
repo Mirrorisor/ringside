@@ -15,8 +15,9 @@ import launchIdl from "../../target/idl/ringside_launch.json";
 import perpsIdl from "../../target/idl/ringside_perps.json";
 import { feeView, type FeeInput } from "../src/creatorfees";
 import {
-  GROSS_CAP_MULT, buildOrderInstruction, decodeMarket, decodePosition, decodeVault, marketPda, oiCap, orderPda as perpsOrderPda,
-  perpsCoders, positionPda as perpsPositionPda, tierParams, vaultPda, vaultUsdcPda,
+  DEFAULT_SLIPPAGE_BPS, GROSS_CAP_MULT, MAX_SLIPPAGE_BPS, acceptablePrice, buildOrderInstruction, decodeMarket, decodePosition, decodeVault, marketPda, netOfFees,
+  oiCap, orderPda as perpsOrderPda, perpsCoders, poolFeeTotal, poolTwapX32, positionPda as perpsPositionPda, slippageBpsFromPercent, tierParams, vaultPda,
+  vaultUsdcPda,
 } from "../src/perps/index";
 
 // ---------------------------------------------------------------------------
@@ -44,7 +45,6 @@ const Q64 = 2n ** 64n;
 const U128 = 2n ** 128n;
 const TICK_MS = 6_000;
 const CURVE_SUPPLY = 800_000_000_000_000n; // 800M tokens, 6 decimals
-const POOL_TWAP_SECONDS = 300n;
 // Raydium CPMM, where graduated tokens trade.
 const CPMM = new PublicKey(NET.cpmm);
 const AMM_CONFIG = new PublicKey(NET.ammConfig);
@@ -154,7 +154,7 @@ const st: {
   slot: bigint; vaultUsdc: number; walletSol: number; traderSol: number; traderUsdc: number; walletTokens: number;
   hist: { spot: number; mark: number; lo: number; hi: number }[]; mode: "perp" | "spot"; side: 0 | 1; busy: boolean;
   /** Raydium pool of a graduated token: vault balances and the raw ObservationState. */
-  pool: { addr: PublicKey; tokens: bigint; sol: bigint; obs: Buffer } | null;
+  pool: { addr: PublicKey; tokens: bigint; sol: bigint; obs: Buffer } | null; // tokens and sol are net of the pool's accrued fees
   /** Curves this wallet created, with each one's perp market (null when it has none). */
   mine: { curve: any; market: any | null }[];
 } = {
@@ -229,31 +229,6 @@ function poolKeys(mint: PublicKey, pool: PublicKey) {
     authority: pda([enc("vault_and_lp_mint_auth_seed")], CPMM),
   };
 }
-/** Mirrors pool_twap_x32 in the perps program; returns Q64. */
-function poolTwapQ(obs: Buffer, tokenIs0: boolean, spotX32: bigint, now: bigint): bigint {
-  const BASE = 43;
-  if (obs.length < BASE + 4000 || obs[8] === 0) return spotX32 << 32n;
-  const latest = obs.readUInt16LE(9) % 100;
-  const ts = (k: number) => obs.readBigUInt64LE(BASE + k * 40);
-  const cum = (k: number) => {
-    const o = BASE + k * 40 + 8 + (tokenIs0 ? 0 : 16);
-    return obs.readBigUInt64LE(o) + (obs.readBigUInt64LE(o + 8) << 64n);
-  };
-  const tl = ts(latest);
-  if (tl === 0n || tl > now) return spotX32 << 32n;
-  const cumNow = (cum(latest) + spotX32 * (now - tl)) % U128;
-  const cutoff = now > POOL_TWAP_SECONDS ? now - POOL_TWAP_SECONDS : 0n;
-  let best: [bigint, bigint] | null = null, oldest: [bigint, bigint] | null = null;
-  for (let k = 0; k < 100; k++) {
-    const t = ts(k);
-    if (t === 0n || t > now) continue;
-    if (t <= cutoff && (!best || t > best[0])) best = [t, cum(k)];
-    if (!oldest || t < oldest[0]) oldest = [t, cum(k)];
-  }
-  const start = best ?? oldest;
-  if (!start || now <= start[0]) return spotX32 << 32n;
-  return ((((cumNow - start[1]) % U128) + U128) % U128 / (now - start[0])) << 32n;
-}
 const graduated = () => !!(st.curve?.migrated && st.pool && st.market && st.market.tier >= 1);
 /** Spot the perps program uses: the curve, or the Raydium pool once the market graduated. */
 function spotNow(): bigint {
@@ -262,11 +237,18 @@ function spotNow(): bigint {
 }
 /** Spot as the perps program sees it: the pool only once the market has graduated. */
 const perpSpot = () => (graduated() ? spotNow() : spotQ(st.curve));
+/** The pool's TWAP (Q64), or null while its observation history doesn't cover the window yet. */
+function poolTwapNow(c: any): bigint | null {
+  const k = poolKeys(c.mint, st.pool!.addr);
+  const t = poolTwapX32(st.pool!.obs, k.tokenIs0, BigInt(Math.floor(Date.now() / 1000)));
+  return t === null ? null : t << 32n;
+}
+/** Mirrors warmup_price: the curve's final price stored at graduation (the band anchor for older markets). */
+const warmupPrice = (m: any): bigint => (m.gradPriceQ64 ? big(m.gradPriceQ64) : 0n) || big(m.bandAnchorQ64);
+/** A graduated market whose pool has no TWAP history yet: priced at the curve's final price, new opens refused. */
+const warming = () => graduated() && poolTwapNow(st.curve) === null;
 function twapNow(c: any, slot: bigint): bigint {
-  if (graduated()) {
-    const k = poolKeys(c.mint, st.pool!.addr);
-    return poolTwapQ(st.pool!.obs, k.tokenIs0, (st.pool!.sol << 32n) / st.pool!.tokens, BigInt(Math.floor(Date.now() / 1000)));
-  }
+  if (graduated()) return poolTwapNow(c) ?? warmupPrice(st.market);
   return twapQ(c, slot);
 }
 
@@ -360,8 +342,15 @@ async function tick() {
     if (st.curve?.migrated) {
       const addr = await resolvePool(mint, mI?.data ?? null);
       const k = poolKeys(mint, addr);
-      const [tv, sv, ob] = await connection.getMultipleAccountsInfo([k.tokenVault, k.solVault, k.observation]);
-      if (tv && sv && ob) st.pool = { addr, tokens: BigInt(tokenAmount(tv.data)), sol: BigInt(tokenAmount(sv.data)), obs: ob.data };
+      const [tv, sv, ob, ps] = await connection.getMultipleAccountsInfo([k.tokenVault, k.solVault, k.observation, k.pool]);
+      if (tv && sv && ob && ps && ps.data.length >= 413) {
+        // Raydium prices (and the perps program marks) from vault balances net of accrued protocol, fund and creator fees.
+        st.pool = {
+          addr, obs: ob.data,
+          tokens: netOfFees(BigInt(tokenAmount(tv.data)), poolFeeTotal(ps.data, !k.tokenIs0)),
+          sol: netOfFees(BigInt(tokenAmount(sv.data)), poolFeeTotal(ps.data, k.tokenIs0)),
+        };
+      }
     }
     if (st.curve && st.market) {
       const { mark, anchor } = markQ(st.market, st.curve, st.slot);
@@ -519,6 +508,21 @@ function backupTradingKey() {
   log("Trading key downloaded. Keep it safe: it controls this trading account's margin.");
 }
 
+/** The slippage the user picked, in bps: default 1%, at most 5%. */
+function slippageBps(): number {
+  const el = $("slip") as HTMLInputElement;
+  const raw = parseFloat(el.value);
+  const bps = Number.isFinite(raw) ? slippageBpsFromPercent(raw) : DEFAULT_SLIPPAGE_BPS;
+  if (Number.isFinite(raw) && raw * 100 > MAX_SLIPPAGE_BPS) el.value = String(MAX_SLIPPAGE_BPS / 100);
+  return bps;
+}
+/** What the program fills at: the worse of mark and spot for the trader, for an open or a close. */
+function fillPriceQ(side: number, closing: boolean, mk: { mark: bigint }): bigint {
+  const spot = perpSpot();
+  const higher = (side === 0) !== closing; // open long and close short pay the higher price
+  return higher ? (mk.mark > spot ? mk.mark : spot) : (mk.mark < spot ? mk.mark : spot);
+}
+
 function renderTicket(mk: ReturnType<typeof markQ> | null) {
   const col = parseFloat(($("col") as HTMLInputElement).value) || 0;
   const t = tierOf(), levInput = $("lev") as HTMLInputElement;
@@ -545,6 +549,8 @@ function renderTicket(mk: ReturnType<typeof markQ> | null) {
     const spot = perpSpot();
     const px = st.side === 0 ? (mk.mark > spot ? mk.mark : spot) : (mk.mark < spot ? mk.mark : spot);
     $("pPx").textContent = `${qToSolPerToken(px).toExponential(3)} SOL`;
+    const bound = acceptablePrice(st.side as 0 | 1, "open", px, slippageBps());
+    $("pLimit").textContent = `${st.side === 0 ? "at most" : "at least"} ${qToSolPerToken(bound).toExponential(3)} SOL`;
     const oiL = Number(m.oiLong) / USDC, oiS = Number(m.oiShort) / USDC;
     const sideOi = st.side === 0 ? oiL : oiS, netAfter = oiL - oiS + (st.side === 0 ? size : -size);
     const existing = st.positions[st.side] ? Number(st.positions[st.side].sizeUsd) / USDC : 0;
@@ -557,6 +563,7 @@ function renderTicket(mk: ReturnType<typeof markQ> | null) {
     else if (existing + size > k.account) why = "Above your per-account cap for this market.";
     else if (sideOi + size > k.side) why = "This side of the market is full.";
     else if (Math.abs(netAfter) > k.skew) why = "Vault net exposure limit. Try the other side or a smaller size.";
+    else if (warming()) why = "New Raydium pool: opens reopen once it has 5 minutes of trade history. Closing works.";
     else if (mk.clamped) why = "Mark is at the band edge; new positions wait for it to catch up.";
     else if (c.complete && m.tier === 0) why = "Sold out: perps reopen once the market moves to the Raydium price.";
     else if (m.reduceOnly) why = "Market is reduce-only.";
@@ -778,10 +785,16 @@ async function sponsoredOrder(side: number, kind: number, collateral: number, si
   const info = await (await fetch(`${RELAYER}/v1/info`)).json();
   const relayer = new PublicKey(info.relayer);
   const market = marketPda(perps.programId, mint);
+  // Every order carries a price bound: the program refuses 0. It is the fill price right now moved by the user's slippage.
+  if (!st.market || !st.curve) throw new Error("Market not loaded yet.");
+  const reference = fillPriceQ(side, kind === 1, markQ(st.market, st.curve, st.slot));
+  const bps = slippageBps();
   const ix = buildOrderInstruction({
     idl: perpsIdl as Idl, action: kind ? "close" : "open", trader: trader.publicKey, payer: relayer, mint, side: side as 0 | 1, usdcMint: st.usdcMint!,
     collateral: BigInt(Math.round(collateral * USDC)), sizeUsd: BigInt(Math.round(size * USDC)), coders: perpsCoder,
+    referencePriceQ64: reference, slippageBps: bps,
   });
+  log(`${kind ? "Close" : "Open"} price limit ${qToSolPerToken(acceptablePrice(side as 0 | 1, kind ? "close" : "open", reference, bps)).toExponential(3)} SOL (${bps / 100}% slippage)`);
   let body: any;
   for (let attempt = 0; ; attempt++) {
     const tx = new Transaction({ feePayer: relayer, recentBlockhash: (await connection.getLatestBlockhash()).blockhash }).add(ix);
@@ -891,7 +904,7 @@ $("mSpot").addEventListener("click", () => setMode("spot"));
 const setSide = (s: 0 | 1) => { st.side = s; $("sLong").setAttribute("aria-pressed", String(s === 0)); $("sShort").setAttribute("aria-pressed", String(s === 1)); render(); };
 $("sLong").addEventListener("click", () => setSide(0));
 $("sShort").addEventListener("click", () => setSide(1));
-for (const id of ["col", "lev", "solIn"]) $(id).addEventListener("input", () => render());
+for (const id of ["col", "lev", "solIn", "slip"]) $(id).addEventListener("input", () => render());
 new ResizeObserver(() => drawChart()).observe($("chart"));
 
 async function loop() {

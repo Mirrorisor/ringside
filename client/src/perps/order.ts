@@ -8,7 +8,7 @@ import { PublicKey, SystemProgram, TransactionInstruction } from "@solana/web3.j
 import { TOKEN_PROGRAM_ID, getAssociatedTokenAddressSync } from "@solana/spl-token";
 import { BN, type Idl } from "./anchor.js";
 import { perpsCoders, type PerpsCoders } from "./accounts.js";
-import { BPS, ORDER_CLOSE, ORDER_INCREASE, SIDE_LONG } from "./math.js";
+import { BPS, DEFAULT_SLIPPAGE_BPS, MAX_SLIPPAGE_BPS, ORDER_CLOSE, ORDER_INCREASE, SIDE_LONG } from "./math.js";
 import { marketPda, orderPda, positionPda, vaultPda, vaultUsdcPda } from "./pda.js";
 
 export type OrderAction = "open" | "increase" | "close";
@@ -29,7 +29,8 @@ export interface OrderParams {
   sizeUsd?: bigint;
   /**
    * Slippage bound. Either an explicit `acceptablePriceQ64`, or a reference price (Q64 lamports per base unit)
-   * plus slippage in bps. With neither, no bound (0), as the app has always sent. Direction follows the program
+   * plus slippage in bps. One of the two is required: the program refuses an order whose acceptable price is 0
+   * (`AcceptablePriceRequired`), because an unbounded order can be filled by anyone at any price. Direction follows the program
    * (lib.rs:382-387): an increase long or a close short caps the price; an increase short or a close long floors it.
    */
   acceptablePriceQ64?: bigint;
@@ -57,9 +58,11 @@ export function buildOrderInstruction(p: OrderParams): TransactionInstruction {
   if (collateral < 0n || collateral > U64 || sizeUsd < 0n || sizeUsd > U64) throw new Error("amount out of u64 range");
   let acceptable = p.acceptablePriceQ64 ?? 0n;
   if (p.acceptablePriceQ64 === undefined && p.referencePriceQ64 !== undefined) {
-    acceptable = acceptablePrice(p.side, p.action, p.referencePriceQ64, p.slippageBps ?? 0);
+    const bps = p.slippageBps ?? DEFAULT_SLIPPAGE_BPS;
+    if (bps > MAX_SLIPPAGE_BPS) throw new Error(`slippage above ${MAX_SLIPPAGE_BPS / 100}% is not offered on perp orders`);
+    acceptable = acceptablePrice(p.side, p.action, p.referencePriceQ64, bps);
   }
-  if (acceptable < 0n || acceptable > U128) throw new Error("acceptablePriceQ64 out of range");
+  if (acceptable <= 0n || acceptable > U128) throw new Error("an order needs a non-zero acceptable price (acceptablePriceQ64, or referencePriceQ64 and slippageBps)");
 
   const coders = p.coders ?? perpsCoders(p.idl);
   const programId = new PublicKey(p.idl.address);

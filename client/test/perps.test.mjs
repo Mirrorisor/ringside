@@ -8,7 +8,7 @@ import anchorPkg from "@coral-xyz/anchor";
 import { Connection, Keypair, PublicKey, SystemProgram, VersionedTransaction } from "@solana/web3.js";
 import { TOKEN_PROGRAM_ID, getAssociatedTokenAddressSync } from "@solana/spl-token";
 import {
-  BPS, GROSS_CAP_MULT, acceptablePrice, buildOrderInstruction, caps, checkIncreaseCaps, curvePda, decodeMarket, decodePerpEvents, decodePosition,
+  BPS, DEFAULT_SLIPPAGE_BPS, GROSS_CAP_MULT, MAX_SLIPPAGE_BPS, acceptablePrice, netOfFees, poolFeeTotal, poolTwapX32, slippageBpsFromPercent, buildOrderInstruction, caps, checkIncreaseCaps, curvePda, decodeMarket, decodePerpEvents, decodePosition,
   decodeVault, fundingOwed, marketPda, projectedFundingIndex, maxSizeForCollateral, oiCap, orderPda, perpsCoders, positionPda, tierParams, vaultPda, vaultUsdcPda,
 } from "../dist/perps/index.js";
 import { buildIntent, BuildError, cachedGenesisHash, cachedMintDecimals } from "../dist/copy/build.js";
@@ -130,22 +130,22 @@ test("request_order: identical to what Anchor's Program builds (what the app sen
   const market = marketPda(PERPS, MINT);
   for (const [kind, side] of [[0, 0], [0, 1], [1, 0], [1, 1]]) {
     const col = kind ? 0 : 7_500_000, size = kind ? 0 : 15_000_000;
-    const old = await program.methods.requestOrder({ side, kind, collateral: new BN(col), sizeUsd: new BN(size), acceptablePriceQ64: new BN(0) })
+    const old = await program.methods.requestOrder({ side, kind, collateral: new BN(col), sizeUsd: new BN(size), acceptablePriceQ64: new BN(123456) })
       .accountsPartial({
         owner: TRADER, payer: RELAYER, vault: vaultPda(PERPS), vaultUsdc: vaultUsdcPda(PERPS), market,
         position: positionPda(PERPS, TRADER, market, side), order: orderPda(PERPS, TRADER, market, side),
         ownerUsdc: getAssociatedTokenAddressSync(USDC_MINT, TRADER), tokenProgram: TOKEN_PROGRAM_ID, systemProgram: SystemProgram.programId,
       }).instruction();
-    const now = buildOrderInstruction({ idl, action: kind ? "close" : "open", trader: TRADER, payer: RELAYER, mint: MINT, side, usdcMint: USDC_MINT, collateral: BigInt(col), sizeUsd: BigInt(size) });
+    const now = buildOrderInstruction({ idl, action: kind ? "close" : "open", trader: TRADER, payer: RELAYER, mint: MINT, side, usdcMint: USDC_MINT, collateral: BigInt(col), sizeUsd: BigInt(size), acceptablePriceQ64: 123456n });
     assert.deepEqual(now.data, old.data, `data kind ${kind} side ${side}`);
     assert.deepEqual(now.keys.map((x) => [x.pubkey.toBase58(), x.isSigner, x.isWritable]), old.keys.map((x) => [x.pubkey.toBase58(), x.isSigner, x.isWritable]));
   }
 });
 
 test("request_order: close ignores amounts, increase equals open, bad input refused, slippage direction follows the program", opts, () => {
-  const base = { idl, trader: TRADER, mint: MINT, side: 0, usdcMint: USDC_MINT };
+  const base = { idl, trader: TRADER, mint: MINT, side: 0, usdcMint: USDC_MINT, acceptablePriceQ64: 7n };
   const close = buildOrderInstruction({ ...base, action: "close", collateral: 9n, sizeUsd: 9n });
-  assert.deepEqual(close.data, Buffer.concat([DISC, Buffer.from([0, 1]), u64(0), u64(0), u128(0)]));
+  assert.deepEqual(close.data, Buffer.concat([DISC, Buffer.from([0, 1]), u64(0), u64(0), u128(7)]));
   assert.equal(close.keys[1].pubkey.toBase58(), TRADER.toBase58(), "payer defaults to the trader");
   const a = buildOrderInstruction({ ...base, action: "open", collateral: 1n, sizeUsd: 2n }), b = buildOrderInstruction({ ...base, action: "increase", collateral: 1n, sizeUsd: 2n });
   assert.deepEqual(a.data, b.data);
@@ -157,8 +157,17 @@ test("request_order: close ignores amounts, increase equals open, bad input refu
   assert.equal(acceptablePrice(1, "open", R, 100), 990_000n, "open short: price must not fall below");
   assert.equal(acceptablePrice(0, "close", R, 100), 990_000n, "close long: floor");
   assert.equal(acceptablePrice(1, "close", R, 100), 1_010_000n, "close short: cap");
-  const bounded = buildOrderInstruction({ ...base, action: "open", collateral: 1n, sizeUsd: 2n, referencePriceQ64: R, slippageBps: 100 });
+  const { acceptablePriceQ64: _drop, ...unbounded } = base;
+  const bounded = buildOrderInstruction({ ...unbounded, action: "open", collateral: 1n, sizeUsd: 2n, referencePriceQ64: R, slippageBps: 100 });
   assert.deepEqual(bounded.data.subarray(-16), u128(1_010_000n));
+  // The default slippage is 1%.
+  assert.deepEqual(buildOrderInstruction({ ...unbounded, action: "open", collateral: 1n, sizeUsd: 2n, referencePriceQ64: R }).data.subarray(-16), u128(1_010_000n));
+  // The program refuses a zero acceptable price, so the builder never makes one, and offers at most 5% slippage.
+  assert.throws(() => buildOrderInstruction({ ...unbounded, action: "open", collateral: 1n, sizeUsd: 2n }), /non-zero acceptable price/);
+  assert.throws(() => buildOrderInstruction({ ...unbounded, action: "close" }), /non-zero acceptable price/);
+  assert.throws(() => buildOrderInstruction({ ...base, action: "open", collateral: 1n, sizeUsd: 2n, acceptablePriceQ64: 0n }), /non-zero/);
+  assert.throws(() => buildOrderInstruction({ ...unbounded, action: "open", collateral: 1n, sizeUsd: 2n, referencePriceQ64: R, slippageBps: 501 }), /5%/);
+  assert.ok(buildOrderInstruction({ ...unbounded, action: "open", collateral: 1n, sizeUsd: 2n, referencePriceQ64: R, slippageBps: 500 }));
   assert.throws(() => acceptablePrice(0, "open", R, 10_001));
 });
 
@@ -234,7 +243,7 @@ function rig({ maxLeverage = 5, tier = 2, solReserve = 300_000_000_000n, market 
   const state = {
     vault: { usdcMint: USDC_MINT, paused: false, solUsdE6: bn(150_000_000), solUsdTs: bn(1_000), tier0CapBps: 100, skewCapBps: 2500, ...vaultOv },
     market: { tier, reduceOnly: false, oiLong: bn(0), oiShort: bn(0), oiCapOverride: bn(0), ...market },
-    positions: { 0: null, 1: null, ...positions }, orders: { 0: false, 1: false, ...orders }, solReserve, graduated, nowSec: 1_050,
+    positions: { 0: null, 1: null, ...positions }, orders: { 0: false, 1: false, ...orders }, solReserve, graduated, nowSec: 1_050, referencePriceQ64: 1_000_000n,
   };
   const calls = [];
   const deps = (o = {}) => ({
@@ -326,7 +335,6 @@ test("copy perps build: unsigned, sponsor pays, short side, slippage bound, clos
   assert.equal(a2.price, 1_010_000n, "close short: capped at reference + slippage");
   // M1: with both sides open on chain, only the leader's side is closed (it used to refuse as ambiguous or close the wrong one).
   r3.state.positions[0] = { sizeUsd: bn(50_000_000), collateral: bn(10_000_000) };
-  r3.state.referencePriceQ64 = undefined;
   const cl2 = await r3.open({ action: "close", side: "short", signature: SIG(4) });
   assert.equal(orderArgs(await buildIntent(r3.deps(), cl2.id, FOLLOWER)).side, 1, "closes the short, leaves the long");
   // The leader closing the long, which the follower never copied, is skipped by the engine ...
@@ -503,4 +511,74 @@ test("copy perps build: other refusals (no market, graduated, reduce-only, pause
   await assert.rejects(buildIntent(r.deps({ port: { state: async () => null } }), i.id, FOLLOWER), refused("venue_unavailable"), "no market");
   await assert.rejects(buildIntent(r.deps({ solPriceUsd: async () => undefined }), i.id, FOLLOWER), refused("build_failed"), "no price");
   assert.ok(await buildIntent(r.deps({ solPriceUsd: undefined }), i.id, FOLLOWER), "falls back to the vault's own price");
+});
+
+// ---- slippage and pool reads (mirror the program's rules) -----------------------------------------
+
+test("slippage: default 1%, at most 5%", opts, () => {
+  assert.equal(DEFAULT_SLIPPAGE_BPS, 100);
+  assert.equal(MAX_SLIPPAGE_BPS, 500);
+  assert.equal(slippageBpsFromPercent(1), 100);
+  assert.equal(slippageBpsFromPercent(0.5), 50);
+  assert.equal(slippageBpsFromPercent(5), 500);
+  assert.equal(slippageBpsFromPercent(50), 500, "capped");
+  for (const bad of [0, -1, NaN, Infinity]) assert.equal(slippageBpsFromPercent(bad), 100, `${bad} reads as the default`);
+});
+
+/** An ObservationState as the Rust tests build it: steps are (time, price from then on); observation i closes the previous step's interval. */
+function observations(steps, tokenIs0 = true) {
+  const d = Buffer.alloc(8 + 1 + 2 + 32 + 100 * 40 + 32);
+  d[8] = 1;
+  let cum = 0n;
+  steps.forEach(([t, ], i) => {
+    if (i > 0) cum += BigInt(steps[i - 1][1]) * BigInt(t - steps[i - 1][0]);
+    const o = 43 + i * 40;
+    d.writeBigUInt64LE(BigInt(t), o);
+    const at = o + 8 + (tokenIs0 ? 0 : 16);
+    d.writeBigUInt64LE(cum & ((1n << 64n) - 1n), at);
+    d.writeBigUInt64LE(cum >> 64n, at + 8);
+  });
+  d.writeUInt16LE(steps.length - 1, 9);
+  return d;
+}
+
+test("pool TWAP: needs history covering the window, extends at the last observed price, ignores the live price", opts, () => {
+  const steps = [...Array(20).keys()].map((k) => [1_000 + k * 60, 100]).concat([[2_200, 200]]);
+  assert.equal(poolTwapX32(observations(steps), true, 2_260n), 100n);
+  const steps2 = steps.concat([[2_230, 100]]);
+  assert.equal(poolTwapX32(observations(steps2), true, 2_260n), 120n);
+  // The other token's cumulative.
+  assert.equal(poolTwapX32(observations(steps2, false), false, 2_260n), 120n);
+  // No history, Raydium's first observation only, or history shorter than the window: no TWAP (the market is warming up).
+  assert.equal(poolTwapX32(Buffer.alloc(8 + 1 + 2 + 32 + 4000 + 32), true, 5_000n), null);
+  assert.equal(poolTwapX32(observations([[1_000, 100]]), true, 5_000n), null);
+  assert.equal(poolTwapX32(observations([[4_900, 100], [4_950, 100]]), true, 5_000n), null);
+  assert.equal(poolTwapX32(observations([[4_600, 100], [4_650, 100]]), true, 4_900n), 100n);
+  // A stale newest observation extends at the last observed price.
+  assert.equal(poolTwapX32(observations([[1_000, 100], [1_100, 100], [1_200, 100]]), true, 4_800n), 100n);
+  // A pump held one observation moves the TWAP but the band (the program's clamp) is what bounds the mark.
+  const pumped = [...Array(20).keys()].map((k) => [1_000 + k * 60, 100]).concat([[2_200, 10_000], [2_215, 100]]);
+  assert.equal(poolTwapX32(observations(pumped), true, 2_260n), (174_000n + 450_000n) / 300n);
+});
+
+test("pool fees: protocol, fund and creator fees come off the vault balances", opts, () => {
+  const d = Buffer.alloc(637);
+  const put = (o, v) => d.writeBigUInt64LE(BigInt(v), o);
+  put(341, 1); put(349, 2); put(357, 10); put(365, 20); put(397, 100); put(405, 200);
+  assert.equal(poolFeeTotal(d, false), 111n);
+  assert.equal(poolFeeTotal(d, true), 222n);
+  assert.equal(netOfFees(1_000n, 111n), 889n);
+  assert.equal(netOfFees(100n, 111n), 0n);
+  assert.throws(() => poolFeeTotal(Buffer.alloc(100), false));
+});
+
+test("copy perps build: every order carries a price bound", opts, async () => {
+  const r = rig({ tier: 1 });
+  const i = await r.open();
+  r.state.referencePriceQ64 = undefined;
+  await assert.rejects(buildIntent(r.deps(), i.id, FOLLOWER), refused("venue_unavailable"), "no reference price, no order");
+  assert.equal(r.store.get(i.id).status, "pending", "the intent stays pending");
+  r.state.referencePriceQ64 = 1_000_000n;
+  const a = orderArgs(await buildIntent(r.deps(), i.id, FOLLOWER));
+  assert.ok(a.price > 0n);
 });
